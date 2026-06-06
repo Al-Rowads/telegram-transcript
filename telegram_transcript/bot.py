@@ -24,6 +24,7 @@ def create_application(settings: Settings | None = None) -> Application:
     transcriber = OpenAITranscriber(
         api_key=settings.openai_api_key,
         model=settings.openai_transcribe_model,
+        refinement_model=settings.openai_refine_model,
     )
 
     app = Application.builder().token(settings.telegram_bot_token).build()

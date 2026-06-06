@@ -17,6 +17,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.telegram_bot_token == "telegram-token"
     assert settings.openai_api_key == "openai-key"
     assert settings.openai_transcribe_model == "whisper-1"
+    assert settings.openai_refine_model == "GPT5.4-mini"
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.max_concurrent_jobs == 1
@@ -27,6 +28,7 @@ def test_load_settings_parses_optional_values() -> None:
         {
             **BASE_ENV,
             "OPENAI_TRANSCRIBE_MODEL": "gpt-4o-transcribe",
+            "OPENAI_REFINE_MODEL": "custom-refine-model",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "MAX_VIDEO_MB": "25.5",
             "MAX_OPENAI_AUDIO_MB": "12",
@@ -36,6 +38,7 @@ def test_load_settings_parses_optional_values() -> None:
     )
 
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
+    assert settings.openai_refine_model == "custom-refine-model"
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5
     assert settings.max_openai_audio_mb == 12

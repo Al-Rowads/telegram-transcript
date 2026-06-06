@@ -8,6 +8,7 @@ A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`
 - Accepts Telegram video messages and video documents.
 - Converts video audio to mono 16 kHz MP3 with `ffmpeg`.
 - Splits audio into safe chunks when it would exceed OpenAI's per-file upload limit.
+- Refines raw Whisper output into natural Baghdadi Iraqi Arabic before replying.
 - Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.
@@ -28,6 +29,7 @@ Required variables:
 Optional variables:
 
 - `OPENAI_TRANSCRIBE_MODEL`: defaults to `whisper-1`.
+- `OPENAI_REFINE_MODEL`: text model used to refine raw Whisper output. Defaults to `GPT5.4-mini`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
 - `MAX_OPENAI_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`, below OpenAI's 25 MB upload limit.

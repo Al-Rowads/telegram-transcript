@@ -16,6 +16,7 @@ class Settings:
     telegram_bot_token: str
     openai_api_key: str
     openai_transcribe_model: str = "whisper-1"
+    openai_refine_model: str = "GPT5.4-mini"
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
     max_openai_audio_mb: float = 24.0
@@ -42,6 +43,7 @@ def load_settings(
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
     openai_api_key = require_value(source, "OPENAI_API_KEY")
     model = source.get("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip() or "whisper-1"
+    refine_model = source.get("OPENAI_REFINE_MODEL", "GPT5.4-mini").strip() or "GPT5.4-mini"
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
     max_openai_audio_mb = parse_positive_float(
         source.get("MAX_OPENAI_AUDIO_MB"),
@@ -55,6 +57,7 @@ def load_settings(
         telegram_bot_token=telegram_bot_token,
         openai_api_key=openai_api_key,
         openai_transcribe_model=model,
+        openai_refine_model=refine_model,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,
         max_openai_audio_mb=max_openai_audio_mb,
