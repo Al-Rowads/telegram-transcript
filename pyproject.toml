@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "telegram-transcript"
+version = "0.1.0"
+description = "Telegram bot that transcribes uploaded videos with ffmpeg and OpenAI."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.84.0,<3",
+  "python-dotenv>=1.0.1,<2",
+  "python-telegram-bot>=21.6,<23",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.24,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["telegram_transcript"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
