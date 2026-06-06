@@ -7,14 +7,30 @@ from typing import Any
 
 from openai import OpenAI
 
+IRAQI_ARABIC_SYSTEM_PROMPT = """النص الصوتي باللهجة العراقية. اكتب التفريغ بصياغة عراقية واضحة ومهذبة بدون ترجمة للإنجليزية.
+صحّح أخطاء التعرف الشائعة، خصوصاً الكلمات المتشابهة صوتياً، وحافظ على المعنى الأصلي بدون إضافة أفكار جديدة.
+استخدم كتابة عراقية طبيعية مثل: هاي، شنو، ليش، جاي، يكول، احجي، بيها، مالته، علمود، هواي.
+اكتب أسماء الأشخاص والكتّاب الأجانب بالإنجليزية إذا كانت معروفة، مثل: Alain de Botton.
+ضع علامات ترقيم مناسبة وقسّم الكلام إلى أسطر قصيرة عند تغيّر الفكرة.
+لا تستخدم الفصحى إلا إذا كان المتحدث يستخدمها فعلاً.
+المطلوب: تفريغ عراقي واضح، مرتب، ومفهوم، مع الحفاظ على لهجة المتحدث."""
+
 
 class TranscriptionError(RuntimeError):
     """Raised when OpenAI returns an unusable transcription response."""
 
 
 class OpenAITranscriber:
-    def __init__(self, *, api_key: str, model: str, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        prompt: str = IRAQI_ARABIC_SYSTEM_PROMPT,
+        client: Any | None = None,
+    ) -> None:
         self.model = model
+        self.prompt = prompt
         self.client = client if client is not None else OpenAI(api_key=api_key)
 
     def transcribe_file(self, audio_path: Path) -> str:
@@ -22,6 +38,7 @@ class OpenAITranscriber:
             response = self.client.audio.transcriptions.create(
                 model=self.model,
                 file=audio_file,
+                prompt=self.prompt,
             )
         return extract_transcript_text(response)
 
