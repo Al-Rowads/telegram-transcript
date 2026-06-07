@@ -38,13 +38,16 @@ class FakeMessage:
         self.message_thread_id = message_thread_id
         self.text_replies: list[str] = []
         self.text_reply_kwargs: list[dict[str, object]] = []
+        self.status_replies: list[FakeStatus] = []
         self.document_replies: list[object] = []
         self.document_reply_kwargs: list[dict[str, object]] = []
 
     async def reply_text(self, text: str, **kwargs: object) -> object:
         self.text_replies.append(text)
         self.text_reply_kwargs.append(kwargs)
-        return FakeStatus()
+        status = FakeStatus()
+        self.status_replies.append(status)
+        return status
 
     async def reply_document(self, *, document: object, caption: str, **kwargs: object) -> None:
         self.document_replies.append((document, caption))
@@ -154,13 +157,13 @@ async def test_handle_non_video_ignores_group_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_non_video_guides_private_messages() -> None:
+async def test_handle_non_video_ignores_private_messages() -> None:
     message = FakeMessage()
     update = SimpleNamespace(effective_message=message)
 
     await handle_non_video(update, SimpleNamespace())
 
-    assert message.text_replies == ["Please send a video file to transcribe."]
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -184,14 +187,14 @@ async def test_handle_video_upload_rejects_unauthorized_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_rejects_non_video() -> None:
+async def test_handle_video_upload_ignores_private_non_video_document() -> None:
     message = FakeMessage(document=SimpleNamespace(mime_type="text/plain", file_name="notes.txt"))
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
 
     await handle_video_upload(update, context)
 
-    assert message.text_replies == ["Please send a video file to transcribe."]
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -209,7 +212,7 @@ async def test_handle_video_upload_ignores_group_non_video_document() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_rejects_oversized_video() -> None:
+async def test_handle_video_upload_ignores_oversized_video() -> None:
     message = FakeMessage(video=SimpleNamespace(file_size=11))
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     context = SimpleNamespace(
@@ -224,7 +227,7 @@ async def test_handle_video_upload_rejects_oversized_video() -> None:
 
     await handle_video_upload(update, context)
 
-    assert "larger than" in message.text_replies[0]
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -256,14 +259,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
     await handle_video_upload(update, context)
 
     assert processed
-    assert message.text_replies == ["Video received. Waiting for an available transcription slot..."]
-    assert message.text_reply_kwargs == [
-        {
-            "reply_to_message_id": 123,
-            "allow_sending_without_reply": True,
-            "message_thread_id": 8,
-        }
-    ]
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -315,14 +311,15 @@ async def test_process_video_message_reports_step_by_step_flow(
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
     caplog.set_level("INFO", logger="telegram_transcript.bot")
     message = FakeMessage()
-    status = FakeStatus()
+    status_ref: dict[str, object] = {"message": None}
     settings = Settings(telegram_bot_token="token", openai_api_key="key")
     context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
 
-    await process_video_message(message, FakeAttachment(), settings, context, status, "job1234")
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234")
 
+    assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
+    status = message.status_replies[0]
     assert status.edits == [
-        "Step 1/6: downloading video...",
         "Step 2/6: extracting MP3 audio at 1x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
@@ -330,7 +327,6 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 6/6: sending cleaned transcript...",
         "Transcript ready.",
     ]
-    assert message.text_replies == ["هاي مرتبة"]
     assert "job1234 step 1/6" in caplog.text
     assert "job1234 step 6/6" in caplog.text
     assert "هاي مرتبة" not in caplog.text
@@ -356,7 +352,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
 
     monkeypatch.setattr(bot_module, "extract_audio", fail_extract_audio)
     message = FakeMessage()
-    status = FakeStatus()
+    status_ref: dict[str, object] = {"message": None}
     settings = Settings(
         telegram_bot_token="token",
         openai_api_key="key",
@@ -364,8 +360,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     )
     context = SimpleNamespace(bot_data={"transcriber": object()})
 
-    await process_video_message(message, FakeAttachment(), settings, context, status, "job1234")
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234")
 
-    assert status.edits[0] == "Step 1/6: downloading video..."
-    assert status.edits[1].startswith("This video is larger than the configured")
+    assert status_ref["message"] is None
     assert message.text_replies == []

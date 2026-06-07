@@ -48,29 +48,15 @@ def video_message_filter() -> filters.BaseFilter:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await help_command(update, context)
+    return
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-    if get_chat_type(message) == ChatType.CHANNEL:
-        return
-    settings: Settings = context.bot_data["settings"]
-    await message.reply_text(
-        "Send me a video file and I will reply with its transcript.\n\n"
-        f"Maximum configured video size: {settings.max_video_mb:g} MB."
-    )
+    return
 
 
 async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-    if get_chat_type(message) != ChatType.PRIVATE:
-        return
-    await message.reply_text("Please send a video file to transcribe.")
+    return
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -88,17 +74,12 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     attachment = get_video_attachment(message)
     if attachment is None:
-        if get_chat_type(message) == ChatType.PRIVATE:
-            await reply_to_source(message, "Please send a video file to transcribe.")
         return
 
     file_size = getattr(attachment, "file_size", None)
     if file_size is not None and file_size > settings.max_video_bytes:
-        await reply_to_source(message, f"This video is larger than the configured {settings.max_video_mb:g} MB limit.")
         return
 
-    semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
-    status = await reply_to_source(message, "Video received. Waiting for an available transcription slot...")
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine_model=%s",
@@ -110,16 +91,22 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         settings.openai_refine_model,
     )
 
+    semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
+    status_ref: dict[str, Message | None] = {"message": None}
     async with semaphore:
         try:
             logger.info("job %s started", job_id)
-            await process_video_message(message, attachment, settings, context, status, job_id)
+            await process_video_message(message, attachment, settings, context, status_ref, job_id)
         except (FfmpegError, TranscriptionError) as exc:
             logger.exception("job %s video transcription failed", job_id)
-            await status.edit_text(f"Transcription failed: {exc}")
+            status = status_ref["message"]
+            if status is not None:
+                await status.edit_text(f"Transcription failed: {exc}")
         except Exception:
             logger.exception("job %s unexpected video transcription failure", job_id)
-            await status.edit_text("Transcription failed because of an unexpected error.")
+            status = status_ref["message"]
+            if status is not None:
+                await status.edit_text("Transcription failed because of an unexpected error.")
 
 
 async def process_video_message(
@@ -127,7 +114,7 @@ async def process_video_message(
     attachment: Video | Document,
     settings: Settings,
     context: ContextTypes.DEFAULT_TYPE,
-    status: Message,
+    status_ref: dict[str, Message | None],
     job_id: str,
 ) -> None:
     transcriber: OpenAITranscriber = context.bot_data["transcriber"]
@@ -138,7 +125,6 @@ async def process_video_message(
         video_path = work_dir / f"video{get_attachment_suffix(attachment)}"
         audio_path = work_dir / "audio.mp3"
 
-        await status.edit_text("Step 1/6: downloading video...")
         step_started = time.monotonic()
         logger.info(
             "job %s step 1/6 downloading video: suffix=%s telegram_file_size=%s",
@@ -162,8 +148,10 @@ async def process_video_message(
                 video_bytes,
                 settings.max_video_bytes,
             )
-            await status.edit_text(f"This video is larger than the configured {settings.max_video_mb:g} MB limit.")
             return
+
+        status = await reply_to_source(message, "Video received. Starting transcription...")
+        status_ref["message"] = status
 
         await status.edit_text(f"Step 2/6: extracting MP3 audio at {settings.audio_tempo:g}x...")
         step_started = time.monotonic()
