@@ -33,7 +33,7 @@ Optional variables:
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
 - `MAX_OPENAI_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`, below OpenAI's 25 MB upload limit.
-- `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `0.90`, which slows fast speakers while preserving pitch. Use `1` for normal speed.
+- `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
 
 ## Run Locally

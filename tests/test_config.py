@@ -20,7 +20,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
-    assert settings.audio_tempo == 0.90
+    assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
 
 

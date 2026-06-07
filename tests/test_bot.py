@@ -193,7 +193,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
         assert video_path.exists()
-        assert audio_tempo == 0.90
+        assert audio_tempo == 1.0
         audio_path.write_bytes(b"audio")
         return audio_path
 
@@ -208,7 +208,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     assert status.edits == [
         "Step 1/6: downloading video...",
-        "Step 2/6: extracting MP3 audio at 0.9x...",
+        "Step 2/6: extracting MP3 audio at 1x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
         "Step 5/6: refining transcript...",
