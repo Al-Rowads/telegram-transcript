@@ -9,6 +9,7 @@ from io import BytesIO
 from pathlib import Path
 
 from telegram import Document, InputFile, Message, Update, Video
+from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings
@@ -54,6 +55,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     message = update.effective_message
     if message is None:
         return
+    if get_chat_type(message) == ChatType.CHANNEL:
+        return
     settings: Settings = context.bot_data["settings"]
     await message.reply_text(
         "Send me a video file and I will reply with its transcript.\n\n"
@@ -65,6 +68,8 @@ async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     message = update.effective_message
     if message is None:
         return
+    if get_chat_type(message) != ChatType.PRIVATE:
+        return
     await message.reply_text("Please send a video file to transcribe.")
 
 
@@ -72,25 +77,28 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     if message is None:
         return
+    if get_chat_type(message) == ChatType.CHANNEL:
+        return
 
     settings: Settings = context.bot_data["settings"]
     user_id = update.effective_user.id if update.effective_user else None
     if not is_authorized(settings, user_id):
-        await message.reply_text("Sorry, this bot is not enabled for your Telegram account.")
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
 
     attachment = get_video_attachment(message)
     if attachment is None:
-        await message.reply_text("Please send a video file to transcribe.")
+        if get_chat_type(message) == ChatType.PRIVATE:
+            await reply_to_source(message, "Please send a video file to transcribe.")
         return
 
     file_size = getattr(attachment, "file_size", None)
-    if file_size and file_size > settings.max_video_bytes:
-        await message.reply_text(f"This video is larger than the configured {settings.max_video_mb:g} MB limit.")
+    if file_size is not None and file_size > settings.max_video_bytes:
+        await reply_to_source(message, f"This video is larger than the configured {settings.max_video_mb:g} MB limit.")
         return
 
     semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
-    status = await message.reply_text("Video received. Waiting for an available transcription slot...")
+    status = await reply_to_source(message, "Video received. Waiting for an available transcription slot...")
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine_model=%s",
@@ -147,6 +155,15 @@ async def process_video_message(
             video_bytes,
             elapsed_ms(step_started),
         )
+        if video_bytes > settings.max_video_bytes:
+            logger.info(
+                "job %s rejected after download: video_bytes=%d max_video_bytes=%d",
+                job_id,
+                video_bytes,
+                settings.max_video_bytes,
+            )
+            await status.edit_text(f"This video is larger than the configured {settings.max_video_mb:g} MB limit.")
+            return
 
         await status.edit_text(f"Step 2/6: extracting MP3 audio at {settings.audio_tempo:g}x...")
         step_started = time.monotonic()
@@ -258,7 +275,7 @@ async def process_video_message(
 async def send_transcript(message: Message, transcript: str) -> None:
     if should_send_as_text(transcript):
         for chunk in split_text_for_telegram(transcript):
-            await message.reply_text(chunk)
+            await reply_to_source(message, chunk)
         return
 
     transcript_file = BytesIO(transcript.encode("utf-8"))
@@ -267,7 +284,30 @@ async def send_transcript(message: Message, transcript: str) -> None:
     await message.reply_document(
         document=InputFile(transcript_file, filename="transcript.txt"),
         caption="Transcript",
+        **source_reply_kwargs(message),
     )
+
+
+async def reply_to_source(message: Message, text: str) -> Message:
+    return await message.reply_text(text, **source_reply_kwargs(message))
+
+
+def source_reply_kwargs(message: Message) -> dict[str, int | bool]:
+    kwargs: dict[str, int | bool] = {}
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        kwargs["reply_to_message_id"] = message_id
+        kwargs["allow_sending_without_reply"] = True
+
+    message_thread_id = getattr(message, "message_thread_id", None)
+    if message_thread_id is not None:
+        kwargs["message_thread_id"] = message_thread_id
+    return kwargs
+
+
+def get_chat_type(message: Message) -> str | None:
+    chat = getattr(message, "chat", None)
+    return getattr(chat, "type", None)
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:

@@ -6,6 +6,7 @@ A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`
 
 - Telegram long polling, so no public webhook URL is required.
 - Accepts Telegram video messages and video documents.
+- Works in private chats, groups, and supergroups.
 - Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`.
 - Splits audio into safe chunks when it would exceed OpenAI's per-file upload limit.
 - Refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
@@ -62,6 +63,12 @@ docker compose up --build
 ```
 
 No ports are exposed because the bot uses long polling.
+
+## Group Chats
+
+Add the bot to a group or supergroup to transcribe videos posted there. The bot replies to the original video message so the sender and thread stay clear.
+
+If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 
 ## Tests
 

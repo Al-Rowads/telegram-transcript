@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from telegram.constants import ChatType
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
     get_attachment_suffix,
     get_video_attachment,
+    handle_non_video,
     handle_video_upload,
     is_authorized,
     is_video_document,
@@ -19,18 +22,33 @@ from telegram_transcript.config import Settings
 
 
 class FakeMessage:
-    def __init__(self, *, video: object | None = None, document: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        video: object | None = None,
+        document: object | None = None,
+        chat_type: str = ChatType.PRIVATE,
+        message_id: int = 42,
+        message_thread_id: int | None = None,
+    ) -> None:
         self.video = video
         self.document = document
+        self.chat = SimpleNamespace(type=chat_type)
+        self.message_id = message_id
+        self.message_thread_id = message_thread_id
         self.text_replies: list[str] = []
+        self.text_reply_kwargs: list[dict[str, object]] = []
         self.document_replies: list[object] = []
+        self.document_reply_kwargs: list[dict[str, object]] = []
 
-    async def reply_text(self, text: str) -> object:
+    async def reply_text(self, text: str, **kwargs: object) -> object:
         self.text_replies.append(text)
+        self.text_reply_kwargs.append(kwargs)
         return FakeStatus()
 
-    async def reply_document(self, *, document: object, caption: str) -> None:
+    async def reply_document(self, *, document: object, caption: str, **kwargs: object) -> None:
         self.document_replies.append((document, caption))
+        self.document_reply_kwargs.append(kwargs)
 
 
 class FakeStatus:
@@ -93,18 +111,61 @@ async def test_send_transcript_sends_short_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_transcript_replies_to_original_group_message() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=99, message_thread_id=7)
+
+    await send_transcript(message, "hello")
+
+    assert message.text_replies == ["hello"]
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 99,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 7,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_send_transcript_sends_long_text_as_document() -> None:
-    message = FakeMessage()
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=99, message_thread_id=7)
 
     await send_transcript(message, "x" * 4000)
 
     assert message.text_replies == []
     assert len(message.document_replies) == 1
+    assert message.document_reply_kwargs == [
+        {
+            "reply_to_message_id": 99,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 7,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_non_video_ignores_group_messages() -> None:
+    message = FakeMessage(chat_type=ChatType.GROUP)
+    update = SimpleNamespace(effective_message=message)
+
+    await handle_non_video(update, SimpleNamespace())
+
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_non_video_guides_private_messages() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message)
+
+    await handle_non_video(update, SimpleNamespace())
+
+    assert message.text_replies == ["Please send a video file to transcribe."]
 
 
 @pytest.mark.asyncio
 async def test_handle_video_upload_rejects_unauthorized_user() -> None:
-    message = FakeMessage(video=SimpleNamespace(file_size=1))
+    message = FakeMessage(video=SimpleNamespace(file_size=1), chat_type=ChatType.GROUP, message_id=123)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
     context = SimpleNamespace(
         bot_data={
@@ -119,6 +180,7 @@ async def test_handle_video_upload_rejects_unauthorized_user() -> None:
     await handle_video_upload(update, context)
 
     assert "not enabled" in message.text_replies[0]
+    assert message.text_reply_kwargs[0]["reply_to_message_id"] == 123
 
 
 @pytest.mark.asyncio
@@ -130,6 +192,20 @@ async def test_handle_video_upload_rejects_non_video() -> None:
     await handle_video_upload(update, context)
 
     assert message.text_replies == ["Please send a video file to transcribe."]
+
+
+@pytest.mark.asyncio
+async def test_handle_video_upload_ignores_group_non_video_document() -> None:
+    message = FakeMessage(
+        document=SimpleNamespace(mime_type="text/plain", file_name="notes.txt"),
+        chat_type=ChatType.GROUP,
+    )
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
+
+    await handle_video_upload(update, context)
+
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -149,6 +225,45 @@ async def test_handle_video_upload_rejects_oversized_video() -> None:
     await handle_video_upload(update, context)
 
     assert "larger than" in message.text_replies[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        openai_api_key="key",
+        max_video_mb=10 / 1024 / 1024,
+    )
+    attachment = SimpleNamespace(file_size=10)
+    message = FakeMessage(video=attachment, chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "job_semaphore": asyncio.Semaphore(1),
+        }
+    )
+    processed = False
+
+    async def fake_process_video_message(*args: object) -> None:
+        nonlocal processed
+        processed = True
+        assert args[0] is message
+        assert args[1] is attachment
+
+    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+
+    await handle_video_upload(update, context)
+
+    assert processed
+    assert message.text_replies == ["Video received. Waiting for an available transcription slot..."]
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 123,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 8,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -219,3 +334,38 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert "job1234 step 1/6" in caplog.text
     assert "job1234 step 6/6" in caplog.text
     assert "هاي مرتبة" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_rejects_downloaded_file_over_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTelegramFile:
+        async def download_to_drive(self, *, custom_path: str) -> None:
+            Path(custom_path).write_bytes(b"x" * 11)
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = None
+
+        async def get_file(self) -> FakeTelegramFile:
+            return FakeTelegramFile()
+
+    def fail_extract_audio(*_: object, **__: object) -> None:
+        raise AssertionError("extract_audio should not run for an oversized downloaded video")
+
+    monkeypatch.setattr(bot_module, "extract_audio", fail_extract_audio)
+    message = FakeMessage()
+    status = FakeStatus()
+    settings = Settings(
+        telegram_bot_token="token",
+        openai_api_key="key",
+        max_video_mb=10 / 1024 / 1024,
+    )
+    context = SimpleNamespace(bot_data={"transcriber": object()})
+
+    await process_video_message(message, FakeAttachment(), settings, context, status, "job1234")
+
+    assert status.edits[0] == "Step 1/6: downloading video..."
+    assert status.edits[1].startswith("This video is larger than the configured")
+    assert message.text_replies == []
