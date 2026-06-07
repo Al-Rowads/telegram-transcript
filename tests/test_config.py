@@ -20,6 +20,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
+    assert settings.audio_tempo == 0.75
     assert settings.max_concurrent_jobs == 1
 
 
@@ -32,6 +33,7 @@ def test_load_settings_parses_optional_values() -> None:
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "MAX_VIDEO_MB": "25.5",
             "MAX_OPENAI_AUDIO_MB": "12",
+            "AUDIO_TEMPO": "1",
             "MAX_CONCURRENT_JOBS": "3",
         },
         load_dotenv_file=False,
@@ -42,6 +44,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5
     assert settings.max_openai_audio_mb == 12
+    assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
 
 
@@ -53,6 +56,11 @@ def test_load_settings_requires_credentials() -> None:
 def test_openai_audio_limit_must_stay_below_25_mb() -> None:
     with pytest.raises(ConfigError, match="below OpenAI"):
         load_settings({**BASE_ENV, "MAX_OPENAI_AUDIO_MB": "25"}, load_dotenv_file=False)
+
+
+def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:
+    with pytest.raises(ConfigError, match="AUDIO_TEMPO"):
+        load_settings({**BASE_ENV, "AUDIO_TEMPO": "0.25"}, load_dotenv_file=False)
 
 
 def test_parse_user_ids_rejects_invalid_values() -> None:

@@ -93,10 +93,11 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     status = await message.reply_text("Video received. Waiting for an available transcription slot...")
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s transcribe_model=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine_model=%s",
         job_id,
         get_attachment_suffix(attachment),
         file_size,
+        settings.audio_tempo,
         settings.openai_transcribe_model,
         settings.openai_refine_model,
     )
@@ -147,13 +148,19 @@ async def process_video_message(
             elapsed_ms(step_started),
         )
 
-        await status.edit_text("Step 2/6: extracting MP3 audio...")
+        await status.edit_text(f"Step 2/6: extracting MP3 audio at {settings.audio_tempo:g}x...")
         step_started = time.monotonic()
-        logger.info("job %s step 2/6 extracting MP3 audio: video_bytes=%d", job_id, video_bytes)
+        logger.info(
+            "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g",
+            job_id,
+            video_bytes,
+            settings.audio_tempo,
+        )
         await asyncio.to_thread(
             extract_audio,
             video_path,
             audio_path,
+            audio_tempo=settings.audio_tempo,
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(

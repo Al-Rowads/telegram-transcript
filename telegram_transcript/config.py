@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from telegram_transcript.ffmpeg import DEFAULT_AUDIO_TEMPO
 from telegram_transcript.transcriber import DEFAULT_REFINEMENT_MODEL, DEFAULT_TRANSCRIPTION_MODEL
 
 
@@ -22,6 +23,7 @@ class Settings:
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
     max_openai_audio_mb: float = 24.0
+    audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
 
     @property
@@ -54,6 +56,7 @@ def load_settings(
     )
     if max_openai_audio_mb >= 25:
         raise ConfigError("MAX_OPENAI_AUDIO_MB must be below OpenAI's 25 MB upload limit.")
+    audio_tempo = parse_audio_tempo(source.get("AUDIO_TEMPO"))
 
     return Settings(
         telegram_bot_token=telegram_bot_token,
@@ -63,6 +66,7 @@ def load_settings(
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,
         max_openai_audio_mb=max_openai_audio_mb,
+        audio_tempo=audio_tempo,
         max_concurrent_jobs=parse_positive_int(
             source.get("MAX_CONCURRENT_JOBS"),
             "MAX_CONCURRENT_JOBS",
@@ -115,6 +119,13 @@ def parse_positive_int(raw: str | None, name: str, default: int) -> int:
         raise ConfigError(f"{name} must be an integer.") from exc
     if value <= 0:
         raise ConfigError(f"{name} must be greater than zero.")
+    return value
+
+
+def parse_audio_tempo(raw: str | None) -> float:
+    value = parse_positive_float(raw, "AUDIO_TEMPO", DEFAULT_AUDIO_TEMPO)
+    if not 0.5 <= value <= 2.0:
+        raise ConfigError("AUDIO_TEMPO must be between 0.5 and 2.0.")
     return value
 
 

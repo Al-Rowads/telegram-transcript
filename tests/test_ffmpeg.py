@@ -16,7 +16,18 @@ def test_build_extract_audio_command() -> None:
     assert "-vn" in command
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
+    assert ["-filter:a", "atempo=0.75"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
     assert command[-1] == "output.mp3"
+
+
+def test_build_extract_audio_command_accepts_custom_tempo() -> None:
+    command = ffmpeg.build_extract_audio_command(
+        Path("input.mp4"),
+        Path("output.mp3"),
+        audio_tempo=1.0,
+    )
+
+    assert ["-filter:a", "atempo=1"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
 
 
 def test_split_audio_to_chunks_retries_until_chunks_fit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
