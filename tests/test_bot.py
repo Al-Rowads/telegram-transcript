@@ -12,6 +12,7 @@ from telegram_transcript.bot import (
     get_attachment_suffix,
     get_video_attachment,
     handle_non_video,
+    handle_tempo_command,
     handle_video_upload,
     is_authorized,
     is_video_document,
@@ -167,6 +168,70 @@ async def test_handle_non_video_ignores_private_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_tempo_command_updates_runtime_tempo_in_group() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
+    context = SimpleNamespace(
+        args=["1.2"],
+        bot_data={
+            "audio_tempo": 1.0,
+            "settings": Settings(
+                telegram_bot_token="token",
+                openai_api_key="key",
+                allowed_telegram_user_ids=frozenset({123}),
+            ),
+        },
+    )
+
+    await handle_tempo_command(update, context)
+
+    assert context.bot_data["audio_tempo"] == 1.2
+    assert message.text_replies == ["Tempo set to 1.2x."]
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 123,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 8,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", [ChatType.PRIVATE, ChatType.CHANNEL])
+async def test_handle_tempo_command_ignores_private_and_channel_chats(chat_type: str) -> None:
+    message = FakeMessage(chat_type=chat_type)
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(args=["1.2"], bot_data={"audio_tempo": 1.0})
+
+    await handle_tempo_command(update, context)
+
+    assert context.bot_data["audio_tempo"] == 1.0
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["fast"],
+        ["1.0", "extra"],
+        ["0.49"],
+        ["2.01"],
+    ],
+)
+async def test_handle_tempo_command_ignores_invalid_values(args: list[str]) -> None:
+    message = FakeMessage(chat_type=ChatType.GROUP)
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(args=args, bot_data={"audio_tempo": 1.0})
+
+    await handle_tempo_command(update, context)
+
+    assert context.bot_data["audio_tempo"] == 1.0
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
 async def test_handle_video_upload_rejects_unauthorized_user() -> None:
     message = FakeMessage(video=SimpleNamespace(file_size=1), chat_type=ChatType.GROUP, message_id=123)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
@@ -244,6 +309,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
         bot_data={
             "settings": settings,
             "job_semaphore": asyncio.Semaphore(1),
+            "audio_tempo": 1.4,
         }
     )
     processed = False
@@ -253,6 +319,8 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
         processed = True
         assert args[0] is message
         assert args[1] is attachment
+        assert args[6] == 1.4
+        context.bot_data["audio_tempo"] = 2.0
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
@@ -304,7 +372,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
         assert video_path.exists()
-        assert audio_tempo == 1.0
+        assert audio_tempo == 1.4
         audio_path.write_bytes(b"audio")
         return audio_path
 
@@ -315,12 +383,12 @@ async def test_process_video_message_reports_step_by_step_flow(
     settings = Settings(telegram_bot_token="token", openai_api_key="key")
     context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
 
-    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234")
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
 
     assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
     status = message.status_replies[0]
     assert status.edits == [
-        "Step 2/6: extracting MP3 audio at 1x...",
+        "Step 2/6: extracting MP3 audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
         "Step 5/6: refining transcript...",
@@ -360,7 +428,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     )
     context = SimpleNamespace(bot_data={"transcriber": object()})
 
-    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234")
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     assert status_ref["message"] is None
     assert message.text_replies == []

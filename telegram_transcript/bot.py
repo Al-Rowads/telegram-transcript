@@ -12,7 +12,7 @@ from telegram import Document, InputFile, Message, Update, Video
 from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from telegram_transcript.config import ConfigError, Settings, load_settings
+from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError
@@ -20,6 +20,7 @@ from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionErro
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
 
 def create_application(settings: Settings | None = None) -> Application:
@@ -35,9 +36,11 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
+    app.bot_data["audio_tempo"] = settings.audio_tempo
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(MessageHandler(video_message_filter(), handle_video_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_video))
     return app
@@ -58,6 +61,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return
+
+
+async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) not in GROUP_CHAT_TYPES:
+        return
+
+    audio_tempo = parse_tempo_command_args(getattr(context, "args", None))
+    if audio_tempo is None:
+        return
+
+    context.bot_data["audio_tempo"] = audio_tempo
+    await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -81,13 +97,14 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     if file_size is not None and file_size > settings.max_video_bytes:
         return
 
+    audio_tempo = get_runtime_audio_tempo(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine=%s refine_model=%s",
         job_id,
         get_attachment_suffix(attachment),
         file_size,
-        settings.audio_tempo,
+        audio_tempo,
         settings.openai_transcribe_model,
         settings.refine,
         settings.openai_refine_model,
@@ -98,7 +115,7 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with semaphore:
         try:
             logger.info("job %s started", job_id)
-            await process_video_message(message, attachment, settings, context, status_ref, job_id)
+            await process_video_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
         except (FfmpegError, TranscriptionError) as exc:
             logger.exception("job %s video transcription failed", job_id)
             status = status_ref["message"]
@@ -118,6 +135,7 @@ async def process_video_message(
     context: ContextTypes.DEFAULT_TYPE,
     status_ref: dict[str, Message | None],
     job_id: str,
+    audio_tempo: float,
 ) -> None:
     transcriber: OpenAITranscriber = context.bot_data["transcriber"]
     job_started = time.monotonic()
@@ -155,19 +173,19 @@ async def process_video_message(
         status = await reply_to_source(message, "Video received. Starting transcription...")
         status_ref["message"] = status
 
-        await status.edit_text(f"Step 2/6: extracting MP3 audio at {settings.audio_tempo:g}x...")
+        await status.edit_text(f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...")
         step_started = time.monotonic()
         logger.info(
             "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g",
             job_id,
             video_bytes,
-            settings.audio_tempo,
+            audio_tempo,
         )
         await asyncio.to_thread(
             extract_audio,
             video_path,
             audio_path,
-            audio_tempo=settings.audio_tempo,
+            audio_tempo=audio_tempo,
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(
@@ -298,6 +316,23 @@ def source_reply_kwargs(message: Message) -> dict[str, int | bool]:
 def get_chat_type(message: Message) -> str | None:
     chat = getattr(message, "chat", None)
     return getattr(chat, "type", None)
+
+
+def parse_tempo_command_args(args: object) -> float | None:
+    if not isinstance(args, list) or len(args) != 1:
+        return None
+    try:
+        return parse_audio_tempo(args[0])
+    except ConfigError:
+        return None
+
+
+def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> float:
+    candidate = context.bot_data.get("audio_tempo", settings.audio_tempo)
+    try:
+        return parse_audio_tempo(str(candidate))
+    except ConfigError:
+        return settings.audio_tempo
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:
