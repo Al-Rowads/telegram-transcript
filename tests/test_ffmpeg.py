@@ -16,7 +16,7 @@ def test_build_extract_audio_command() -> None:
     assert "-vn" in command
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
-    assert ["-filter:a", "atempo=0.75"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
+    assert ["-filter:a", "atempo=0.9"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
     assert command[-1] == "output.mp3"
 
 

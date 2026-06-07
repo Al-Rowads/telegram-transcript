@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 DEFAULT_AUDIO_BITRATE_KBPS = 64
-DEFAULT_AUDIO_TEMPO = 0.75
+DEFAULT_AUDIO_TEMPO = 0.90
 
 
 class FfmpegError(RuntimeError):
