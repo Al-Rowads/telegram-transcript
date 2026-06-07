@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
     get_attachment_suffix,
     get_video_attachment,
     handle_video_upload,
     is_authorized,
     is_video_document,
+    process_video_message,
     send_transcript,
 )
 from telegram_transcript.config import Settings
@@ -146,3 +149,72 @@ async def test_handle_video_upload_rejects_oversized_video() -> None:
     await handle_video_upload(update, context)
 
     assert "larger than" in message.text_replies[0]
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_reports_step_by_step_flow(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FakeTelegramFile:
+        async def download_to_drive(self, *, custom_path: str) -> None:
+            Path(custom_path).write_bytes(b"video")
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = 5
+
+        async def get_file(self) -> FakeTelegramFile:
+            return FakeTelegramFile()
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+            chunk = list(chunks)[0]
+            assert progress_callback is not None
+            await progress_callback(
+                "transcribing_chunk",
+                {
+                    "index": 1,
+                    "total": 1,
+                    "chunk_bytes": chunk.stat().st_size,
+                    "model": "gpt-4o-transcribe",
+                },
+            )
+            await progress_callback("chunk_transcribed", {"index": 1, "total": 1, "raw_chars": 12})
+            await progress_callback(
+                "refining_transcript",
+                {
+                    "raw_chars": 12,
+                    "model": "gpt-5.4-mini",
+                },
+            )
+            await progress_callback("refinement_complete", {"cleaned_chars": 9})
+            return "هاي مرتبة"
+
+    def fake_extract_audio(video_path: Path, audio_path: Path) -> Path:
+        assert video_path.exists()
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    caplog.set_level("INFO", logger="telegram_transcript.bot")
+    message = FakeMessage()
+    status = FakeStatus()
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+
+    await process_video_message(message, FakeAttachment(), settings, context, status, "job1234")
+
+    assert status.edits == [
+        "Step 1/6: downloading video...",
+        "Step 2/6: extracting MP3 audio...",
+        "Step 3/6: preparing audio chunks...",
+        "Step 4/6: transcribing chunk 1/1...",
+        "Step 5/6: refining transcript...",
+        "Step 6/6: sending cleaned transcript...",
+        "Transcript ready.",
+    ]
+    assert message.text_replies == ["هاي مرتبة"]
+    assert "job1234 step 1/6" in caplog.text
+    assert "job1234 step 6/6" in caplog.text
+    assert "هاي مرتبة" not in caplog.text

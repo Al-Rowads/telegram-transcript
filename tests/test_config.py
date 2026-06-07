@@ -16,8 +16,8 @@ def test_load_settings_uses_defaults() -> None:
 
     assert settings.telegram_bot_token == "telegram-token"
     assert settings.openai_api_key == "openai-key"
-    assert settings.openai_transcribe_model == "whisper-1"
-    assert settings.openai_refine_model == "GPT5.4-mini"
+    assert settings.openai_transcribe_model == "gpt-4o-transcribe"
+    assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.max_concurrent_jobs == 1

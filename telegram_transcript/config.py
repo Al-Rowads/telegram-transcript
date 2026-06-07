@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from telegram_transcript.transcriber import DEFAULT_REFINEMENT_MODEL, DEFAULT_TRANSCRIPTION_MODEL
+
 
 class ConfigError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
@@ -15,8 +17,8 @@ class ConfigError(RuntimeError):
 class Settings:
     telegram_bot_token: str
     openai_api_key: str
-    openai_transcribe_model: str = "whisper-1"
-    openai_refine_model: str = "GPT5.4-mini"
+    openai_transcribe_model: str = DEFAULT_TRANSCRIPTION_MODEL
+    openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
     max_openai_audio_mb: float = 24.0
@@ -42,8 +44,8 @@ def load_settings(
     source = env if env is not None else os.environ
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
     openai_api_key = require_value(source, "OPENAI_API_KEY")
-    model = source.get("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip() or "whisper-1"
-    refine_model = source.get("OPENAI_REFINE_MODEL", "GPT5.4-mini").strip() or "GPT5.4-mini"
+    model = source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip() or DEFAULT_TRANSCRIPTION_MODEL
+    refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
     max_openai_audio_mb = parse_positive_float(
         source.get("MAX_OPENAI_AUDIO_MB"),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import time
+import uuid
 from io import BytesIO
 from pathlib import Path
 
@@ -10,7 +12,7 @@ from telegram import Document, InputFile, Message, Update, Video
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings
-from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, prepare_audio_chunks_async
+from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError
 
@@ -89,15 +91,25 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
     status = await message.reply_text("Video received. Waiting for an available transcription slot...")
+    job_id = uuid.uuid4().hex[:8]
+    logger.info(
+        "job %s queued: suffix=%s telegram_file_size=%s transcribe_model=%s refine_model=%s",
+        job_id,
+        get_attachment_suffix(attachment),
+        file_size,
+        settings.openai_transcribe_model,
+        settings.openai_refine_model,
+    )
 
     async with semaphore:
         try:
-            await process_video_message(message, attachment, settings, context, status)
+            logger.info("job %s started", job_id)
+            await process_video_message(message, attachment, settings, context, status, job_id)
         except (FfmpegError, TranscriptionError) as exc:
-            logger.exception("Video transcription failed")
+            logger.exception("job %s video transcription failed", job_id)
             await status.edit_text(f"Transcription failed: {exc}")
         except Exception:
-            logger.exception("Unexpected video transcription failure")
+            logger.exception("job %s unexpected video transcription failure", job_id)
             await status.edit_text("Transcription failed because of an unexpected error.")
 
 
@@ -107,31 +119,133 @@ async def process_video_message(
     settings: Settings,
     context: ContextTypes.DEFAULT_TYPE,
     status: Message,
+    job_id: str,
 ) -> None:
     transcriber: OpenAITranscriber = context.bot_data["transcriber"]
+    job_started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
         video_path = work_dir / f"video{get_attachment_suffix(attachment)}"
+        audio_path = work_dir / "audio.mp3"
 
-        await status.edit_text("Downloading video...")
+        await status.edit_text("Step 1/6: downloading video...")
+        step_started = time.monotonic()
+        logger.info(
+            "job %s step 1/6 downloading video: suffix=%s telegram_file_size=%s",
+            job_id,
+            get_attachment_suffix(attachment),
+            getattr(attachment, "file_size", None),
+        )
         telegram_file = await attachment.get_file()
         await telegram_file.download_to_drive(custom_path=str(video_path))
-
-        await status.edit_text("Extracting audio...")
-        chunks = await prepare_audio_chunks_async(
-            video_path,
-            work_dir,
-            settings.max_openai_audio_bytes,
+        video_bytes = video_path.stat().st_size
+        logger.info(
+            "job %s step 1/6 downloaded video: video_bytes=%d duration_ms=%d",
+            job_id,
+            video_bytes,
+            elapsed_ms(step_started),
         )
 
-        chunk_note = f" ({len(chunks)} chunks)" if len(chunks) > 1 else ""
-        await status.edit_text(f"Transcribing audio{chunk_note}...")
-        transcript = await transcriber.transcribe_chunks_async(chunks)
+        await status.edit_text("Step 2/6: extracting MP3 audio...")
+        step_started = time.monotonic()
+        logger.info("job %s step 2/6 extracting MP3 audio: video_bytes=%d", job_id, video_bytes)
+        await asyncio.to_thread(
+            extract_audio,
+            video_path,
+            audio_path,
+        )
+        audio_bytes = audio_path.stat().st_size
+        logger.info(
+            "job %s step 2/6 extracted MP3 audio: audio_bytes=%d duration_ms=%d",
+            job_id,
+            audio_bytes,
+            elapsed_ms(step_started),
+        )
+
+        await status.edit_text("Step 3/6: preparing audio chunks...")
+        step_started = time.monotonic()
+        logger.info(
+            "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
+            job_id,
+            audio_bytes,
+            settings.max_openai_audio_bytes,
+        )
+        if audio_bytes <= settings.max_openai_audio_bytes:
+            chunks = [audio_path]
+        else:
+            chunks = await asyncio.to_thread(
+                split_audio_to_chunks,
+                audio_path,
+                work_dir / "chunks",
+                settings.max_openai_audio_bytes,
+            )
+        chunk_sizes = [chunk.stat().st_size for chunk in chunks]
+        logger.info(
+            "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
+            job_id,
+            len(chunks),
+            sum(chunk_sizes),
+            min(chunk_sizes),
+            max(chunk_sizes),
+            elapsed_ms(step_started),
+        )
+
+        async def report_progress(event: str, data: object) -> None:
+            progress_data = data if isinstance(data, dict) else {}
+            if event == "transcribing_chunk":
+                index = progress_data.get("index")
+                total = progress_data.get("total")
+                await status.edit_text(f"Step 4/6: transcribing chunk {index}/{total}...")
+                logger.info(
+                    "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s model=%s",
+                    job_id,
+                    index,
+                    total,
+                    progress_data.get("chunk_bytes"),
+                    progress_data.get("model"),
+                )
+            elif event == "chunk_transcribed":
+                logger.info(
+                    "job %s step 4/6 transcribed chunk %s/%s: raw_chars=%s",
+                    job_id,
+                    progress_data.get("index"),
+                    progress_data.get("total"),
+                    progress_data.get("raw_chars"),
+                )
+            elif event == "refining_transcript":
+                await status.edit_text("Step 5/6: refining transcript...")
+                logger.info(
+                    "job %s step 5/6 refining transcript: raw_chars=%s model=%s",
+                    job_id,
+                    progress_data.get("raw_chars"),
+                    progress_data.get("model"),
+                )
+            elif event == "refinement_complete":
+                logger.info(
+                    "job %s step 5/6 refined transcript: cleaned_chars=%s",
+                    job_id,
+                    progress_data.get("cleaned_chars"),
+                )
+
+        transcript = await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
 
     transcript = transcript.strip() or "No speech was detected."
-    await status.edit_text("Transcript ready.")
+    await status.edit_text("Step 6/6: sending cleaned transcript...")
+    logger.info(
+        "job %s step 6/6 sending cleaned transcript: output_chars=%d delivery=%s",
+        job_id,
+        len(transcript),
+        "text" if should_send_as_text(transcript) else "document",
+    )
     await send_transcript(message, transcript)
+    await status.edit_text("Transcript ready.")
+    logger.info(
+        "job %s completed: duration_ms=%d output_chars=%d",
+        job_id,
+        elapsed_ms(job_started),
+        len(transcript),
+    )
 
 
 async def send_transcript(message: Message, transcript: str) -> None:
@@ -176,6 +290,10 @@ def get_attachment_suffix(attachment: Video | Document) -> str:
     file_name = getattr(attachment, "file_name", None)
     suffix = Path(file_name).suffix.lower() if file_name else ""
     return suffix if suffix in VIDEO_EXTENSIONS else ".mp4"
+
+
+def elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
 
 
 def main() -> None:
