@@ -223,7 +223,35 @@ async def test_handle_tempo_command_ignores_private_and_channel_chats(chat_type:
 async def test_handle_tempo_command_ignores_invalid_values(args: list[str]) -> None:
     message = FakeMessage(chat_type=ChatType.GROUP)
     update = SimpleNamespace(effective_message=message)
-    context = SimpleNamespace(args=args, bot_data={"audio_tempo": 1.0})
+    context = SimpleNamespace(
+        args=args,
+        bot_data={
+            "audio_tempo": 1.0,
+            "settings": Settings(telegram_bot_token="token", openai_api_key="key"),
+        },
+    )
+
+    await handle_tempo_command(update, context)
+
+    assert context.bot_data["audio_tempo"] == 1.0
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_tempo_command_ignores_other_group_topics() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=9)
+    update = SimpleNamespace(effective_message=message)
+    context = SimpleNamespace(
+        args=["1.2"],
+        bot_data={
+            "audio_tempo": 1.0,
+            "settings": Settings(
+                telegram_bot_token="token",
+                openai_api_key="key",
+                allowed_telegram_topic_id=8,
+            ),
+        },
+    )
 
     await handle_tempo_command(update, context)
 
@@ -301,6 +329,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
         telegram_bot_token="token",
         openai_api_key="key",
         max_video_mb=10 / 1024 / 1024,
+        allowed_telegram_topic_id=8,
     )
     attachment = SimpleNamespace(file_size=10)
     message = FakeMessage(video=attachment, chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
@@ -321,6 +350,76 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
         assert args[1] is attachment
         assert args[6] == 1.4
         context.bot_data["audio_tempo"] = 2.0
+
+    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+
+    await handle_video_upload(update, context)
+
+    assert processed
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_thread_id", [9, None])
+async def test_handle_video_upload_ignores_restricted_group_topics(
+    monkeypatch: pytest.MonkeyPatch,
+    message_thread_id: int | None,
+) -> None:
+    attachment = SimpleNamespace(file_size=1)
+    message = FakeMessage(
+        video=attachment,
+        chat_type=ChatType.SUPERGROUP,
+        message_id=123,
+        message_thread_id=message_thread_id,
+    )
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openai_api_key="key",
+                allowed_telegram_topic_id=8,
+            ),
+            "job_semaphore": asyncio.Semaphore(1),
+            "audio_tempo": 1.0,
+        }
+    )
+
+    async def fail_process_video_message(*_: object) -> None:
+        raise AssertionError("off-topic group videos should not be processed")
+
+    monkeypatch.setattr(bot_module, "process_video_message", fail_process_video_message)
+
+    await handle_video_upload(update, context)
+
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_video_upload_allows_private_chat_when_topic_restricted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attachment = SimpleNamespace(file_size=1)
+    message = FakeMessage(video=attachment)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openai_api_key="key",
+                allowed_telegram_topic_id=8,
+            ),
+            "job_semaphore": asyncio.Semaphore(1),
+            "audio_tempo": 1.0,
+        }
+    )
+    processed = False
+
+    async def fake_process_video_message(*args: object) -> None:
+        nonlocal processed
+        processed = True
+        assert args[0] is message
+        assert args[1] is attachment
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 

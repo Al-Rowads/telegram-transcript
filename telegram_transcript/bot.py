@@ -68,6 +68,10 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if message is None or get_chat_type(message) not in GROUP_CHAT_TYPES:
         return
 
+    settings: Settings = context.bot_data["settings"]
+    if not is_allowed_group_topic(settings, message):
+        return
+
     audio_tempo = parse_tempo_command_args(getattr(context, "args", None))
     if audio_tempo is None:
         return
@@ -84,6 +88,9 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     settings: Settings = context.bot_data["settings"]
+    if not is_allowed_group_topic(settings, message):
+        return
+
     user_id = update.effective_user.id if update.effective_user else None
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
@@ -339,6 +346,14 @@ def is_authorized(settings: Settings, user_id: int | None) -> bool:
     if not settings.allowed_telegram_user_ids:
         return True
     return user_id in settings.allowed_telegram_user_ids
+
+
+def is_allowed_group_topic(settings: Settings, message: Message) -> bool:
+    if settings.allowed_telegram_topic_id is None:
+        return True
+    if get_chat_type(message) not in GROUP_CHAT_TYPES:
+        return True
+    return getattr(message, "message_thread_id", None) == settings.allowed_telegram_topic_id
 
 
 def get_video_attachment(message: Message) -> Video | Document | None:

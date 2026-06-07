@@ -19,6 +19,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.refine is True
+    assert settings.allowed_telegram_topic_id is None
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.audio_tempo == 1.0
@@ -33,6 +34,7 @@ def test_load_settings_parses_optional_values() -> None:
             "OPENAI_REFINE_MODEL": "custom-refine-model",
             "REFINE": "false",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
+            "ALLOWED_TELEGRAM_TOPIC_ID": "789",
             "MAX_VIDEO_MB": "25.5",
             "MAX_OPENAI_AUDIO_MB": "12",
             "AUDIO_TEMPO": "1",
@@ -45,6 +47,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.openai_refine_model == "custom-refine-model"
     assert settings.refine is False
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
+    assert settings.allowed_telegram_topic_id == 789
     assert settings.max_video_mb == 25.5
     assert settings.max_openai_audio_mb == 12
     assert settings.audio_tempo == 1
@@ -69,6 +72,12 @@ def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:
 def test_parse_user_ids_rejects_invalid_values() -> None:
     with pytest.raises(ConfigError, match="Invalid Telegram user ID"):
         parse_user_ids("123, nope")
+
+
+@pytest.mark.parametrize("topic_id", ["nope", "0"])
+def test_load_settings_rejects_invalid_allowed_telegram_topic_id(topic_id: str) -> None:
+    with pytest.raises(ConfigError, match="ALLOWED_TELEGRAM_TOPIC_ID"):
+        load_settings({**BASE_ENV, "ALLOWED_TELEGRAM_TOPIC_ID": topic_id}, load_dotenv_file=False)
 
 
 def test_parse_bool_accepts_common_values() -> None:

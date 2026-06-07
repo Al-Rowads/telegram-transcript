@@ -22,6 +22,7 @@ class Settings:
     openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = True
     allowed_telegram_user_ids: frozenset[int] = frozenset()
+    allowed_telegram_topic_id: int | None = None
     max_video_mb: float = 100.0
     max_openai_audio_mb: float = 24.0
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
@@ -67,6 +68,10 @@ def load_settings(
         openai_refine_model=refine_model,
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
+        allowed_telegram_topic_id=parse_optional_positive_int(
+            source.get("ALLOWED_TELEGRAM_TOPIC_ID"),
+            "ALLOWED_TELEGRAM_TOPIC_ID",
+        ),
         max_video_mb=max_video_mb,
         max_openai_audio_mb=max_openai_audio_mb,
         audio_tempo=audio_tempo,
@@ -116,6 +121,18 @@ def parse_positive_float(raw: str | None, name: str, default: float) -> float:
 def parse_positive_int(raw: str | None, name: str, default: int) -> int:
     if raw is None or not raw.strip():
         return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer.") from exc
+    if value <= 0:
+        raise ConfigError(f"{name} must be greater than zero.")
+    return value
+
+
+def parse_optional_positive_int(raw: str | None, name: str) -> int | None:
+    if raw is None or not raw.strip():
+        return None
     try:
         value = int(raw)
     except ValueError as exc:

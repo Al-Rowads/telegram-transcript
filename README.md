@@ -34,6 +34,7 @@ Optional variables:
 - `OPENAI_REFINE_MODEL`: text model used to refine raw speech-to-text output. Defaults to `gpt-5.4-mini`.
 - `REFINE`: set to `true` to run refinement after transcription, or `false` to return raw ASR output. Defaults to `true`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
+- `ALLOWED_TELEGRAM_TOPIC_ID`: Telegram forum topic ID to process in groups/supergroups. When set, group messages outside that topic are ignored. Private chats keep working.
 - `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
 - `MAX_OPENAI_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`, below OpenAI's 25 MB upload limit.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
@@ -69,6 +70,8 @@ No ports are exposed because the bot uses long polling.
 ## Group Chats
 
 Add the bot to a group or supergroup to transcribe videos posted there. The bot replies to the original video message so the sender and thread stay clear.
+
+For groups with topics, set `ALLOWED_TELEGRAM_TOPIC_ID` to make the bot process only one topic. The bot reads Telegram's `message_thread_id`, so send a test message in the target topic and temporarily log that value if you need to discover it.
 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
