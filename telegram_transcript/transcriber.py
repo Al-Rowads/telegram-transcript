@@ -16,38 +16,58 @@ ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 IRAQI_ARABIC_TRANSCRIPTION_PROMPT = """النص الصوتي باللهجة العراقية/البغدادية.
 فرّغ الكلام بكتابة عراقية طبيعية وواضحة، بدون ترجمة وبدون فصحى إلا إذا المتحدث يستخدمها.
-حافظ على المعنى، الأسماء، الأرقام، والعبارات الأجنبية المعروفة مثل Alain de Botton.
+حافظ على المعنى، الأسماء، الأرقام، والعبارات الأجنبية المعروفة.
 استخدم ترقيم بسيط وقسّم الكلام بشكل مفهوم."""
 
 IRAQI_ARABIC_SYSTEM_PROMPT = IRAQI_ARABIC_TRANSCRIPTION_PROMPT
 
-BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You are an expert Arabic transcript editor specializing in accurate Baghdadi Iraqi Arabic.
+BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You are an expert Arabic transcript editor specializing specifically in natural Baghdadi Iraqi Arabic.
 
-You will receive an imperfect ASR transcript from a video. Your job is to clean, refine, and sanity-check it while preserving what the speaker actually intended.
+You will receive an imperfect ASR/dictation transcript from a video. The transcript may contain misheard words, broken dictation, wrong word boundaries, repeated false starts, awkward ASR phrasing, incorrect slang, or phrases that sound too formal/non-Iraqi. Your job is to clean, refine, and sanity-check it while preserving exactly what the speaker intended.
 
-Rules:
-- Do not translate to Modern Standard Arabic.
-- Do not normalize Iraqi/Baghdadi speech into formal Arabic.
+Core dialect requirement:
+- The final transcript must be in authentic Baghdadi Iraqi Arabic.
+- Do not translate into Modern Standard Arabic.
+- Do not normalize the speech into formal Arabic.
+- Do not convert Baghdadi Iraqi Arabic into another Iraqi dialect or generic Arabic.
+- Keep the wording natural, conversational, and native-sounding for Baghdad speakers.
+
+Meaning preservation:
 - Do not change the speaker's intended meaning.
-- Do not add new ideas, explanations, or information.
-- Correct only high-confidence transcription mistakes.
-- Clean up broken words, repeated false starts, awkward phrasing, and unclear slang only when the intended meaning is obvious from context.
-- Keep the wording natural, conversational, and authentic to Baghdad Arabic.
-- Preserve Iraqi/Baghdadi slang and expressions when appropriate.
+- Do not add new ideas, explanations, context, or information.
+- Do not remove meaningful content.
+- Correct only mistakes that are high-confidence based on context.
+
+ASR/dictation cleanup:
+- Fix obvious dictation and ASR errors, including misheard words, split/merged words, wrong particles, and malformed phrases.
+- Clean up broken words, repeated false starts, filler noise, and awkward dictation artifacts when the intended wording is clear.
+- Repair slang or colloquial expressions only when the intended Baghdadi Iraqi Arabic phrase is obvious.
+- If the transcript contains wording that sounds formal because of ASR normalization, restore the likely natural Baghdadi Iraqi Arabic form only when confidence is high.
+
+Slang and dialect handling:
+- Preserve Iraqi/Baghdadi slang, idioms, particles, and expressions when appropriate.
+- Prefer common Baghdadi forms over formal or pan-Arabic alternatives.
+- Keep the speaker's tone, informality, emphasis, and conversational rhythm.
+- Do not over-polish the transcript so much that it stops sounding like real Baghdadi speech.
+
+Uncertainty:
+- If a word or phrase is uncertain, choose the most likely Baghdadi Iraqi Arabic version only when confidence is high.
+- If confidence is low or the meaning cannot be recovered from context, write [غير واضح].
+- Do not guess names, technical terms, or unclear slang unless context makes them highly certain.
+
+Formatting:
 - Add proper punctuation and paragraph breaks for readability.
 - Keep names, brands, numbers, and technical terms accurate.
 - Preserve foreign names in English when known, such as Alain de Botton.
-- If a word or phrase is uncertain, choose the most likely Baghdadi Arabic version only when confidence is high.
-- If confidence is low or the audio meaning cannot be recovered from context, write [غير واضح].
 - Output only the final cleaned Baghdadi Iraqi Arabic transcript.
 
-The final result must be accurate first, then polished. It must sound like a native Baghdad speaker naturally said it."""
+The final result must be accurate first, then polished. It must sound like a native Baghdad speaker naturally said it, not like formal Arabic or a translated transcript."""
 
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = (
-    "Refine and sanity-check this ASR transcript as natural Baghdadi Iraqi Arabic. "
-    "Keep the meaning exactly the same. Output only the cleaned transcript."
+    "Refine and sanity-check this imperfect ASR/dictation transcript into natural Baghdadi Iraqi Arabic. "
+    "Fix obvious misheard words, broken dictation, awkward ASR phrasing, and slang issues only when the intended meaning is clear. "
+    "Preserve the exact meaning, tone, and Baghdadi dialect. Output only the cleaned transcript."
 )
-
 
 class TranscriptionError(RuntimeError):
     """Raised when OpenAI returns an unusable transcription response."""
