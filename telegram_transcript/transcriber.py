@@ -62,12 +62,14 @@ class OpenAITranscriber:
         prompt: str = IRAQI_ARABIC_SYSTEM_PROMPT,
         refinement_model: str = DEFAULT_REFINEMENT_MODEL,
         refinement_system_prompt: str = BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT,
+        refine: bool = True,
         client: Any | None = None,
     ) -> None:
         self.model = model
         self.prompt = prompt
         self.refinement_model = refinement_model
         self.refinement_system_prompt = refinement_system_prompt
+        self.refine = refine
         self.client = client if client is not None else OpenAI(api_key=api_key)
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
@@ -91,7 +93,7 @@ class OpenAITranscriber:
 
     def transcribe_chunks(self, chunks: Sequence[Path]) -> str:
         transcript = self.transcribe_chunks_raw(chunks)
-        if not transcript.strip():
+        if not transcript.strip() or not self.refine:
             return transcript
         return self.refine_transcript(transcript)
 
@@ -157,7 +159,7 @@ class OpenAITranscriber:
                 )
 
         transcript = "\n\n".join(transcripts)
-        if not transcript.strip():
+        if not transcript.strip() or not self.refine:
             return transcript
 
         if progress_callback is not None:

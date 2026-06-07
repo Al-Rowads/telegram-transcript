@@ -324,7 +324,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
         "Step 5/6: refining transcript...",
-        "Step 6/6: sending cleaned transcript...",
+        "Step 6/6: sending transcript...",
         "Transcript ready.",
     ]
     assert "job1234 step 1/6" in caplog.text

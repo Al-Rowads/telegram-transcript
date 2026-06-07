@@ -20,6 +20,7 @@ class Settings:
     openai_api_key: str
     openai_transcribe_model: str = DEFAULT_TRANSCRIPTION_MODEL
     openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
+    refine: bool = True
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
     max_openai_audio_mb: float = 24.0
@@ -48,6 +49,7 @@ def load_settings(
     openai_api_key = require_value(source, "OPENAI_API_KEY")
     model = source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip() or DEFAULT_TRANSCRIPTION_MODEL
     refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
+    refine = parse_bool(source.get("REFINE"), "REFINE", True)
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
     max_openai_audio_mb = parse_positive_float(
         source.get("MAX_OPENAI_AUDIO_MB"),
@@ -63,6 +65,7 @@ def load_settings(
         openai_api_key=openai_api_key,
         openai_transcribe_model=model,
         openai_refine_model=refine_model,
+        refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,
         max_openai_audio_mb=max_openai_audio_mb,
@@ -120,6 +123,17 @@ def parse_positive_int(raw: str | None, name: str, default: int) -> int:
     if value <= 0:
         raise ConfigError(f"{name} must be greater than zero.")
     return value
+
+
+def parse_bool(raw: str | None, name: str, default: bool) -> bool:
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false.")
 
 
 def parse_audio_tempo(raw: str | None) -> float:

@@ -32,6 +32,7 @@ Optional variables:
 
 - `OPENAI_TRANSCRIBE_MODEL`: defaults to `gpt-4o-transcribe`.
 - `OPENAI_REFINE_MODEL`: text model used to refine raw speech-to-text output. Defaults to `gpt-5.4-mini`.
+- `REFINE`: set to `true` to run refinement after transcription, or `false` to return raw ASR output. Defaults to `true`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
 - `MAX_OPENAI_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`, below OpenAI's 25 MB upload limit.

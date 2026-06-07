@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from telegram_transcript.config import ConfigError, load_settings, mb_to_bytes, parse_user_ids
+from telegram_transcript.config import ConfigError, load_settings, mb_to_bytes, parse_bool, parse_user_ids
 
 
 BASE_ENV = {
@@ -18,6 +18,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openai_api_key == "openai-key"
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "gpt-5.4-mini"
+    assert settings.refine is True
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.audio_tempo == 1.0
@@ -30,6 +31,7 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENAI_TRANSCRIBE_MODEL": "gpt-4o-transcribe",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
+            "REFINE": "false",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "MAX_VIDEO_MB": "25.5",
             "MAX_OPENAI_AUDIO_MB": "12",
@@ -41,6 +43,7 @@ def test_load_settings_parses_optional_values() -> None:
 
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "custom-refine-model"
+    assert settings.refine is False
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5
     assert settings.max_openai_audio_mb == 12
@@ -66,3 +69,15 @@ def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:
 def test_parse_user_ids_rejects_invalid_values() -> None:
     with pytest.raises(ConfigError, match="Invalid Telegram user ID"):
         parse_user_ids("123, nope")
+
+
+def test_parse_bool_accepts_common_values() -> None:
+    assert parse_bool("true", "REFINE", False) is True
+    assert parse_bool("1", "REFINE", False) is True
+    assert parse_bool("off", "REFINE", True) is False
+    assert parse_bool(None, "REFINE", True) is True
+
+
+def test_parse_bool_rejects_invalid_values() -> None:
+    with pytest.raises(ConfigError, match="REFINE"):
+        parse_bool("sometimes", "REFINE", True)

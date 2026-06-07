@@ -130,6 +130,54 @@ def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path)
     assert transcriber.transcribe_chunks([audio]) == ""
 
 
+def test_transcribe_chunks_skips_refinement_when_disabled(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def create(self, *, model: str, file: object, prompt: str) -> object:
+            return SimpleNamespace(text="raw transcript")
+
+    class FakeResponses:
+        def create(self, **_: object) -> object:
+            raise AssertionError("Refinement should not run when REFINE=false.")
+
+    fake_client = SimpleNamespace(
+        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
+        responses=FakeResponses(),
+    )
+    transcriber = OpenAITranscriber(api_key="key", client=fake_client, refine=False)
+
+    assert transcriber.transcribe_chunks([audio]) == "raw transcript"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_async_skips_refinement_when_disabled(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def create(self, *, model: str, file: object, prompt: str) -> object:
+            return SimpleNamespace(text="raw transcript")
+
+    class FakeResponses:
+        def create(self, **_: object) -> object:
+            raise AssertionError("Refinement should not run when REFINE=false.")
+
+    fake_client = SimpleNamespace(
+        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
+        responses=FakeResponses(),
+    )
+    transcriber = OpenAITranscriber(api_key="key", client=fake_client, refine=False)
+    progress_events: list[str] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        progress_events.append(event)
+
+    assert await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress) == "raw transcript"
+    assert progress_events == ["transcribing_chunk", "chunk_transcribed"]
+
+
 def test_transcribe_chunks_raises_when_refinement_has_no_text(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")

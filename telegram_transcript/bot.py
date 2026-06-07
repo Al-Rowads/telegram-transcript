@@ -28,6 +28,7 @@ def create_application(settings: Settings | None = None) -> Application:
         api_key=settings.openai_api_key,
         model=settings.openai_transcribe_model,
         refinement_model=settings.openai_refine_model,
+        refine=settings.refine,
     )
 
     app = Application.builder().token(settings.telegram_bot_token).build()
@@ -82,12 +83,13 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine=%s refine_model=%s",
         job_id,
         get_attachment_suffix(attachment),
         file_size,
         settings.audio_tempo,
         settings.openai_transcribe_model,
+        settings.refine,
         settings.openai_refine_model,
     )
 
@@ -243,9 +245,9 @@ async def process_video_message(
         transcript = await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
 
     transcript = transcript.strip() or "No speech was detected."
-    await status.edit_text("Step 6/6: sending cleaned transcript...")
+    await status.edit_text("Step 6/6: sending transcript...")
     logger.info(
-        "job %s step 6/6 sending cleaned transcript: output_chars=%d delivery=%s",
+        "job %s step 6/6 sending transcript: output_chars=%d delivery=%s",
         job_id,
         len(transcript),
         "text" if should_send_as_text(transcript) else "document",
