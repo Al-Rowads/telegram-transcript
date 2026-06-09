@@ -6,9 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
+    HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES,
     get_attachment_suffix,
     get_video_attachment,
     handle_non_video,
@@ -324,6 +326,63 @@ async def test_handle_video_upload_ignores_oversized_video() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_video_upload_replies_when_hosted_telegram_download_limit_is_exceeded() -> None:
+    attachment = SimpleNamespace(file_size=HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES + 1)
+    message = FakeMessage(video=attachment)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openai_api_key="key",
+                max_video_mb=100,
+            )
+        }
+    )
+
+    await handle_video_upload(update, context)
+
+    assert len(message.text_replies) == 1
+    assert "20 MB" in message.text_replies[0]
+    assert "local Telegram Bot API server" in message.text_replies[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_video_upload_allows_large_file_when_telegram_local_mode_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        openai_api_key="key",
+        telegram_local_mode=True,
+        max_video_mb=100,
+    )
+    attachment = SimpleNamespace(file_size=HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES + 1)
+    message = FakeMessage(video=attachment)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "job_semaphore": asyncio.Semaphore(1),
+            "audio_tempo": 1.0,
+        }
+    )
+    processed = False
+
+    async def fake_process_video_message(*args: object) -> None:
+        nonlocal processed
+        processed = True
+        assert args[1] is attachment
+
+    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+
+    await handle_video_upload(update, context)
+
+    assert processed
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
 async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(
         telegram_bot_token="token",
@@ -531,3 +590,24 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
 
     assert status_ref["message"] is None
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_replies_when_get_file_reports_file_too_big() -> None:
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = None
+
+        async def get_file(self) -> object:
+            raise BadRequest("File is too big")
+
+    message = FakeMessage()
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(bot_data={"transcriber": object()})
+
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+
+    assert status_ref["message"] is None
+    assert len(message.text_replies) == 1
+    assert "20 MB" in message.text_replies[0]

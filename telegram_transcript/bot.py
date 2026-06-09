@@ -10,9 +10,10 @@ from pathlib import Path
 
 from telegram import Document, InputFile, Message, Update, Video
 from telegram.constants import ChatType
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
+from telegram_transcript.config import ConfigError, Settings, load_settings, mb_to_bytes, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+HOSTED_TELEGRAM_DOWNLOAD_LIMIT_MB = 20.0
+HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES = mb_to_bytes(HOSTED_TELEGRAM_DOWNLOAD_LIMIT_MB)
 
 
 def create_application(settings: Settings | None = None) -> Application:
@@ -32,7 +35,15 @@ def create_application(settings: Settings | None = None) -> Application:
         refine=settings.refine,
     )
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    builder = Application.builder().token(settings.telegram_bot_token)
+    if settings.telegram_api_base_url is not None:
+        builder = builder.base_url(settings.telegram_api_base_url)
+    if settings.telegram_api_base_file_url is not None:
+        builder = builder.base_file_url(settings.telegram_api_base_file_url)
+    if settings.telegram_local_mode:
+        builder = builder.local_mode(True)
+
+    app = builder.build()
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
@@ -103,6 +114,9 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     file_size = getattr(attachment, "file_size", None)
     if file_size is not None and file_size > settings.max_video_bytes:
         return
+    if exceeds_hosted_telegram_download_limit(file_size, settings):
+        await reply_to_source(message, hosted_telegram_download_limit_message())
+        return
 
     audio_tempo = get_runtime_audio_tempo(context, settings)
     job_id = uuid.uuid4().hex[:8]
@@ -159,8 +173,20 @@ async def process_video_message(
             get_attachment_suffix(attachment),
             getattr(attachment, "file_size", None),
         )
-        telegram_file = await attachment.get_file()
-        await telegram_file.download_to_drive(custom_path=str(video_path))
+        try:
+            telegram_file = await attachment.get_file()
+            await telegram_file.download_to_drive(custom_path=str(video_path))
+        except BadRequest as exc:
+            if is_file_too_big_error(exc) and get_hosted_telegram_download_limit_bytes(settings) is not None:
+                logger.info(
+                    "job %s rejected by Telegram getFile: telegram_file_size=%s hosted_limit_bytes=%d",
+                    job_id,
+                    getattr(attachment, "file_size", None),
+                    HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES,
+                )
+                await reply_to_source(message, hosted_telegram_download_limit_message())
+                return
+            raise
         video_bytes = video_path.stat().st_size
         logger.info(
             "job %s step 1/6 downloaded video: video_bytes=%d duration_ms=%d",
@@ -354,6 +380,29 @@ def is_allowed_group_topic(settings: Settings, message: Message) -> bool:
     if get_chat_type(message) not in GROUP_CHAT_TYPES:
         return True
     return getattr(message, "message_thread_id", None) == settings.allowed_telegram_topic_id
+
+
+def get_hosted_telegram_download_limit_bytes(settings: Settings) -> int | None:
+    if settings.telegram_local_mode:
+        return None
+    return HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES
+
+
+def exceeds_hosted_telegram_download_limit(file_size: int | None, settings: Settings) -> bool:
+    limit = get_hosted_telegram_download_limit_bytes(settings)
+    return file_size is not None and limit is not None and file_size > limit
+
+
+def hosted_telegram_download_limit_message() -> str:
+    limit = f"{HOSTED_TELEGRAM_DOWNLOAD_LIMIT_MB:g} MB"
+    return (
+        f"Telegram can only let bots download files up to {limit} on the hosted Bot API. "
+        "Send it as a compressed video, make the file smaller, or run a local Telegram Bot API server for larger files."
+    )
+
+
+def is_file_too_big_error(exc: BadRequest) -> bool:
+    return "file is too big" in str(exc).lower()
 
 
 def get_video_attachment(message: Message) -> Video | Document | None:

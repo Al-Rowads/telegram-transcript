@@ -16,6 +16,9 @@ def test_load_settings_uses_defaults() -> None:
 
     assert settings.telegram_bot_token == "telegram-token"
     assert settings.openai_api_key == "openai-key"
+    assert settings.telegram_api_base_url is None
+    assert settings.telegram_api_base_file_url is None
+    assert settings.telegram_local_mode is False
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.refine is True
@@ -32,6 +35,9 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENAI_TRANSCRIBE_MODEL": "gpt-4o-transcribe",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
+            "TELEGRAM_API_BASE_URL": " http://telegram-bot-api:8081/bot ",
+            "TELEGRAM_API_BASE_FILE_URL": " http://telegram-bot-api:8081/file/bot ",
+            "TELEGRAM_LOCAL_MODE": "true",
             "REFINE": "false",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "ALLOWED_TELEGRAM_TOPIC_ID": "789",
@@ -45,6 +51,9 @@ def test_load_settings_parses_optional_values() -> None:
 
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "custom-refine-model"
+    assert settings.telegram_api_base_url == "http://telegram-bot-api:8081/bot"
+    assert settings.telegram_api_base_file_url == "http://telegram-bot-api:8081/file/bot"
+    assert settings.telegram_local_mode is True
     assert settings.refine is False
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.allowed_telegram_topic_id == 789

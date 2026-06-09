@@ -18,6 +18,9 @@ class ConfigError(RuntimeError):
 class Settings:
     telegram_bot_token: str
     openai_api_key: str
+    telegram_api_base_url: str | None = None
+    telegram_api_base_file_url: str | None = None
+    telegram_local_mode: bool = False
     openai_transcribe_model: str = DEFAULT_TRANSCRIPTION_MODEL
     openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = True
@@ -47,6 +50,9 @@ def load_settings(
 
     source = env if env is not None else os.environ
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
+    telegram_api_base_url = parse_optional_string(source.get("TELEGRAM_API_BASE_URL"))
+    telegram_api_base_file_url = parse_optional_string(source.get("TELEGRAM_API_BASE_FILE_URL"))
+    telegram_local_mode = parse_bool(source.get("TELEGRAM_LOCAL_MODE"), "TELEGRAM_LOCAL_MODE", False)
     openai_api_key = require_value(source, "OPENAI_API_KEY")
     model = source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip() or DEFAULT_TRANSCRIPTION_MODEL
     refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
@@ -63,6 +69,9 @@ def load_settings(
 
     return Settings(
         telegram_bot_token=telegram_bot_token,
+        telegram_api_base_url=telegram_api_base_url,
+        telegram_api_base_file_url=telegram_api_base_file_url,
+        telegram_local_mode=telegram_local_mode,
         openai_api_key=openai_api_key,
         openai_transcribe_model=model,
         openai_refine_model=refine_model,
@@ -88,6 +97,13 @@ def require_value(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise ConfigError(f"{name} is required.")
     return value
+
+
+def parse_optional_string(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value or None
 
 
 def parse_user_ids(raw: str | None) -> frozenset[int]:
