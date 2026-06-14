@@ -30,6 +30,29 @@ def test_build_extract_audio_command_accepts_custom_tempo() -> None:
     assert ["-filter:a", "atempo=1"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
 
 
+def test_build_extract_audio_command_accepts_default_noise_filter() -> None:
+    command = ffmpeg.build_extract_audio_command(
+        Path("input.mp4"),
+        Path("output.mp3"),
+        noise_reduction_filter="anlmdn",
+    )
+
+    assert ["-filter:a", "anlmdn,atempo=1"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
+
+
+def test_build_extract_audio_command_accepts_extra_noise_filter() -> None:
+    command = ffmpeg.build_extract_audio_command(
+        Path("input.mp4"),
+        Path("output.mp3"),
+        audio_tempo=1.25,
+        noise_reduction_filter="highpass=f=80,afftdn=nr=15,loudnorm",
+    )
+
+    assert ["-filter:a", "highpass=f=80,afftdn=nr=15,loudnorm,atempo=1.25"] == command[
+        command.index("-filter:a") : command.index("-filter:a") + 2
+    ]
+
+
 def test_split_audio_to_chunks_retries_until_chunks_fit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     audio_path = tmp_path / "audio.mp3"
     audio_path.write_bytes(b"x" * 2000)

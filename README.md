@@ -84,6 +84,8 @@ For groups with topics, set `ALLOWED_TELEGRAM_TOPIC_ID` to make the bot process 
 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
+Use `/noise` before sending a video to apply default one-shot ffmpeg noise reduction to the next video in the same chat or topic. Use `/noise extra` for stronger filtering with high-pass, FFT denoise, and loudness normalization. The setting is consumed by the next accepted video and is not permanent.
+
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 
 ## Tests

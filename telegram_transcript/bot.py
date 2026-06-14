@@ -24,6 +24,13 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 HOSTED_TELEGRAM_DOWNLOAD_LIMIT_MB = 20.0
 HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES = mb_to_bytes(HOSTED_TELEGRAM_DOWNLOAD_LIMIT_MB)
+PENDING_NOISE_REDUCTION_KEY = "pending_noise_reduction_by_thread"
+DEFAULT_NOISE_REDUCTION_MODE = "default"
+EXTRA_NOISE_REDUCTION_MODE = "extra"
+NOISE_REDUCTION_FILTERS = {
+    DEFAULT_NOISE_REDUCTION_MODE: "anlmdn",
+    EXTRA_NOISE_REDUCTION_MODE: "highpass=f=80,afftdn=nr=15,loudnorm",
+}
 
 
 def create_application(settings: Settings | None = None) -> Application:
@@ -52,6 +59,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
+    app.add_handler(CommandHandler("noise", handle_noise_command))
     app.add_handler(MessageHandler(video_message_filter(), handle_video_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_video))
     return app
@@ -91,6 +99,28 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
 
+async def handle_noise_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    if not is_allowed_group_topic(settings, message):
+        return
+
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        return
+
+    noise_reduction_mode = parse_noise_command_args(getattr(context, "args", None))
+    if noise_reduction_mode is None:
+        return
+
+    if not set_pending_noise_reduction_mode(context, message, noise_reduction_mode):
+        return
+    await reply_to_source(message, noise_reduction_confirmation_text(noise_reduction_mode))
+
+
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
@@ -119,13 +149,15 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     audio_tempo = get_runtime_audio_tempo(context, settings)
+    noise_reduction_mode = consume_pending_noise_reduction_mode(context, message)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g noise_reduction=%s transcribe_model=%s refine=%s refine_model=%s",
         job_id,
         get_attachment_suffix(attachment),
         file_size,
         audio_tempo,
+        noise_reduction_mode or "none",
         settings.openai_transcribe_model,
         settings.refine,
         settings.openai_refine_model,
@@ -136,7 +168,16 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with semaphore:
         try:
             logger.info("job %s started", job_id)
-            await process_video_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
+            await process_video_message(
+                message,
+                attachment,
+                settings,
+                context,
+                status_ref,
+                job_id,
+                audio_tempo,
+                noise_reduction_mode,
+            )
         except (FfmpegError, TranscriptionError) as exc:
             logger.exception("job %s video transcription failed", job_id)
             status = status_ref["message"]
@@ -157,9 +198,11 @@ async def process_video_message(
     status_ref: dict[str, Message | None],
     job_id: str,
     audio_tempo: float,
+    noise_reduction_mode: str | None = None,
 ) -> None:
     transcriber: OpenAITranscriber = context.bot_data["transcriber"]
     job_started = time.monotonic()
+    noise_reduction_filter = get_noise_reduction_filter(noise_reduction_mode)
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -206,19 +249,21 @@ async def process_video_message(
         status = await reply_to_source(message, "Video received. Starting transcription...")
         status_ref["message"] = status
 
-        await status.edit_text(f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...")
+        await status.edit_text(extracting_audio_status_text(audio_tempo, noise_reduction_mode))
         step_started = time.monotonic()
         logger.info(
-            "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g",
+            "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g noise_reduction=%s",
             job_id,
             video_bytes,
             audio_tempo,
+            noise_reduction_mode or "none",
         )
         await asyncio.to_thread(
             extract_audio,
             video_path,
             audio_path,
             audio_tempo=audio_tempo,
+            noise_reduction_filter=noise_reduction_filter,
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(
@@ -358,6 +403,87 @@ def parse_tempo_command_args(args: object) -> float | None:
         return parse_audio_tempo(args[0])
     except ConfigError:
         return None
+
+
+def parse_noise_command_args(args: object) -> str | None:
+    if not isinstance(args, list):
+        return None
+    if len(args) == 0:
+        return DEFAULT_NOISE_REDUCTION_MODE
+    if len(args) == 1 and isinstance(args[0], str) and args[0].casefold() == EXTRA_NOISE_REDUCTION_MODE:
+        return EXTRA_NOISE_REDUCTION_MODE
+    return None
+
+
+def set_pending_noise_reduction_mode(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    noise_reduction_mode: str,
+) -> bool:
+    pending = get_pending_noise_reductions(context, create=True)
+    if pending is None:
+        return False
+    pending[get_noise_reduction_thread_key(message)] = noise_reduction_mode
+    return True
+
+
+def consume_pending_noise_reduction_mode(context: ContextTypes.DEFAULT_TYPE, message: Message) -> str | None:
+    pending = get_pending_noise_reductions(context, create=False)
+    if pending is None:
+        return None
+    noise_reduction_mode = pending.pop(get_noise_reduction_thread_key(message), None)
+    return noise_reduction_mode if noise_reduction_mode in NOISE_REDUCTION_FILTERS else None
+
+
+def get_pending_noise_reductions(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    create: bool,
+) -> dict[int | None, str] | None:
+    chat_data = getattr(context, "chat_data", None)
+    if chat_data is None:
+        return None
+
+    pending = chat_data.get(PENDING_NOISE_REDUCTION_KEY)
+    if pending is None:
+        if not create:
+            return None
+        pending = {}
+        chat_data[PENDING_NOISE_REDUCTION_KEY] = pending
+    if not isinstance(pending, dict):
+        if not create:
+            return None
+        pending = {}
+        chat_data[PENDING_NOISE_REDUCTION_KEY] = pending
+    return pending
+
+
+def get_noise_reduction_thread_key(message: Message) -> int | None:
+    return getattr(message, "message_thread_id", None)
+
+
+def get_noise_reduction_filter(noise_reduction_mode: str | None) -> str | None:
+    if noise_reduction_mode is None:
+        return None
+    return NOISE_REDUCTION_FILTERS.get(noise_reduction_mode)
+
+
+def describe_noise_reduction(noise_reduction_mode: str) -> str:
+    if noise_reduction_mode == EXTRA_NOISE_REDUCTION_MODE:
+        return "extra noise reduction"
+    return "default noise reduction"
+
+
+def noise_reduction_confirmation_text(noise_reduction_mode: str) -> str:
+    label = describe_noise_reduction(noise_reduction_mode).capitalize()
+    return f"{label} set for the next video."
+
+
+def extracting_audio_status_text(audio_tempo: float, noise_reduction_mode: str | None) -> str:
+    suffix = ""
+    if noise_reduction_mode is not None:
+        suffix = f" with {describe_noise_reduction(noise_reduction_mode)}"
+    return f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x{suffix}..."
 
 
 def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> float:

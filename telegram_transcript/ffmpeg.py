@@ -29,6 +29,7 @@ def build_extract_audio_command(
     executable: str = "ffmpeg",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
+    noise_reduction_filter: str | None = None,
 ) -> list[str]:
     return [
         executable,
@@ -44,13 +45,21 @@ def build_extract_audio_command(
         "-ar",
         "16000",
         "-filter:a",
-        f"atempo={audio_tempo:g}",
+        build_audio_filter_chain(audio_tempo, noise_reduction_filter),
         "-codec:a",
         "libmp3lame",
         "-b:a",
         f"{audio_bitrate_kbps}k",
         str(output_path),
     ]
+
+
+def build_audio_filter_chain(audio_tempo: float, noise_reduction_filter: str | None = None) -> str:
+    filters: list[str] = []
+    if noise_reduction_filter is not None and noise_reduction_filter.strip():
+        filters.append(noise_reduction_filter.strip())
+    filters.append(f"atempo={audio_tempo:g}")
+    return ",".join(filters)
 
 
 def build_split_audio_command(
@@ -94,6 +103,7 @@ def extract_audio(
     executable: str = "ffmpeg",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
+    noise_reduction_filter: str | None = None,
 ) -> Path:
     run_command(
         build_extract_audio_command(
@@ -102,6 +112,7 @@ def extract_audio(
             executable=executable,
             audio_bitrate_kbps=audio_bitrate_kbps,
             audio_tempo=audio_tempo,
+            noise_reduction_filter=noise_reduction_filter,
         )
     )
     if not audio_path.exists() or audio_path.stat().st_size == 0:
@@ -117,6 +128,7 @@ def prepare_audio_chunks(
     executable: str = "ffmpeg",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
+    noise_reduction_filter: str | None = None,
 ) -> list[Path]:
     audio_path = work_dir / "audio.mp3"
     extract_audio(
@@ -125,6 +137,7 @@ def prepare_audio_chunks(
         executable=executable,
         audio_bitrate_kbps=audio_bitrate_kbps,
         audio_tempo=audio_tempo,
+        noise_reduction_filter=noise_reduction_filter,
     )
     if audio_path.stat().st_size <= max_audio_bytes:
         return [audio_path]
@@ -145,6 +158,7 @@ async def prepare_audio_chunks_async(
     executable: str = "ffmpeg",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
+    noise_reduction_filter: str | None = None,
 ) -> list[Path]:
     return await asyncio.to_thread(
         prepare_audio_chunks,
@@ -154,6 +168,7 @@ async def prepare_audio_chunks_async(
         executable=executable,
         audio_bitrate_kbps=audio_bitrate_kbps,
         audio_tempo=audio_tempo,
+        noise_reduction_filter=noise_reduction_filter,
     )
 
 
