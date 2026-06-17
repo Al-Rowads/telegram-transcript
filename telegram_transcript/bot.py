@@ -228,6 +228,17 @@ async def process_media_message(
         source_path = work_dir / f"source{source_suffix}"
         audio_path = work_dir / "audio.mp3"
 
+        is_voice_note = is_audio and getattr(message, "voice", None) is not None
+        received_text = (
+            "Voice note received!"
+            if is_voice_note
+            else "Audio received!"
+            if is_audio
+            else "Video received!"
+        )
+        status = await reply_to_source(message, received_text)
+        status_ref["message"] = status
+
         step_started = time.monotonic()
         logger.info(
             "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
@@ -235,6 +246,7 @@ async def process_media_message(
             source_suffix,
             get_attachment_file_size(attachment),
         )
+        await edit_status(status, "Downloading...")
         await download_attachment(attachment, source_path)
         source_bytes = source_path.stat().st_size
         logger.info(
@@ -251,14 +263,6 @@ async def process_media_message(
                 settings.max_video_bytes,
             )
             return
-
-        received_text = (
-            "Audio received. Starting transcription..."
-            if is_audio
-            else "Video received. Starting transcription..."
-        )
-        status = await reply_to_source(message, received_text)
-        status_ref["message"] = status
 
         if is_audio and source_bytes <= settings.max_openai_audio_bytes:
             logger.info(
@@ -293,7 +297,7 @@ async def process_media_message(
                 elapsed_ms(step_started),
             )
 
-            await edit_status(status, "Step 3/6: preparing audio chunks...")
+            await edit_status(status, "Splitting audio...")
             step_started = time.monotonic()
             logger.info(
                 "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
@@ -327,7 +331,8 @@ async def process_media_message(
             if event == "transcribing_chunk":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
-                await edit_status(status, f"Step 4/6: transcribing chunk {index}/{total}...")
+                chunk_status = "Transcribing..." if total == 1 else f"Transcribing (chunk {index} of {total})..."
+                await edit_status(status, chunk_status)
                 logger.info(
                     "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s model=%s",
                     job_id,
@@ -345,7 +350,7 @@ async def process_media_message(
                     progress_data.get("raw_chars"),
                 )
             elif event == "refining_transcript":
-                await edit_status(status, "Step 5/6: refining transcript...")
+                await edit_status(status, "Refining transcript...")
                 logger.info(
                     "job %s step 5/6 refining transcript: raw_chars=%s model=%s",
                     job_id,
@@ -362,7 +367,7 @@ async def process_media_message(
         transcript = await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
 
     transcript = transcript.strip() or "No speech was detected."
-    await edit_status(status, "Step 6/6: sending transcript...")
+    await edit_status(status, "Sending transcript...")
     logger.info(
         "job %s step 6/6 sending transcript: output_chars=%d delivery=%s",
         job_id,
@@ -513,10 +518,13 @@ def noise_reduction_confirmation_text(noise_reduction_mode: str) -> str:
 
 
 def extracting_audio_status_text(audio_tempo: float, noise_reduction_mode: str | None) -> str:
-    suffix = ""
+    parts = []
+    if audio_tempo != 1.0:
+        parts.append(f"at {audio_tempo:g}x")
     if noise_reduction_mode is not None:
-        suffix = f" with {describe_noise_reduction(noise_reduction_mode)}"
-    return f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x{suffix}..."
+        parts.append(f"with {describe_noise_reduction(noise_reduction_mode)}")
+    suffix = " " + " ".join(parts) if parts else ""
+    return f"Converting to MP3{suffix}..."
 
 
 def get_runtime_audio_tempo(state: BotState, settings: Settings) -> float:
