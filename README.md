@@ -1,14 +1,15 @@
 # Telegram Video Transcription Bot
 
-A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`, sends the audio to OpenAI transcription, and replies with the transcript.
+A Python Telegram bot that receives a video, voice note, or MP3, gets speech audio (extracting it from video with `ffmpeg` when needed), sends the audio to OpenAI transcription, and replies with the transcript.
 
 ## Features
 
 - Telegram long polling, so no public webhook URL is required.
 - Accepts Telegram video messages and video documents.
+- Accepts Telegram voice notes and `.mp3` files, transcribing them directly and skipping the `ffmpeg` step when the audio is already within OpenAI's upload limit.
 - Works in private chats, groups, and supergroups.
-- Ignores text, non-video media, invalid commands, and oversized videos without replying.
-- Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`.
+- Ignores text, unsupported media, invalid commands, and oversized uploads without replying.
+- Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`, and falls back to the same compression for audio uploads that are too large to send directly.
 - Splits audio into safe chunks when it would exceed OpenAI's per-file upload limit.
 - Refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
 - Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
@@ -76,7 +77,7 @@ No ports are exposed because the bot uses long polling.
 
 ## Group Chats
 
-Add the bot to a group or supergroup to transcribe videos posted there. The bot replies to the original video message so the sender and thread stay clear.
+Add the bot to a group or supergroup to transcribe videos, voice notes, and MP3 files posted there. The bot replies to the original message so the sender and thread stay clear.
 
 For groups with topics, set `ALLOWED_TELEGRAM_TOPIC_ID` to make the bot process only one topic. The bot reads Telegram's `message_thread_id`, so send a test message in the target topic and temporarily log that value if you need to discover it.
 

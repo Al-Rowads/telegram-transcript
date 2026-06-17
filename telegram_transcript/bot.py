@@ -23,6 +23,8 @@ from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionErro
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+AUDIO_EXTENSIONS = {".mp3"}
+AUDIO_SUFFIX_BY_MIME = {"audio/mpeg": ".mp3", "audio/ogg": ".ogg", "audio/opus": ".ogg"}
 DEFAULT_NOISE_REDUCTION_MODE = "default"
 EXTRA_NOISE_REDUCTION_MODE = "extra"
 NOISE_REDUCTION_FILTERS = {
@@ -97,14 +99,14 @@ async def handle_new_message(event: events.NewMessage.Event, state: BotState) ->
             await handle_noise_command(message, state, args)
             return
 
-    if get_video_attachment(message) is not None:
-        await handle_video_upload(message, state)
+    if get_media_attachment(message) is not None:
+        await handle_media_upload(message, state)
         return
 
-    await handle_non_video(message, state)
+    await handle_non_media(message, state)
 
 
-async def handle_non_video(message: Message, state: BotState) -> None:
+async def handle_non_media(message: Message, state: BotState) -> None:
     return
 
 
@@ -141,7 +143,7 @@ async def handle_noise_command(message: Message, state: BotState, args: list[str
     await reply_to_source(message, noise_reduction_confirmation_text(noise_reduction_mode))
 
 
-async def handle_video_upload(message: Message, state: BotState) -> None:
+async def handle_media_upload(message: Message, state: BotState) -> None:
     if is_broadcast_channel(message):
         return
 
@@ -153,9 +155,11 @@ async def handle_video_upload(message: Message, state: BotState) -> None:
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
 
-    attachment = get_video_attachment(message)
+    attachment = get_media_attachment(message)
     if attachment is None:
         return
+
+    is_audio = not is_video_message(message) and is_audio_message(message)
 
     file_size = get_attachment_file_size(attachment)
     if file_size is not None and file_size > settings.max_video_bytes:
@@ -167,7 +171,7 @@ async def handle_video_upload(message: Message, state: BotState) -> None:
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g noise_reduction=%s transcribe_model=%s refine=%s refine_model=%s",
         job_id,
-        get_attachment_suffix(attachment),
+        get_audio_suffix(attachment) if is_audio else get_attachment_suffix(attachment),
         file_size,
         audio_tempo,
         noise_reduction_mode or "none",
@@ -180,7 +184,7 @@ async def handle_video_upload(message: Message, state: BotState) -> None:
     async with state.job_semaphore:
         try:
             logger.info("job %s started", job_id)
-            await process_video_message(
+            await process_media_message(
                 message,
                 attachment,
                 settings,
@@ -189,20 +193,21 @@ async def handle_video_upload(message: Message, state: BotState) -> None:
                 job_id,
                 audio_tempo,
                 noise_reduction_mode,
+                is_audio,
             )
         except (FfmpegError, TranscriptionError) as exc:
-            logger.exception("job %s video transcription failed", job_id)
+            logger.exception("job %s media transcription failed", job_id)
             status = status_ref["message"]
             if status is not None:
                 await edit_status(status, f"Transcription failed: {exc}")
         except Exception:
-            logger.exception("job %s unexpected video transcription failure", job_id)
+            logger.exception("job %s unexpected media transcription failure", job_id)
             status = status_ref["message"]
             if status is not None:
                 await edit_status(status, "Transcription failed because of an unexpected error.")
 
 
-async def process_video_message(
+async def process_media_message(
     message: Message,
     attachment: Message,
     settings: Settings,
@@ -211,6 +216,7 @@ async def process_video_message(
     job_id: str,
     audio_tempo: float,
     noise_reduction_mode: str | None = None,
+    is_audio: bool = False,
 ) -> None:
     transcriber = state.transcriber
     job_started = time.monotonic()
@@ -218,77 +224,93 @@ async def process_video_message(
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
-        video_path = work_dir / f"video{get_attachment_suffix(attachment)}"
+        source_suffix = get_audio_suffix(attachment) if is_audio else get_attachment_suffix(attachment)
+        source_path = work_dir / f"source{source_suffix}"
         audio_path = work_dir / "audio.mp3"
 
         step_started = time.monotonic()
         logger.info(
-            "job %s step 1/6 downloading video: suffix=%s telegram_file_size=%s",
+            "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
             job_id,
-            get_attachment_suffix(attachment),
+            source_suffix,
             get_attachment_file_size(attachment),
         )
-        await download_attachment(attachment, video_path)
-        video_bytes = video_path.stat().st_size
+        await download_attachment(attachment, source_path)
+        source_bytes = source_path.stat().st_size
         logger.info(
-            "job %s step 1/6 downloaded video: video_bytes=%d duration_ms=%d",
+            "job %s step 1/6 downloaded media: source_bytes=%d duration_ms=%d",
             job_id,
-            video_bytes,
+            source_bytes,
             elapsed_ms(step_started),
         )
-        if video_bytes > settings.max_video_bytes:
+        if source_bytes > settings.max_video_bytes:
             logger.info(
-                "job %s rejected after download: video_bytes=%d max_video_bytes=%d",
+                "job %s rejected after download: source_bytes=%d max_video_bytes=%d",
                 job_id,
-                video_bytes,
+                source_bytes,
                 settings.max_video_bytes,
             )
             return
 
-        status = await reply_to_source(message, "Video received. Starting transcription...")
+        received_text = (
+            "Audio received. Starting transcription..."
+            if is_audio
+            else "Video received. Starting transcription..."
+        )
+        status = await reply_to_source(message, received_text)
         status_ref["message"] = status
 
-        await edit_status(status, extracting_audio_status_text(audio_tempo, noise_reduction_mode))
-        step_started = time.monotonic()
-        logger.info(
-            "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g noise_reduction=%s",
-            job_id,
-            video_bytes,
-            audio_tempo,
-            noise_reduction_mode or "none",
-        )
-        await asyncio.to_thread(
-            extract_audio,
-            video_path,
-            audio_path,
-            audio_tempo=audio_tempo,
-            noise_reduction_filter=noise_reduction_filter,
-        )
-        audio_bytes = audio_path.stat().st_size
-        logger.info(
-            "job %s step 2/6 extracted MP3 audio: audio_bytes=%d duration_ms=%d",
-            job_id,
-            audio_bytes,
-            elapsed_ms(step_started),
-        )
-
-        await edit_status(status, "Step 3/6: preparing audio chunks...")
-        step_started = time.monotonic()
-        logger.info(
-            "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
-            job_id,
-            audio_bytes,
-            settings.max_openai_audio_bytes,
-        )
-        if audio_bytes <= settings.max_openai_audio_bytes:
-            chunks = [audio_path]
-        else:
-            chunks = await asyncio.to_thread(
-                split_audio_to_chunks,
-                audio_path,
-                work_dir / "chunks",
+        if is_audio and source_bytes <= settings.max_openai_audio_bytes:
+            logger.info(
+                "job %s step 2/6 skipping audio extraction: source_bytes=%d max_chunk_bytes=%d",
+                job_id,
+                source_bytes,
                 settings.max_openai_audio_bytes,
             )
+            chunks = [source_path]
+        else:
+            await edit_status(status, extracting_audio_status_text(audio_tempo, noise_reduction_mode))
+            step_started = time.monotonic()
+            logger.info(
+                "job %s step 2/6 extracting MP3 audio: source_bytes=%d audio_tempo=%g noise_reduction=%s",
+                job_id,
+                source_bytes,
+                audio_tempo,
+                noise_reduction_mode or "none",
+            )
+            await asyncio.to_thread(
+                extract_audio,
+                source_path,
+                audio_path,
+                audio_tempo=audio_tempo,
+                noise_reduction_filter=noise_reduction_filter,
+            )
+            audio_bytes = audio_path.stat().st_size
+            logger.info(
+                "job %s step 2/6 extracted MP3 audio: audio_bytes=%d duration_ms=%d",
+                job_id,
+                audio_bytes,
+                elapsed_ms(step_started),
+            )
+
+            await edit_status(status, "Step 3/6: preparing audio chunks...")
+            step_started = time.monotonic()
+            logger.info(
+                "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
+                job_id,
+                audio_bytes,
+                settings.max_openai_audio_bytes,
+            )
+            if audio_bytes <= settings.max_openai_audio_bytes:
+                chunks = [audio_path]
+            else:
+                chunks = await asyncio.to_thread(
+                    split_audio_to_chunks,
+                    audio_path,
+                    work_dir / "chunks",
+                    settings.max_openai_audio_bytes,
+                )
+
         chunk_sizes = [chunk.stat().st_size for chunk in chunks]
         logger.info(
             "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
@@ -357,9 +379,9 @@ async def process_video_message(
     )
 
 
-async def download_attachment(attachment: Message, video_path: Path) -> None:
-    await attachment.download_media(file=str(video_path))
-    if not video_path.exists():
+async def download_attachment(attachment: Message, target_path: Path) -> None:
+    await attachment.download_media(file=str(target_path))
+    if not target_path.exists():
         raise RuntimeError("Telegram media download did not produce a file.")
 
 
@@ -534,8 +556,8 @@ def get_chat_id(message: Message) -> int | None:
     return getattr(message, "chat_id", None)
 
 
-def get_video_attachment(message: Message) -> Message | None:
-    return message if is_video_message(message) else None
+def get_media_attachment(message: Message) -> Message | None:
+    return message if is_video_message(message) or is_audio_message(message) else None
 
 
 def is_video_message(message: Message) -> bool:
@@ -553,10 +575,33 @@ def is_video_document(document: Any) -> bool:
     return Path(file_name).suffix.lower() in VIDEO_EXTENSIONS
 
 
+def is_audio_message(message: Message) -> bool:
+    if getattr(message, "voice", None) is not None:
+        return True
+    file = getattr(message, "file", None)
+    return file is not None and is_audio_document(file)
+
+
+def is_audio_document(document: Any) -> bool:
+    if get_file_mime_type(document) == "audio/mpeg":
+        return True
+    file_name = get_file_name(document)
+    return Path(file_name).suffix.lower() in AUDIO_EXTENSIONS
+
+
 def get_attachment_suffix(attachment: Message) -> str:
     file_name = get_file_name(getattr(attachment, "file", None)) or get_file_name(attachment)
     suffix = Path(file_name).suffix.lower() if file_name else ""
     return suffix if suffix in VIDEO_EXTENSIONS else ".mp4"
+
+
+def get_audio_suffix(attachment: Message) -> str:
+    file = getattr(attachment, "file", None)
+    file_name = get_file_name(file) or get_file_name(attachment)
+    suffix = Path(file_name).suffix.lower() if file_name else ""
+    if suffix in AUDIO_EXTENSIONS:
+        return suffix
+    return AUDIO_SUFFIX_BY_MIME.get(get_file_mime_type(file), ".ogg")
 
 
 def get_attachment_file_size(attachment: Message) -> int | None:

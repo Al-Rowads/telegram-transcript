@@ -10,16 +10,19 @@ from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
     BotState,
     get_attachment_suffix,
+    get_audio_suffix,
     get_message_topic_id,
-    get_video_attachment,
+    get_media_attachment,
     handle_new_message,
     handle_noise_command,
-    handle_non_video,
+    handle_non_media,
     handle_tempo_command,
-    handle_video_upload,
+    handle_media_upload,
+    is_audio_document,
+    is_audio_message,
     is_authorized,
     is_video_document,
-    process_video_message,
+    process_media_message,
     send_transcript,
 )
 from telegram_transcript.config import Settings, mb_to_bytes
@@ -40,6 +43,7 @@ class FakeMessage:
         raw_text: str = "",
         file: object | None = None,
         video: object | None = None,
+        voice: object | None = None,
         media_bytes: bytes = b"video",
         is_private: bool = True,
         is_group: bool = False,
@@ -53,6 +57,7 @@ class FakeMessage:
         self.raw_text = raw_text
         self.file = file
         self.video = video
+        self.voice = voice
         self.media_bytes = media_bytes
         self.is_private = is_private
         self.is_group = is_group
@@ -118,6 +123,14 @@ def video_file(*, size: int | None = 1, name: str = "clip.mp4", mime_type: str =
     return SimpleNamespace(size=size, name=name, mime_type=mime_type)
 
 
+def audio_file(*, size: int | None = 1, name: str = "clip.mp3", mime_type: str = "audio/mpeg") -> object:
+    return SimpleNamespace(size=size, name=name, mime_type=mime_type)
+
+
+def voice_file(*, size: int | None = 1) -> object:
+    return SimpleNamespace(size=size, name="", mime_type="audio/ogg")
+
+
 def group_message(**kwargs: object) -> FakeMessage:
     return FakeMessage(is_private=False, is_group=True, is_channel=False, **kwargs)
 
@@ -153,20 +166,54 @@ def test_is_video_document_accepts_video_extension() -> None:
     assert is_video_document(document)
 
 
-def test_get_video_attachment_accepts_telethon_video_message() -> None:
+def test_get_media_attachment_accepts_telethon_video_message() -> None:
     message = FakeMessage(video=SimpleNamespace(size=1), file=video_file())
 
-    assert get_video_attachment(message) is message
+    assert get_media_attachment(message) is message
 
 
-def test_get_video_attachment_accepts_video_file_message() -> None:
+def test_get_media_attachment_accepts_video_file_message() -> None:
     message = FakeMessage(file=video_file(mime_type="application/octet-stream", name="clip.mkv"))
 
-    assert get_video_attachment(message) is message
+    assert get_media_attachment(message) is message
 
 
 def test_get_attachment_suffix_defaults_to_mp4() -> None:
     assert get_attachment_suffix(FakeMessage(file=video_file(name="clip.txt"))) == ".mp4"
+
+
+def test_is_audio_document_accepts_mp3_mime_type() -> None:
+    assert is_audio_document(SimpleNamespace(mime_type="audio/mpeg", name="upload.bin"))
+
+
+def test_is_audio_document_accepts_mp3_extension() -> None:
+    assert is_audio_document(SimpleNamespace(mime_type="application/octet-stream", name="clip.mp3"))
+
+
+def test_is_audio_document_rejects_other_audio() -> None:
+    assert not is_audio_document(SimpleNamespace(mime_type="audio/wav", name="clip.wav"))
+    assert not is_audio_document(SimpleNamespace(mime_type="audio/ogg", name="note.oga"))
+
+
+def test_is_audio_message_accepts_voice_note() -> None:
+    message = FakeMessage(voice=SimpleNamespace(size=1), file=voice_file())
+
+    assert is_audio_message(message)
+    assert get_media_attachment(message) is message
+
+
+def test_get_media_attachment_accepts_mp3_file_message() -> None:
+    message = FakeMessage(file=audio_file())
+
+    assert get_media_attachment(message) is message
+
+
+def test_get_audio_suffix_returns_mp3_for_mp3_file() -> None:
+    assert get_audio_suffix(FakeMessage(file=audio_file())) == ".mp3"
+
+
+def test_get_audio_suffix_returns_ogg_for_voice_note() -> None:
+    assert get_audio_suffix(FakeMessage(voice=SimpleNamespace(size=1), file=voice_file())) == ".ogg"
 
 
 def test_get_message_topic_id_uses_forum_topic_reply_id() -> None:
@@ -201,10 +248,10 @@ async def test_send_transcript_sends_long_text_as_document() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_non_video_ignores_messages() -> None:
+async def test_handle_non_media_ignores_messages() -> None:
     message = group_message()
 
-    await handle_non_video(message, make_state())
+    await handle_non_media(message, make_state())
 
     assert message.text_replies == []
 
@@ -323,62 +370,62 @@ async def test_handle_noise_command_ignores_other_group_topics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_rejects_unauthorized_user() -> None:
+async def test_handle_media_upload_rejects_unauthorized_user() -> None:
     message = group_message(file=video_file(), sender_id=999)
     state = make_state(settings=make_settings(allowed_telegram_user_ids=frozenset({123})))
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert "not enabled" in message.text_replies[0]
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_ignores_non_video_document() -> None:
+async def test_handle_media_upload_ignores_non_video_document() -> None:
     message = FakeMessage(file=video_file(mime_type="text/plain", name="notes.txt"))
     state = make_state()
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_ignores_oversized_video() -> None:
+async def test_handle_media_upload_ignores_oversized_video() -> None:
     message = FakeMessage(file=video_file(size=11))
     state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024))
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_allows_default_two_gib_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_handle_media_upload_allows_default_two_gib_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     size = mb_to_bytes(2048)
     message = FakeMessage(file=video_file(size=size))
     state = make_state(settings=make_settings())
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[1] is message
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert processed
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_accepts_video_at_exact_configured_size(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_handle_media_upload_accepts_video_at_exact_configured_size(monkeypatch: pytest.MonkeyPatch) -> None:
     message = group_message(file=video_file(size=10), reply_to=topic_reply(8))
     state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024, allowed_telegram_topic_id=8), audio_tempo=1.4)
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[0] is message
@@ -386,16 +433,16 @@ async def test_handle_video_upload_accepts_video_at_exact_configured_size(monkey
         assert args[6] == 1.4
         state.audio_tempo = 2.0
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert processed
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_consumes_pending_noise_for_matching_thread(
+async def test_handle_media_upload_consumes_pending_noise_for_matching_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(8))
@@ -403,21 +450,21 @@ async def test_handle_video_upload_consumes_pending_noise_for_matching_thread(
     state.pending_noise_reductions[(20, 8)] = "extra"
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[7] == "extra"
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert processed
     assert state.pending_noise_reductions == {}
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_does_not_consume_pending_noise_for_other_thread(
+async def test_handle_media_upload_does_not_consume_pending_noise_for_other_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(9))
@@ -425,26 +472,26 @@ async def test_handle_video_upload_does_not_consume_pending_noise_for_other_thre
     state.pending_noise_reductions[(20, 8)] = "default"
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[7] is None
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert processed
     assert state.pending_noise_reductions == {(20, 8): "default"}
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_does_not_consume_pending_noise_for_known_oversized_video() -> None:
+async def test_handle_media_upload_does_not_consume_pending_noise_for_known_oversized_video() -> None:
     message = group_message(file=video_file(size=11), chat_id=20, reply_to=topic_reply(8))
     state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024))
     state.pending_noise_reductions[(20, 8)] = "default"
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert state.pending_noise_reductions == {(20, 8): "default"}
     assert message.text_replies == []
@@ -452,40 +499,40 @@ async def test_handle_video_upload_does_not_consume_pending_noise_for_known_over
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reply_to", [topic_reply(9), None])
-async def test_handle_video_upload_ignores_restricted_group_topics(
+async def test_handle_media_upload_ignores_restricted_group_topics(
     monkeypatch: pytest.MonkeyPatch,
     reply_to: object | None,
 ) -> None:
     message = group_message(file=video_file(), reply_to=reply_to)
     state = make_state(settings=make_settings(allowed_telegram_topic_id=8))
 
-    async def fail_process_video_message(*_: object) -> None:
+    async def fail_process_media_message(*_: object) -> None:
         raise AssertionError("off-topic group videos should not be processed")
 
-    monkeypatch.setattr(bot_module, "process_video_message", fail_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fail_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_allows_private_chat_when_topic_restricted(
+async def test_handle_media_upload_allows_private_chat_when_topic_restricted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     message = FakeMessage(file=video_file())
     state = make_state(settings=make_settings(allowed_telegram_topic_id=8))
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[0] is message
         assert args[1] is message
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
-    await handle_video_upload(message, state)
+    await handle_media_upload(message, state)
 
     assert processed
     assert message.text_replies == []
@@ -498,11 +545,11 @@ async def test_handle_new_message_routes_commands_and_video(monkeypatch: pytest.
     video = FakeMessage(file=video_file())
     processed = False
 
-    async def fake_process_video_message(*_: object) -> None:
+    async def fake_process_media_message(*_: object) -> None:
         nonlocal processed
         processed = True
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
     await handle_new_message(SimpleNamespace(message=tempo), state)
     await handle_new_message(SimpleNamespace(message=video), state)
@@ -512,7 +559,7 @@ async def test_handle_new_message_routes_commands_and_video(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_process_video_message_reports_step_by_step_flow(
+async def test_process_media_message_reports_step_by_step_flow(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -560,7 +607,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     settings = make_settings()
     state = make_state(settings=settings, transcriber=FakeTranscriber())
 
-    await process_video_message(message, message, settings, state, status_ref, "job1234", 1.4)
+    await process_media_message(message, message, settings, state, status_ref, "job1234", 1.4)
 
     assert message.downloads
     assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
@@ -579,7 +626,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
 
 @pytest.mark.asyncio
-async def test_process_video_message_applies_default_noise_reduction(
+async def test_process_media_message_applies_default_noise_reduction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeTranscriber:
@@ -606,7 +653,7 @@ async def test_process_video_message_applies_default_noise_reduction(
     settings = make_settings()
     state = make_state(settings=settings, transcriber=FakeTranscriber())
 
-    await process_video_message(
+    await process_media_message(
         message,
         message,
         settings,
@@ -622,7 +669,7 @@ async def test_process_video_message_applies_default_noise_reduction(
 
 
 @pytest.mark.asyncio
-async def test_process_video_message_rejects_downloaded_file_over_size(
+async def test_process_media_message_rejects_downloaded_file_over_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fail_extract_audio(*_: object, **__: object) -> None:
@@ -634,7 +681,94 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     settings = make_settings(max_video_mb=10 / 1024 / 1024)
     state = make_state(settings=settings, transcriber=object())
 
-    await process_video_message(message, message, settings, state, status_ref, "job1234", 1.0)
+    await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0)
 
     assert status_ref["message"] is None
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_skips_extraction_for_small_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+            assert list(chunks)[0].name == "source.mp3"
+            return "صار"
+
+    def fail_extract_audio(*_: object, **__: object) -> None:
+        raise AssertionError("extract_audio should not run for already-small audio")
+
+    monkeypatch.setattr(bot_module, "extract_audio", fail_extract_audio)
+    message = FakeMessage(file=audio_file(size=5), media_bytes=b"audio")
+    status_ref: dict[str, object] = {"message": None}
+    settings = make_settings()
+    state = make_state(settings=settings, transcriber=FakeTranscriber())
+
+    await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0, None, True)
+
+    assert message.text_replies == ["Audio received. Starting transcription...", "صار"]
+    assert message.downloads and message.downloads[0].endswith("source.mp3")
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_extracts_oversized_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted = False
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+            assert list(chunks)[0].name == "audio.mp3"
+            return "done"
+
+    def fake_extract_audio(
+        source_path: Path,
+        audio_path: Path,
+        *,
+        audio_tempo: float,
+        noise_reduction_filter: str | None = None,
+    ) -> Path:
+        nonlocal extracted
+        extracted = True
+        assert source_path.exists()
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    message = FakeMessage(file=audio_file(size=50), media_bytes=b"x" * 50)
+    status_ref: dict[str, object] = {"message": None}
+    settings = make_settings(max_openai_audio_mb=10 / 1024 / 1024)
+    state = make_state(settings=settings, transcriber=FakeTranscriber())
+
+    await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0, None, True)
+
+    assert extracted
+    assert message.text_replies == ["Audio received. Starting transcription...", "done"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        FakeMessage(file=audio_file()),
+        FakeMessage(voice=SimpleNamespace(size=1), file=voice_file()),
+    ],
+)
+async def test_handle_media_upload_routes_audio_with_is_audio_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    message: FakeMessage,
+) -> None:
+    state = make_state()
+    processed = False
+
+    async def fake_process_media_message(*args: object) -> None:
+        nonlocal processed
+        processed = True
+        assert args[8] is True
+
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
+
+    await handle_media_upload(message, state)
+
+    assert processed
