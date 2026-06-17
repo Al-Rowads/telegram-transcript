@@ -35,9 +35,7 @@ Required output:
   1. The original Arabic line exactly as written.
   2. A natural Persian translation of that Arabic line.
   3. One key word or short key phrase from that Arabic line for video highlight timing.
-  4. The unseparable words or short phrases from that Arabic line that should not be separated by a video/subtitle line break.
 - Treat each preserved Arabic line as the translation unit, even if it contains more than one sentence.
-- If there are no unseparable words for a line, write: none
 - Do not add labels, bullets, numbering, explanations, markdown, or text outside the two required blocks.
 
 Exact output format:
@@ -50,7 +48,6 @@ same Arabic transcription here
 <new-line> </new-line>
 Persian translation line 1
 * key word line 1
-^ unseparable words line 1
 <new-line> </new-line>
 <seperator>----</seperator>
 <new-line> </new-line>
@@ -59,7 +56,6 @@ Persian translation line 1
 Persian translation line 2
 <new-line> </new-line>
 * key word line 2
-^ unseparable words line 2
 </translation>"""
 
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = (
