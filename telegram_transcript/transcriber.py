@@ -48,13 +48,15 @@ same Arabic transcription here
 <translation>
 + Arabic line 1
 <new-line> </new-line>
-translation: Persian translation line 1
+Persian translation line 1
 * key word line 1
 ^ unseparable words line 1
 <new-line> </new-line>
+<seperator>----</seperator>
+<new-line> </new-line>
 + Arabic line 2
 <new-line> </new-line>
-translation: Persian translation line 2
+Persian translation line 2
 <new-line> </new-line>
 * key word line 2
 ^ unseparable words line 2
