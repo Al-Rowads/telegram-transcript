@@ -26,6 +26,8 @@ BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You prepare Arabic-to-Persian vide
 You will receive a raw ASR/dictation transcript from a video. Keep the same transcription exactly as provided. Do not refine, correct, normalize, polish, reword, translate, remove, add, merge, split, or reorder the Arabic transcript text.
 
 Required output:
+- each line defines as a sentence ending with (?,!,.,etc...)
+- max line word is 5 to 9 words. IMPORTANT MAX LINE IS 5 to 9 WORDS 
 - Output only two blocks: <transcription> and <translation>.
 - In <transcription>, copy the exact transcript text you received, preserving the same transcription, line order, wording, punctuation, spacing, and line breaks.
 - In <translation>, work line by line from the preserved Arabic transcription.
@@ -45,15 +47,17 @@ same Arabic transcription here
 
 <translation>
 + Arabic line 1
-- Persian translation line 1
+<new-line> </new-line>
+translation: Persian translation line 1
 * key word line 1
 ^ unseparable words line 1
-
-
+<new-line> </new-line>
 + Arabic line 2
-- Persian translation line 2
+<new-line> </new-line>
+translation: Persian translation line 2
+<new-line> </new-line>
 * key word line 2
-^unseparable words line 2
+^ unseparable words line 2
 </translation>"""
 
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = (
