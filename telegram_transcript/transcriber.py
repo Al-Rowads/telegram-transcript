@@ -44,14 +44,16 @@ same Arabic transcription here
 </transcription>
 
 <translation>
-Arabic line 1
-Persian translation line 1
-key word line 1
-unseparable words line 1
-Arabic line 2
-Persian translation line 2
-key word line 2
-unseparable words line 2
++ Arabic line 1
+- Persian translation line 1
+* key word line 1
+^ unseparable words line 1
+
+
++ Arabic line 2
+- Persian translation line 2
+* key word line 2
+^unseparable words line 2
 </translation>"""
 
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = (
