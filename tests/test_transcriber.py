@@ -109,6 +109,20 @@ def test_refinement_input_uses_delimited_raw_transcript() -> None:
     assert raw in refinement_input
 
 
+def test_refinement_prompt_describes_translation_editing_contract() -> None:
+    combined_prompt = f"{BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT}\n{BAGHDADI_ARABIC_REFINEMENT_REQUEST}"
+
+    assert "same transcription" in combined_prompt
+    assert "line by line" in combined_prompt
+    assert "Persian translation" in combined_prompt
+    assert "key word" in combined_prompt
+    assert "unseparable words" in combined_prompt
+    assert "<transcription>" in combined_prompt
+    assert "</transcription>" in combined_prompt
+    assert "<translation>" in combined_prompt
+    assert "</translation>" in combined_prompt
+
+
 def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path) -> None:
     audio = tmp_path / "empty.mp3"
     audio.write_bytes(b"empty")

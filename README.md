@@ -11,7 +11,7 @@ A Python Telegram bot that receives a video, voice note, or MP3, gets speech aud
 - Ignores text, unsupported media, invalid commands, and oversized uploads without replying.
 - Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`, and falls back to the same compression for audio uploads that are too large to send directly.
 - Splits audio into safe chunks when it would exceed OpenAI's per-file upload limit.
-- Refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
+- Converts raw speech-to-text output into a structured Arabic transcript, Persian translation, key-word, and line-break editing aid before replying.
 - Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.

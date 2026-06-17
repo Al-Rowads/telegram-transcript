@@ -21,53 +21,46 @@ IRAQI_ARABIC_TRANSCRIPTION_PROMPT = """النص الصوتي باللهجة ال
 
 IRAQI_ARABIC_SYSTEM_PROMPT = IRAQI_ARABIC_TRANSCRIPTION_PROMPT
 
-BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You are an expert Arabic transcript editor specializing specifically in natural Baghdadi Iraqi Arabic.
+BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You prepare Arabic-to-Persian video editing notes from an existing transcript.
 
-You will receive an imperfect ASR/dictation transcript from a video. The transcript may contain misheard words, broken dictation, wrong word boundaries, repeated false starts, awkward ASR phrasing, incorrect slang, or phrases that sound too formal/non-Iraqi. Your job is to clean, refine, and sanity-check it while preserving exactly what the speaker intended.
+You will receive a raw ASR/dictation transcript from a video. Keep the same transcription exactly as provided. Do not refine, correct, normalize, polish, reword, translate, remove, add, merge, split, or reorder the Arabic transcript text.
 
-Core dialect requirement:
-- The final transcript must be in authentic Baghdadi Iraqi Arabic.
-- Do not translate into Modern Standard Arabic.
-- Do not normalize the speech into formal Arabic.
-- Do not convert Baghdadi Iraqi Arabic into another Iraqi dialect or generic Arabic.
-- Keep the wording natural, conversational, and native-sounding for Baghdad speakers.
+Required output:
+- Output only two blocks: <transcription> and <translation>.
+- In <transcription>, copy the exact transcript text you received, preserving the same transcription, line order, wording, punctuation, spacing, and line breaks.
+- In <translation>, work line by line from the preserved Arabic transcription.
+- For each non-empty Arabic line, write exactly four lines in this order:
+  1. The original Arabic line exactly as written.
+  2. A natural Persian translation of that Arabic line.
+  3. One key word or short key phrase from that Arabic line for video highlight timing.
+  4. The unseparable words or short phrases from that Arabic line that should not be separated by a video/subtitle line break.
+- Treat each preserved Arabic line as the translation unit, even if it contains more than one sentence.
+- If there are no unseparable words for a line, write: none
+- Do not add labels, bullets, numbering, explanations, markdown, or text outside the two required blocks.
 
-Meaning preservation:
-- Do not change the speaker's intended meaning.
-- Do not add new ideas, explanations, context, or information.
-- Do not remove meaningful content.
-- Correct only mistakes that are high-confidence based on context.
+Exact output format:
+<transcription>
+same Arabic transcription here
+</transcription>
 
-ASR/dictation cleanup:
-- Fix obvious dictation and ASR errors, including misheard words, split/merged words, wrong particles, and malformed phrases.
-- Clean up broken words, repeated false starts, filler noise, and awkward dictation artifacts when the intended wording is clear.
-- Repair slang or colloquial expressions only when the intended Baghdadi Iraqi Arabic phrase is obvious.
-- If the transcript contains wording that sounds formal because of ASR normalization, restore the likely natural Baghdadi Iraqi Arabic form only when confidence is high.
-
-Slang and dialect handling:
-- Preserve Iraqi/Baghdadi slang, idioms, particles, and expressions when appropriate.
-- Prefer common Baghdadi forms over formal or pan-Arabic alternatives.
-- Keep the speaker's tone, informality, emphasis, and conversational rhythm.
-- Do not over-polish the transcript so much that it stops sounding like real Baghdadi speech.
-
-Uncertainty:
-- If a word or phrase is uncertain, choose the most likely Baghdadi Iraqi Arabic version only when confidence is high.
-- If confidence is low or the meaning cannot be recovered from context, write [غير واضح].
-- Do not guess names, technical terms, or unclear slang unless context makes them highly certain.
-
-Formatting:
-- Add proper punctuation and paragraph breaks for readability.
-- Keep names, brands, numbers, and technical terms accurate.
-- Preserve foreign names in English when known, such as Alain de Botton.
-- Output only the final cleaned Baghdadi Iraqi Arabic transcript.
-
-The final result must be accurate first, then polished. It must sound like a native Baghdad speaker naturally said it, not like formal Arabic or a translated transcript."""
+<translation>
+Arabic line 1
+Persian translation line 1
+key word line 1
+unseparable words line 1
+Arabic line 2
+Persian translation line 2
+key word line 2
+unseparable words line 2
+</translation>"""
 
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = (
-    "Refine and sanity-check this imperfect ASR/dictation transcript into natural Baghdadi Iraqi Arabic. "
-    "Fix obvious misheard words, broken dictation, awkward ASR phrasing, and slang issues only when the intended meaning is clear. "
-    "Preserve the exact meaning, tone, and Baghdadi dialect. Output only the cleaned transcript."
+    "Keep the same transcription exactly as provided, then translate it line by line to Persian. "
+    "For each Arabic line, include the original Arabic line, its Persian translation, one key word or short key phrase "
+    "for video highlighting, and the unseparable words or short phrases that should not be separated by a line break. "
+    "Output only the <transcription> and <translation> blocks."
 )
+
 
 class TranscriptionError(RuntimeError):
     """Raised when OpenAI returns an unusable transcription response."""
