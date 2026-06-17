@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from telegram_transcript.ffmpeg import DEFAULT_AUDIO_TEMPO
 from telegram_transcript.transcriber import DEFAULT_REFINEMENT_MODEL, DEFAULT_TRANSCRIPTION_MODEL
 
+MAX_TELEGRAM_VIDEO_MB = 2048.0
+
 
 class ConfigError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
@@ -17,16 +19,15 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
+    telegram_api_id: int
+    telegram_api_hash: str
     openai_api_key: str
-    telegram_api_base_url: str | None = None
-    telegram_api_base_file_url: str | None = None
-    telegram_local_mode: bool = False
     openai_transcribe_model: str = DEFAULT_TRANSCRIPTION_MODEL
     openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = True
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     allowed_telegram_topic_id: int | None = None
-    max_video_mb: float = 100.0
+    max_video_mb: float = MAX_TELEGRAM_VIDEO_MB
     max_openai_audio_mb: float = 24.0
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
@@ -50,14 +51,15 @@ def load_settings(
 
     source = env if env is not None else os.environ
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
-    telegram_api_base_url = parse_optional_string(source.get("TELEGRAM_API_BASE_URL"))
-    telegram_api_base_file_url = parse_optional_string(source.get("TELEGRAM_API_BASE_FILE_URL"))
-    telegram_local_mode = parse_bool(source.get("TELEGRAM_LOCAL_MODE"), "TELEGRAM_LOCAL_MODE", False)
+    telegram_api_id = parse_positive_int(require_value(source, "TELEGRAM_API_ID"), "TELEGRAM_API_ID", 0)
+    telegram_api_hash = require_value(source, "TELEGRAM_API_HASH")
     openai_api_key = require_value(source, "OPENAI_API_KEY")
     model = source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip() or DEFAULT_TRANSCRIPTION_MODEL
     refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
     refine = parse_bool(source.get("REFINE"), "REFINE", True)
-    max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
+    max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", MAX_TELEGRAM_VIDEO_MB)
+    if max_video_mb > MAX_TELEGRAM_VIDEO_MB:
+        raise ConfigError("MAX_VIDEO_MB must be less than or equal to Telegram's 2048 MB file limit.")
     max_openai_audio_mb = parse_positive_float(
         source.get("MAX_OPENAI_AUDIO_MB"),
         "MAX_OPENAI_AUDIO_MB",
@@ -69,9 +71,8 @@ def load_settings(
 
     return Settings(
         telegram_bot_token=telegram_bot_token,
-        telegram_api_base_url=telegram_api_base_url,
-        telegram_api_base_file_url=telegram_api_base_file_url,
-        telegram_local_mode=telegram_local_mode,
+        telegram_api_id=telegram_api_id,
+        telegram_api_hash=telegram_api_hash,
         openai_api_key=openai_api_key,
         openai_transcribe_model=model,
         openai_refine_model=refine_model,
@@ -97,13 +98,6 @@ def require_value(env: Mapping[str, str], name: str) -> str:
     if not value:
         raise ConfigError(f"{name} is required.")
     return value
-
-
-def parse_optional_string(raw: str | None) -> str | None:
-    if raw is None:
-        return None
-    value = raw.strip()
-    return value or None
 
 
 def parse_user_ids(raw: str | None) -> frozenset[int]:

@@ -5,14 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from telegram.constants import ChatType
-from telegram.error import BadRequest
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
-    HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES,
+    BotState,
     get_attachment_suffix,
+    get_message_topic_id,
     get_video_attachment,
+    handle_new_message,
     handle_noise_command,
     handle_non_video,
     handle_tempo_command,
@@ -22,89 +22,157 @@ from telegram_transcript.bot import (
     process_video_message,
     send_transcript,
 )
-from telegram_transcript.config import Settings
+from telegram_transcript.config import Settings, mb_to_bytes
+
+
+class FakeClient:
+    def __init__(self) -> None:
+        self.sent_files: list[dict[str, object]] = []
+
+    async def send_file(self, entity: object, file: object, **kwargs: object) -> None:
+        self.sent_files.append({"entity": entity, "file": file, "kwargs": kwargs})
 
 
 class FakeMessage:
     def __init__(
         self,
         *,
+        raw_text: str = "",
+        file: object | None = None,
         video: object | None = None,
-        document: object | None = None,
-        chat_type: str = ChatType.PRIVATE,
-        message_id: int = 42,
-        message_thread_id: int | None = None,
+        media_bytes: bytes = b"video",
+        is_private: bool = True,
+        is_group: bool = False,
+        is_channel: bool = False,
+        id: int = 42,
+        chat_id: int = 100,
+        sender_id: int = 123,
+        reply_to: object | None = None,
+        client: FakeClient | None = None,
     ) -> None:
+        self.raw_text = raw_text
+        self.file = file
         self.video = video
-        self.document = document
-        self.chat = SimpleNamespace(type=chat_type)
-        self.message_id = message_id
-        self.message_thread_id = message_thread_id
+        self.media_bytes = media_bytes
+        self.is_private = is_private
+        self.is_group = is_group
+        self.is_channel = is_channel
+        self.id = id
+        self.chat_id = chat_id
+        self.sender_id = sender_id
+        self.reply_to = reply_to
+        self.client = client or FakeClient()
         self.text_replies: list[str] = []
-        self.text_reply_kwargs: list[dict[str, object]] = []
         self.status_replies: list[FakeStatus] = []
-        self.document_replies: list[object] = []
-        self.document_reply_kwargs: list[dict[str, object]] = []
+        self.downloads: list[str] = []
 
-    async def reply_text(self, text: str, **kwargs: object) -> object:
+    async def reply(self, text: str) -> object:
         self.text_replies.append(text)
-        self.text_reply_kwargs.append(kwargs)
         status = FakeStatus()
         self.status_replies.append(status)
         return status
 
-    async def reply_document(self, *, document: object, caption: str, **kwargs: object) -> None:
-        self.document_replies.append((document, caption))
-        self.document_reply_kwargs.append(kwargs)
+    async def download_media(self, *, file: str) -> str:
+        self.downloads.append(file)
+        Path(file).write_bytes(self.media_bytes)
+        return file
+
+    async def get_input_chat(self) -> str:
+        return f"chat:{self.chat_id}"
 
 
 class FakeStatus:
     def __init__(self) -> None:
         self.edits: list[str] = []
 
-    async def edit_text(self, text: str) -> None:
+    async def edit(self, text: str) -> None:
         self.edits.append(text)
 
 
-def test_is_authorized_allows_everyone_without_allowlist() -> None:
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+def make_settings(**kwargs: object) -> Settings:
+    return Settings(
+        telegram_bot_token="token",
+        telegram_api_id=12345,
+        telegram_api_hash="hash",
+        openai_api_key="key",
+        **kwargs,
+    )
 
-    assert is_authorized(settings, user_id=123)
+
+def make_state(
+    *,
+    settings: Settings | None = None,
+    transcriber: object | None = None,
+    audio_tempo: float | None = None,
+) -> BotState:
+    settings = settings or make_settings()
+    return BotState(
+        settings=settings,
+        transcriber=transcriber or object(),
+        job_semaphore=asyncio.Semaphore(settings.max_concurrent_jobs),
+        audio_tempo=settings.audio_tempo if audio_tempo is None else audio_tempo,
+    )
+
+
+def video_file(*, size: int | None = 1, name: str = "clip.mp4", mime_type: str = "video/mp4") -> object:
+    return SimpleNamespace(size=size, name=name, mime_type=mime_type)
+
+
+def group_message(**kwargs: object) -> FakeMessage:
+    return FakeMessage(is_private=False, is_group=True, is_channel=False, **kwargs)
+
+
+def channel_message(**kwargs: object) -> FakeMessage:
+    return FakeMessage(is_private=False, is_group=False, is_channel=True, **kwargs)
+
+
+def topic_reply(topic_id: int) -> object:
+    return SimpleNamespace(forum_topic=True, reply_to_top_id=None, reply_to_msg_id=topic_id)
+
+
+def test_is_authorized_allows_everyone_without_allowlist() -> None:
+    assert is_authorized(make_settings(), user_id=123)
 
 
 def test_is_authorized_checks_allowlist() -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        openai_api_key="key",
-        allowed_telegram_user_ids=frozenset({123}),
-    )
+    settings = make_settings(allowed_telegram_user_ids=frozenset({123}))
 
     assert is_authorized(settings, user_id=123)
     assert not is_authorized(settings, user_id=999)
 
 
 def test_is_video_document_accepts_video_mime_type() -> None:
-    document = SimpleNamespace(mime_type="video/mp4", file_name="upload.bin")
+    document = SimpleNamespace(mime_type="video/mp4", name="upload.bin")
 
     assert is_video_document(document)
 
 
 def test_is_video_document_accepts_video_extension() -> None:
-    document = SimpleNamespace(mime_type="application/octet-stream", file_name="clip.mov")
+    document = SimpleNamespace(mime_type="application/octet-stream", name="clip.mov")
 
     assert is_video_document(document)
 
 
-def test_get_video_attachment_prefers_video() -> None:
-    video = SimpleNamespace(file_size=1)
-    document = SimpleNamespace(mime_type="video/mp4", file_name="clip.mp4")
-    message = SimpleNamespace(video=video, document=document)
+def test_get_video_attachment_accepts_telethon_video_message() -> None:
+    message = FakeMessage(video=SimpleNamespace(size=1), file=video_file())
 
-    assert get_video_attachment(message) is video
+    assert get_video_attachment(message) is message
+
+
+def test_get_video_attachment_accepts_video_file_message() -> None:
+    message = FakeMessage(file=video_file(mime_type="application/octet-stream", name="clip.mkv"))
+
+    assert get_video_attachment(message) is message
 
 
 def test_get_attachment_suffix_defaults_to_mp4() -> None:
-    assert get_attachment_suffix(SimpleNamespace(file_name="clip.txt")) == ".mp4"
+    assert get_attachment_suffix(FakeMessage(file=video_file(name="clip.txt"))) == ".mp4"
+
+
+def test_get_message_topic_id_uses_forum_topic_reply_id() -> None:
+    message = group_message(reply_to=topic_reply(8))
+
+    assert get_message_topic_id(message) == 8
 
 
 @pytest.mark.asyncio
@@ -114,406 +182,213 @@ async def test_send_transcript_sends_short_text() -> None:
     await send_transcript(message, "hello")
 
     assert message.text_replies == ["hello"]
-    assert message.document_replies == []
-
-
-@pytest.mark.asyncio
-async def test_send_transcript_replies_to_original_group_message() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=99, message_thread_id=7)
-
-    await send_transcript(message, "hello")
-
-    assert message.text_replies == ["hello"]
-    assert message.text_reply_kwargs == [
-        {
-            "reply_to_message_id": 99,
-            "allow_sending_without_reply": True,
-            "message_thread_id": 7,
-        }
-    ]
+    assert message.client.sent_files == []
 
 
 @pytest.mark.asyncio
 async def test_send_transcript_sends_long_text_as_document() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=99, message_thread_id=7)
+    message = group_message(id=99, chat_id=7)
 
     await send_transcript(message, "x" * 4000)
 
     assert message.text_replies == []
-    assert len(message.document_replies) == 1
-    assert message.document_reply_kwargs == [
-        {
-            "reply_to_message_id": 99,
-            "allow_sending_without_reply": True,
-            "message_thread_id": 7,
-        }
-    ]
+    assert len(message.client.sent_files) == 1
+    sent = message.client.sent_files[0]
+    assert sent["entity"] == "chat:7"
+    assert sent["kwargs"]["caption"] == "Transcript"
+    assert sent["kwargs"]["force_document"] is True
+    assert sent["kwargs"]["reply_to"] == 99
 
 
 @pytest.mark.asyncio
-async def test_handle_non_video_ignores_group_messages() -> None:
-    message = FakeMessage(chat_type=ChatType.GROUP)
-    update = SimpleNamespace(effective_message=message)
+async def test_handle_non_video_ignores_messages() -> None:
+    message = group_message()
 
-    await handle_non_video(update, SimpleNamespace())
-
-    assert message.text_replies == []
-
-
-@pytest.mark.asyncio
-async def test_handle_non_video_ignores_private_messages() -> None:
-    message = FakeMessage()
-    update = SimpleNamespace(effective_message=message)
-
-    await handle_non_video(update, SimpleNamespace())
+    await handle_non_video(message, make_state())
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_tempo_command_updates_runtime_tempo_in_group() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
-    context = SimpleNamespace(
-        args=["1.2"],
-        bot_data={
-            "audio_tempo": 1.0,
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_user_ids=frozenset({123}),
-            ),
-        },
+    message = group_message(id=123, reply_to=topic_reply(8))
+    state = make_state(
+        settings=make_settings(
+            allowed_telegram_user_ids=frozenset({999}),
+            allowed_telegram_topic_id=8,
+        ),
+        audio_tempo=1.0,
     )
 
-    await handle_tempo_command(update, context)
+    await handle_tempo_command(message, state, ["1.2"])
 
-    assert context.bot_data["audio_tempo"] == 1.2
+    assert state.audio_tempo == 1.2
     assert message.text_replies == ["Tempo set to 1.2x."]
-    assert message.text_reply_kwargs == [
-        {
-            "reply_to_message_id": 123,
-            "allow_sending_without_reply": True,
-            "message_thread_id": 8,
-        }
-    ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("chat_type", [ChatType.PRIVATE, ChatType.CHANNEL])
-async def test_handle_tempo_command_ignores_private_and_channel_chats(chat_type: str) -> None:
-    message = FakeMessage(chat_type=chat_type)
-    update = SimpleNamespace(effective_message=message)
-    context = SimpleNamespace(args=["1.2"], bot_data={"audio_tempo": 1.0})
-
-    await handle_tempo_command(update, context)
-
-    assert context.bot_data["audio_tempo"] == 1.0
-    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "args",
+    "message",
     [
-        [],
-        ["fast"],
-        ["1.0", "extra"],
-        ["0.49"],
-        ["2.01"],
+        FakeMessage(),
+        channel_message(),
     ],
 )
+async def test_handle_tempo_command_ignores_private_and_channel_chats(message: FakeMessage) -> None:
+    state = make_state(audio_tempo=1.0)
+
+    await handle_tempo_command(message, state, ["1.2"])
+
+    assert state.audio_tempo == 1.0
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("args", [[], ["fast"], ["1.0", "extra"], ["0.49"], ["2.01"]])
 async def test_handle_tempo_command_ignores_invalid_values(args: list[str]) -> None:
-    message = FakeMessage(chat_type=ChatType.GROUP)
-    update = SimpleNamespace(effective_message=message)
-    context = SimpleNamespace(
-        args=args,
-        bot_data={
-            "audio_tempo": 1.0,
-            "settings": Settings(telegram_bot_token="token", openai_api_key="key"),
-        },
-    )
+    message = group_message()
+    state = make_state(audio_tempo=1.0)
 
-    await handle_tempo_command(update, context)
+    await handle_tempo_command(message, state, args)
 
-    assert context.bot_data["audio_tempo"] == 1.0
+    assert state.audio_tempo == 1.0
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_tempo_command_ignores_other_group_topics() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=9)
-    update = SimpleNamespace(effective_message=message)
-    context = SimpleNamespace(
-        args=["1.2"],
-        bot_data={
-            "audio_tempo": 1.0,
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_topic_id=8,
-            ),
-        },
-    )
+    message = group_message(reply_to=topic_reply(9))
+    state = make_state(settings=make_settings(allowed_telegram_topic_id=8), audio_tempo=1.0)
 
-    await handle_tempo_command(update, context)
+    await handle_tempo_command(message, state, ["1.2"])
 
-    assert context.bot_data["audio_tempo"] == 1.0
+    assert state.audio_tempo == 1.0
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_noise_command_sets_default_noise_for_group_thread() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        args=[],
-        bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")},
-        chat_data={},
-    )
+    message = group_message(chat_id=20, reply_to=topic_reply(8))
+    state = make_state()
 
-    await handle_noise_command(update, context)
+    await handle_noise_command(message, state, [])
 
-    assert context.chat_data[bot_module.PENDING_NOISE_REDUCTION_KEY] == {8: "default"}
+    assert state.pending_noise_reductions == {(20, 8): "default"}
     assert message.text_replies == ["Default noise reduction set for the next video."]
-    assert message.text_reply_kwargs == [
-        {
-            "reply_to_message_id": 123,
-            "allow_sending_without_reply": True,
-            "message_thread_id": 8,
-        }
-    ]
 
 
 @pytest.mark.asyncio
 async def test_handle_noise_command_sets_extra_noise_for_group_thread() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        args=["extra"],
-        bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")},
-        chat_data={},
-    )
+    message = group_message(chat_id=20, reply_to=topic_reply(8))
+    state = make_state()
 
-    await handle_noise_command(update, context)
+    await handle_noise_command(message, state, ["extra"])
 
-    assert context.chat_data[bot_module.PENDING_NOISE_REDUCTION_KEY] == {8: "extra"}
+    assert state.pending_noise_reductions == {(20, 8): "extra"}
     assert message.text_replies == ["Extra noise reduction set for the next video."]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("args", [["fast"], ["extra", "now"]])
 async def test_handle_noise_command_ignores_invalid_values(args: list[str]) -> None:
-    message = FakeMessage(chat_type=ChatType.GROUP)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        args=args,
-        bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")},
-        chat_data={},
-    )
+    message = group_message()
+    state = make_state()
 
-    await handle_noise_command(update, context)
+    await handle_noise_command(message, state, args)
 
-    assert context.chat_data == {}
+    assert state.pending_noise_reductions == {}
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_noise_command_ignores_unauthorized_users() -> None:
-    message = FakeMessage(chat_type=ChatType.GROUP)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
-    context = SimpleNamespace(
-        args=[],
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_user_ids=frozenset({123}),
-            )
-        },
-        chat_data={},
-    )
+    message = group_message(sender_id=999)
+    state = make_state(settings=make_settings(allowed_telegram_user_ids=frozenset({123})))
 
-    await handle_noise_command(update, context)
+    await handle_noise_command(message, state, [])
 
-    assert context.chat_data == {}
+    assert state.pending_noise_reductions == {}
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_noise_command_ignores_other_group_topics() -> None:
-    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=9)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        args=[],
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_topic_id=8,
-            )
-        },
-        chat_data={},
-    )
+    message = group_message(reply_to=topic_reply(9))
+    state = make_state(settings=make_settings(allowed_telegram_topic_id=8))
 
-    await handle_noise_command(update, context)
+    await handle_noise_command(message, state, [])
 
-    assert context.chat_data == {}
+    assert state.pending_noise_reductions == {}
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_video_upload_rejects_unauthorized_user() -> None:
-    message = FakeMessage(video=SimpleNamespace(file_size=1), chat_type=ChatType.GROUP, message_id=123)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_user_ids=frozenset({123}),
-            )
-        }
-    )
+    message = group_message(file=video_file(), sender_id=999)
+    state = make_state(settings=make_settings(allowed_telegram_user_ids=frozenset({123})))
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert "not enabled" in message.text_replies[0]
-    assert message.text_reply_kwargs[0]["reply_to_message_id"] == 123
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_ignores_private_non_video_document() -> None:
-    message = FakeMessage(document=SimpleNamespace(mime_type="text/plain", file_name="notes.txt"))
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
+async def test_handle_video_upload_ignores_non_video_document() -> None:
+    message = FakeMessage(file=video_file(mime_type="text/plain", name="notes.txt"))
+    state = make_state()
 
-    await handle_video_upload(update, context)
-
-    assert message.text_replies == []
-
-
-@pytest.mark.asyncio
-async def test_handle_video_upload_ignores_group_non_video_document() -> None:
-    message = FakeMessage(
-        document=SimpleNamespace(mime_type="text/plain", file_name="notes.txt"),
-        chat_type=ChatType.GROUP,
-    )
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
-
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
 async def test_handle_video_upload_ignores_oversized_video() -> None:
-    message = FakeMessage(video=SimpleNamespace(file_size=11))
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                max_video_mb=10 / 1024 / 1024,
-            )
-        }
-    )
+    message = FakeMessage(file=video_file(size=11))
+    state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024))
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_replies_when_hosted_telegram_download_limit_is_exceeded() -> None:
-    attachment = SimpleNamespace(file_size=HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES + 1)
-    message = FakeMessage(video=attachment)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                max_video_mb=100,
-            )
-        }
-    )
-
-    await handle_video_upload(update, context)
-
-    assert len(message.text_replies) == 1
-    assert "20 MB" in message.text_replies[0]
-    assert "local Telegram Bot API server" in message.text_replies[0]
-
-
-@pytest.mark.asyncio
-async def test_handle_video_upload_allows_large_file_when_telegram_local_mode_is_enabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        openai_api_key="key",
-        telegram_local_mode=True,
-        max_video_mb=100,
-    )
-    attachment = SimpleNamespace(file_size=HOSTED_TELEGRAM_DOWNLOAD_LIMIT_BYTES + 1)
-    message = FakeMessage(video=attachment)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.0,
-        }
-    )
+async def test_handle_video_upload_allows_default_two_gib_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    size = mb_to_bytes(2048)
+    message = FakeMessage(file=video_file(size=size))
+    state = make_state(settings=make_settings())
     processed = False
 
     async def fake_process_video_message(*args: object) -> None:
         nonlocal processed
         processed = True
-        assert args[1] is attachment
+        assert args[1] is message
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert processed
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        openai_api_key="key",
-        max_video_mb=10 / 1024 / 1024,
-        allowed_telegram_topic_id=8,
-    )
-    attachment = SimpleNamespace(file_size=10)
-    message = FakeMessage(video=attachment, chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.4,
-        }
-    )
+async def test_handle_video_upload_accepts_video_at_exact_configured_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = group_message(file=video_file(size=10), reply_to=topic_reply(8))
+    state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024, allowed_telegram_topic_id=8), audio_tempo=1.4)
     processed = False
 
     async def fake_process_video_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[0] is message
-        assert args[1] is attachment
+        assert args[1] is message
         assert args[6] == 1.4
-        context.bot_data["audio_tempo"] = 2.0
+        state.audio_tempo = 2.0
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert processed
     assert message.text_replies == []
@@ -523,18 +398,9 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
 async def test_handle_video_upload_consumes_pending_noise_for_matching_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    attachment = SimpleNamespace(file_size=1)
-    message = FakeMessage(video=attachment, chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.0,
-        },
-        chat_data={bot_module.PENDING_NOISE_REDUCTION_KEY: {8: "extra"}},
-    )
+    message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(8))
+    state = make_state()
+    state.pending_noise_reductions[(20, 8)] = "extra"
     processed = False
 
     async def fake_process_video_message(*args: object) -> None:
@@ -544,28 +410,19 @@ async def test_handle_video_upload_consumes_pending_noise_for_matching_thread(
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert processed
-    assert context.chat_data[bot_module.PENDING_NOISE_REDUCTION_KEY] == {}
+    assert state.pending_noise_reductions == {}
 
 
 @pytest.mark.asyncio
 async def test_handle_video_upload_does_not_consume_pending_noise_for_other_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    attachment = SimpleNamespace(file_size=1)
-    message = FakeMessage(video=attachment, chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=9)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.0,
-        },
-        chat_data={bot_module.PENDING_NOISE_REDUCTION_KEY: {8: "default"}},
-    )
+    message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(9))
+    state = make_state()
+    state.pending_noise_reductions[(20, 8)] = "default"
     processed = False
 
     async def fake_process_video_message(*args: object) -> None:
@@ -575,64 +432,39 @@ async def test_handle_video_upload_does_not_consume_pending_noise_for_other_thre
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert processed
-    assert context.chat_data[bot_module.PENDING_NOISE_REDUCTION_KEY] == {8: "default"}
+    assert state.pending_noise_reductions == {(20, 8): "default"}
 
 
 @pytest.mark.asyncio
 async def test_handle_video_upload_does_not_consume_pending_noise_for_known_oversized_video() -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        openai_api_key="key",
-        max_video_mb=10 / 1024 / 1024,
-    )
-    message = FakeMessage(video=SimpleNamespace(file_size=11), message_thread_id=8)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={"settings": settings},
-        chat_data={bot_module.PENDING_NOISE_REDUCTION_KEY: {8: "default"}},
-    )
+    message = group_message(file=video_file(size=11), chat_id=20, reply_to=topic_reply(8))
+    state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024))
+    state.pending_noise_reductions[(20, 8)] = "default"
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
-    assert context.chat_data[bot_module.PENDING_NOISE_REDUCTION_KEY] == {8: "default"}
+    assert state.pending_noise_reductions == {(20, 8): "default"}
     assert message.text_replies == []
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("message_thread_id", [9, None])
+@pytest.mark.parametrize("reply_to", [topic_reply(9), None])
 async def test_handle_video_upload_ignores_restricted_group_topics(
     monkeypatch: pytest.MonkeyPatch,
-    message_thread_id: int | None,
+    reply_to: object | None,
 ) -> None:
-    attachment = SimpleNamespace(file_size=1)
-    message = FakeMessage(
-        video=attachment,
-        chat_type=ChatType.SUPERGROUP,
-        message_id=123,
-        message_thread_id=message_thread_id,
-    )
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_topic_id=8,
-            ),
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.0,
-        }
-    )
+    message = group_message(file=video_file(), reply_to=reply_to)
+    state = make_state(settings=make_settings(allowed_telegram_topic_id=8))
 
     async def fail_process_video_message(*_: object) -> None:
         raise AssertionError("off-topic group videos should not be processed")
 
     monkeypatch.setattr(bot_module, "process_video_message", fail_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert message.text_replies == []
 
@@ -641,34 +473,42 @@ async def test_handle_video_upload_ignores_restricted_group_topics(
 async def test_handle_video_upload_allows_private_chat_when_topic_restricted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attachment = SimpleNamespace(file_size=1)
-    message = FakeMessage(video=attachment)
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        bot_data={
-            "settings": Settings(
-                telegram_bot_token="token",
-                openai_api_key="key",
-                allowed_telegram_topic_id=8,
-            ),
-            "job_semaphore": asyncio.Semaphore(1),
-            "audio_tempo": 1.0,
-        }
-    )
+    message = FakeMessage(file=video_file())
+    state = make_state(settings=make_settings(allowed_telegram_topic_id=8))
     processed = False
 
     async def fake_process_video_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[0] is message
-        assert args[1] is attachment
+        assert args[1] is message
 
     monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
 
-    await handle_video_upload(update, context)
+    await handle_video_upload(message, state)
 
     assert processed
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_new_message_routes_commands_and_video(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = make_state(audio_tempo=1.0)
+    tempo = group_message(raw_text="/tempo@mybot 1.5")
+    video = FakeMessage(file=video_file())
+    processed = False
+
+    async def fake_process_video_message(*_: object) -> None:
+        nonlocal processed
+        processed = True
+
+    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+
+    await handle_new_message(SimpleNamespace(message=tempo), state)
+    await handle_new_message(SimpleNamespace(message=video), state)
+
+    assert state.audio_tempo == 1.5
+    assert processed
 
 
 @pytest.mark.asyncio
@@ -676,17 +516,6 @@ async def test_process_video_message_reports_step_by_step_flow(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"video")
-
-    class FakeAttachment:
-        file_name = "clip.mp4"
-        file_size = 5
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
-
     class FakeTranscriber:
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
             chunk = list(chunks)[0]
@@ -726,13 +555,14 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
     caplog.set_level("INFO", logger="telegram_transcript.bot")
-    message = FakeMessage()
+    message = FakeMessage(file=video_file(size=5), media_bytes=b"video")
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+    settings = make_settings()
+    state = make_state(settings=settings, transcriber=FakeTranscriber())
 
-    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
+    await process_video_message(message, message, settings, state, status_ref, "job1234", 1.4)
 
+    assert message.downloads
     assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
     status = message.status_replies[0]
     assert status.edits == [
@@ -752,17 +582,6 @@ async def test_process_video_message_reports_step_by_step_flow(
 async def test_process_video_message_applies_default_noise_reduction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"video")
-
-    class FakeAttachment:
-        file_name = "clip.mp4"
-        file_size = 5
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
-
     class FakeTranscriber:
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
             assert list(chunks)[0].name == "audio.mp3"
@@ -782,16 +601,16 @@ async def test_process_video_message_applies_default_noise_reduction(
         return audio_path
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
-    message = FakeMessage()
+    message = FakeMessage(file=video_file(size=5), media_bytes=b"video")
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+    settings = make_settings()
+    state = make_state(settings=settings, transcriber=FakeTranscriber())
 
     await process_video_message(
         message,
-        FakeAttachment(),
+        message,
         settings,
-        context,
+        state,
         status_ref,
         "job1234",
         1.0,
@@ -806,52 +625,16 @@ async def test_process_video_message_applies_default_noise_reduction(
 async def test_process_video_message_rejects_downloaded_file_over_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"x" * 11)
-
-    class FakeAttachment:
-        file_name = "clip.mp4"
-        file_size = None
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
-
     def fail_extract_audio(*_: object, **__: object) -> None:
         raise AssertionError("extract_audio should not run for an oversized downloaded video")
 
     monkeypatch.setattr(bot_module, "extract_audio", fail_extract_audio)
-    message = FakeMessage()
+    message = FakeMessage(file=video_file(size=None), media_bytes=b"x" * 11)
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(
-        telegram_bot_token="token",
-        openai_api_key="key",
-        max_video_mb=10 / 1024 / 1024,
-    )
-    context = SimpleNamespace(bot_data={"transcriber": object()})
+    settings = make_settings(max_video_mb=10 / 1024 / 1024)
+    state = make_state(settings=settings, transcriber=object())
 
-    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+    await process_video_message(message, message, settings, state, status_ref, "job1234", 1.0)
 
     assert status_ref["message"] is None
     assert message.text_replies == []
-
-
-@pytest.mark.asyncio
-async def test_process_video_message_replies_when_get_file_reports_file_too_big() -> None:
-    class FakeAttachment:
-        file_name = "clip.mp4"
-        file_size = None
-
-        async def get_file(self) -> object:
-            raise BadRequest("File is too big")
-
-    message = FakeMessage()
-    status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    context = SimpleNamespace(bot_data={"transcriber": object()})
-
-    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
-
-    assert status_ref["message"] is None
-    assert len(message.text_replies) == 1
-    assert "20 MB" in message.text_replies[0]

@@ -7,6 +7,8 @@ from telegram_transcript.config import ConfigError, load_settings, mb_to_bytes, 
 
 BASE_ENV = {
     "TELEGRAM_BOT_TOKEN": "telegram-token",
+    "TELEGRAM_API_ID": "12345",
+    "TELEGRAM_API_HASH": "telegram-api-hash",
     "OPENAI_API_KEY": "openai-key",
 }
 
@@ -15,15 +17,17 @@ def test_load_settings_uses_defaults() -> None:
     settings = load_settings(BASE_ENV, load_dotenv_file=False)
 
     assert settings.telegram_bot_token == "telegram-token"
+    assert settings.telegram_api_id == 12345
+    assert settings.telegram_api_hash == "telegram-api-hash"
     assert settings.openai_api_key == "openai-key"
-    assert settings.telegram_api_base_url is None
-    assert settings.telegram_api_base_file_url is None
-    assert settings.telegram_local_mode is False
+    assert not hasattr(settings, "telegram_api_base_url")
+    assert not hasattr(settings, "telegram_api_base_file_url")
+    assert not hasattr(settings, "telegram_local_mode")
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.refine is True
     assert settings.allowed_telegram_topic_id is None
-    assert settings.max_video_bytes == mb_to_bytes(100)
+    assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
@@ -35,9 +39,6 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENAI_TRANSCRIBE_MODEL": "gpt-4o-transcribe",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
-            "TELEGRAM_API_BASE_URL": " http://telegram-bot-api:8081/bot ",
-            "TELEGRAM_API_BASE_FILE_URL": " http://telegram-bot-api:8081/file/bot ",
-            "TELEGRAM_LOCAL_MODE": "true",
             "REFINE": "false",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "ALLOWED_TELEGRAM_TOPIC_ID": "789",
@@ -51,9 +52,6 @@ def test_load_settings_parses_optional_values() -> None:
 
     assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "custom-refine-model"
-    assert settings.telegram_api_base_url == "http://telegram-bot-api:8081/bot"
-    assert settings.telegram_api_base_file_url == "http://telegram-bot-api:8081/file/bot"
-    assert settings.telegram_local_mode is True
     assert settings.refine is False
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.allowed_telegram_topic_id == 789
@@ -65,12 +63,50 @@ def test_load_settings_parses_optional_values() -> None:
 
 def test_load_settings_requires_credentials() -> None:
     with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
-        load_settings({"OPENAI_API_KEY": "openai-key"}, load_dotenv_file=False)
+        load_settings(
+            {
+                "TELEGRAM_API_ID": "12345",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
+                "OPENAI_API_KEY": "openai-key",
+            },
+            load_dotenv_file=False,
+        )
+
+    with pytest.raises(ConfigError, match="TELEGRAM_API_ID"):
+        load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
+                "OPENAI_API_KEY": "openai-key",
+            },
+            load_dotenv_file=False,
+        )
+
+    with pytest.raises(ConfigError, match="TELEGRAM_API_HASH"):
+        load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_ID": "12345",
+                "OPENAI_API_KEY": "openai-key",
+            },
+            load_dotenv_file=False,
+        )
+
+
+@pytest.mark.parametrize("api_id", ["nope", "0"])
+def test_load_settings_rejects_invalid_telegram_api_id(api_id: str) -> None:
+    with pytest.raises(ConfigError, match="TELEGRAM_API_ID"):
+        load_settings({**BASE_ENV, "TELEGRAM_API_ID": api_id}, load_dotenv_file=False)
 
 
 def test_openai_audio_limit_must_stay_below_25_mb() -> None:
     with pytest.raises(ConfigError, match="below OpenAI"):
         load_settings({**BASE_ENV, "MAX_OPENAI_AUDIO_MB": "25"}, load_dotenv_file=False)
+
+
+def test_max_video_limit_cannot_exceed_telegram_two_gib_limit() -> None:
+    with pytest.raises(ConfigError, match="2048 MB"):
+        load_settings({**BASE_ENV, "MAX_VIDEO_MB": "2049"}, load_dotenv_file=False)
 
 
 def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:

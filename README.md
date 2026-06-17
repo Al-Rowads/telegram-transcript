@@ -14,6 +14,7 @@ A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`
 - Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.
+- Uses Telethon so the bot can download Telegram files up to 2 GiB.
 
 ## Environment
 
@@ -26,6 +27,8 @@ cp .env.example .env
 Required variables:
 
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
+- `TELEGRAM_API_ID`: Telegram API ID from <https://my.telegram.org/apps>.
+- `TELEGRAM_API_HASH`: Telegram API hash from <https://my.telegram.org/apps>.
 - `OPENAI_API_KEY`: OpenAI API key.
 
 Optional variables:
@@ -35,19 +38,14 @@ Optional variables:
 - `REFINE`: set to `true` to run refinement after transcription, or `false` to return raw ASR output. Defaults to `true`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `ALLOWED_TELEGRAM_TOPIC_ID`: Telegram forum topic ID to process in groups/supergroups. When set, group messages outside that topic are ignored. Private chats keep working.
-- `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`. When using Telegram's hosted Bot API, downloads are still capped at 20 MB by Telegram before this bot can read the file.
+- `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB file limit for this Telethon-based downloader.
 - `MAX_OPENAI_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`, below OpenAI's 25 MB upload limit.
-- `TELEGRAM_API_BASE_URL`: optional custom Bot API base URL, for example `http://telegram-bot-api:8081/bot`.
-- `TELEGRAM_API_BASE_FILE_URL`: optional custom Bot API file URL, for example `http://telegram-bot-api:8081/file/bot`.
-- `TELEGRAM_LOCAL_MODE`: set to `true` when using a local Telegram Bot API server so the bot can process downloads larger than the hosted 20 MB limit.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
 
 ## Telegram File Size Notes
 
-Telegram's hosted Bot API `getFile` endpoint only lets bots download files up to 20 MB. A 22.2 MB MP4 may work when sent as a video because Telegram can compress or transform it before the bot receives it, while sending it as a file preserves the original bytes and can exceed the download limit.
-
-To process larger video documents, run a local Telegram Bot API server, set `TELEGRAM_API_BASE_URL`, `TELEGRAM_API_BASE_FILE_URL`, and `TELEGRAM_LOCAL_MODE=true`, then set `MAX_VIDEO_MB` to the largest size you want this bot to accept. Telegram documents this local-server option at <https://core.telegram.org/bots/api#using-a-local-bot-api-server>.
+This bot uses Telethon instead of Telegram's hosted Bot API file endpoint, so it is not limited by the hosted Bot API `getFile` 20 MB download cap. Set `MAX_VIDEO_MB` to the largest file size you want to accept, up to `2048`.
 
 ## Run Locally
 
