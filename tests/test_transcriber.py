@@ -14,8 +14,10 @@ from telegram_transcript.transcriber import (
     OpenAITranscriber,
     RAW_TRANSCRIPT_END,
     RAW_TRANSCRIPT_START,
+    TranscriptionResult,
     TranscriptionError,
     build_refinement_input,
+    extract_refined_message,
     extract_transcript_text,
 )
 
@@ -57,7 +59,18 @@ async def test_transcribe_chunks_reports_progress_and_refines(tmp_path: Path) ->
                     "temperature": temperature,
                 }
             )
-            return SimpleNamespace(output_text="cleaned transcript")
+            return SimpleNamespace(
+                output_text=(
+                    "<transcription>\n"
+                    "first\n\nsecond\n"
+                    "</transcription>\n\n"
+                    "<translation>\n"
+                    "+ first\n"
+                    "اول\n"
+                    "* first\n"
+                    "</translation>"
+                )
+            )
 
     fake_transcriptions = FakeTranscriptions()
     fake_responses = FakeResponses()
@@ -71,7 +84,13 @@ async def test_transcribe_chunks_reports_progress_and_refines(tmp_path: Path) ->
     async def record_progress(event: str, data: object) -> None:
         progress_events.append((event, dict(data)))
 
-    assert await transcriber.transcribe_chunks_async([first, second], progress_callback=record_progress) == "cleaned transcript"
+    result = await transcriber.transcribe_chunks_async_result([first, second], progress_callback=record_progress)
+
+    assert result == TranscriptionResult(
+        transcription="first\n\nsecond",
+        refined_message="+ first\nاول\n* first",
+    )
+    assert result.best_text == "+ first\nاول\n* first"
     assert [call["file"] for call in fake_transcriptions.calls] == ["first", "second"]
     assert fake_transcriptions.calls[0]["model"] == DEFAULT_TRANSCRIPTION_MODEL
     assert fake_transcriptions.calls[0]["prompt"] == IRAQI_ARABIC_TRANSCRIPTION_PROMPT
@@ -96,6 +115,16 @@ async def test_transcribe_chunks_reports_progress_and_refines(tmp_path: Path) ->
     assert progress_events[0][1]["index"] == 1
     assert progress_events[2][1]["index"] == 2
     assert progress_events[4][1]["model"] == DEFAULT_REFINEMENT_MODEL
+
+
+def test_extract_refined_message_uses_translation_block() -> None:
+    refined = "<transcription>\nraw\n</transcription>\n<translation>\nrefined\n</translation>"
+
+    assert extract_refined_message(refined) == "refined"
+
+
+def test_extract_refined_message_falls_back_to_full_text_without_translation_block() -> None:
+    assert extract_refined_message("cleaned transcript") == "cleaned transcript"
 
 
 def test_refinement_input_uses_delimited_raw_transcript() -> None:
@@ -141,6 +170,7 @@ def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path)
     )
     transcriber = OpenAITranscriber(api_key="key", client=fake_client)
 
+    assert transcriber.transcribe_chunks_result([audio]) == TranscriptionResult(transcription="")
     assert transcriber.transcribe_chunks([audio]) == ""
 
 
@@ -162,6 +192,7 @@ def test_transcribe_chunks_skips_refinement_when_disabled(tmp_path: Path) -> Non
     )
     transcriber = OpenAITranscriber(api_key="key", client=fake_client, refine=False)
 
+    assert transcriber.transcribe_chunks_result([audio]) == TranscriptionResult(transcription="raw transcript")
     assert transcriber.transcribe_chunks([audio]) == "raw transcript"
 
 
@@ -188,7 +219,11 @@ async def test_transcribe_chunks_async_skips_refinement_when_disabled(tmp_path: 
     async def record_progress(event: str, data: object) -> None:
         progress_events.append(event)
 
-    assert await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress) == "raw transcript"
+    assert await transcriber.transcribe_chunks_async_result(
+        [audio],
+        progress_callback=record_progress,
+    ) == TranscriptionResult(transcription="raw transcript")
+    assert await transcriber.transcribe_chunks_async([audio]) == "raw transcript"
     assert progress_events == ["transcribing_chunk", "chunk_transcribed"]
 
 

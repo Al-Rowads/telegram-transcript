@@ -24,8 +24,10 @@ from telegram_transcript.bot import (
     is_video_document,
     process_media_message,
     send_transcript,
+    send_transcription_result,
 )
 from telegram_transcript.config import Settings, mb_to_bytes
+from telegram_transcript.transcriber import TranscriptionResult
 
 
 class FakeClient:
@@ -248,6 +250,33 @@ async def test_send_transcript_sends_long_text_as_document() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_transcription_result_sends_transcription_then_refined_message() -> None:
+    message = FakeMessage()
+
+    await send_transcription_result(message, TranscriptionResult("raw transcript", "refined message"))
+
+    assert message.text_replies == ["raw transcript", "refined message"]
+    assert message.client.sent_files == []
+
+
+@pytest.mark.asyncio
+async def test_send_transcription_result_sends_long_parts_as_separate_documents() -> None:
+    message = group_message(id=99, chat_id=7)
+
+    await send_transcription_result(message, TranscriptionResult("x" * 4000, "y" * 4000))
+
+    assert message.text_replies == []
+    assert len(message.client.sent_files) == 2
+    transcription, refined = message.client.sent_files
+    assert getattr(transcription["file"], "name") == "transcription.txt"
+    assert transcription["kwargs"]["caption"] == "Transcription"
+    assert transcription["kwargs"]["reply_to"] == 99
+    assert getattr(refined["file"], "name") == "refined_message.txt"
+    assert refined["kwargs"]["caption"] == "Refined message"
+    assert refined["kwargs"]["reply_to"] == 99
+
+
+@pytest.mark.asyncio
 async def test_handle_non_media_ignores_messages() -> None:
     message = group_message()
 
@@ -314,14 +343,14 @@ async def test_handle_tempo_command_ignores_other_group_topics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_noise_command_sets_default_noise_for_group_thread() -> None:
+async def test_handle_noise_command_ignores_no_arg_default_noise_command() -> None:
     message = group_message(chat_id=20, reply_to=topic_reply(8))
     state = make_state()
 
     await handle_noise_command(message, state, [])
 
-    assert state.pending_noise_reductions == {(20, 8): "default"}
-    assert message.text_replies == ["Default noise reduction set for the next video."]
+    assert state.pending_noise_reductions == {}
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio
@@ -431,6 +460,7 @@ async def test_handle_media_upload_accepts_video_at_exact_configured_size(monkey
         assert args[0] is message
         assert args[1] is message
         assert args[6] == 1.4
+        assert args[7] == "default"
         state.audio_tempo = 2.0
 
     monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
@@ -464,36 +494,56 @@ async def test_handle_media_upload_consumes_pending_noise_for_matching_thread(
 
 
 @pytest.mark.asyncio
-async def test_handle_media_upload_does_not_consume_pending_noise_for_other_thread(
+async def test_handle_media_upload_uses_default_noise_without_pending_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(9))
+    message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(8))
     state = make_state()
-    state.pending_noise_reductions[(20, 8)] = "default"
     processed = False
 
     async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
-        assert args[7] is None
+        assert args[7] == "default"
 
     monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
     await handle_media_upload(message, state)
 
     assert processed
-    assert state.pending_noise_reductions == {(20, 8): "default"}
+
+
+@pytest.mark.asyncio
+async def test_handle_media_upload_does_not_consume_pending_extra_noise_for_other_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = group_message(file=video_file(), chat_id=20, reply_to=topic_reply(9))
+    state = make_state()
+    state.pending_noise_reductions[(20, 8)] = "extra"
+    processed = False
+
+    async def fake_process_media_message(*args: object) -> None:
+        nonlocal processed
+        processed = True
+        assert args[7] == "default"
+
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
+
+    await handle_media_upload(message, state)
+
+    assert processed
+    assert state.pending_noise_reductions == {(20, 8): "extra"}
 
 
 @pytest.mark.asyncio
 async def test_handle_media_upload_does_not_consume_pending_noise_for_known_oversized_video() -> None:
     message = group_message(file=video_file(size=11), chat_id=20, reply_to=topic_reply(8))
     state = make_state(settings=make_settings(max_video_mb=10 / 1024 / 1024))
-    state.pending_noise_reductions[(20, 8)] = "default"
+    state.pending_noise_reductions[(20, 8)] = "extra"
 
     await handle_media_upload(message, state)
 
-    assert state.pending_noise_reductions == {(20, 8): "default"}
+    assert state.pending_noise_reductions == {(20, 8): "extra"}
     assert message.text_replies == []
 
 
@@ -564,7 +614,11 @@ async def test_process_media_message_reports_step_by_step_flow(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     class FakeTranscriber:
-        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+        async def transcribe_chunks_async_result(
+            self,
+            chunks: object,
+            progress_callback: object = None,
+        ) -> TranscriptionResult:
             chunk = list(chunks)[0]
             assert progress_callback is not None
             await progress_callback(
@@ -585,7 +639,7 @@ async def test_process_media_message_reports_step_by_step_flow(
                 },
             )
             await progress_callback("refinement_complete", {"cleaned_chars": 9})
-            return "هاي مرتبة"
+            return TranscriptionResult("هاي خام", "هاي مرتبة")
 
     def fake_extract_audio(
         video_path: Path,
@@ -596,7 +650,7 @@ async def test_process_media_message_reports_step_by_step_flow(
     ) -> Path:
         assert video_path.exists()
         assert audio_tempo == 1.4
-        assert noise_reduction_filter is None
+        assert noise_reduction_filter == "anlmdn"
         audio_path.write_bytes(b"audio")
         return audio_path
 
@@ -610,29 +664,35 @@ async def test_process_media_message_reports_step_by_step_flow(
     await process_media_message(message, message, settings, state, status_ref, "job1234", 1.4)
 
     assert message.downloads
-    assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
+    assert message.text_replies == ["Video received!", "هاي خام", "هاي مرتبة"]
     status = message.status_replies[0]
     assert status.edits == [
-        "Step 2/6: extracting MP3 audio at 1.4x...",
-        "Step 3/6: preparing audio chunks...",
-        "Step 4/6: transcribing chunk 1/1...",
-        "Step 5/6: refining transcript...",
-        "Step 6/6: sending transcript...",
+        "Downloading...",
+        "Converting to MP3 at 1.4x with default noise reduction...",
+        "Splitting audio...",
+        "Transcribing...",
+        "Refining transcript...",
+        "Sending transcript...",
         "Transcript ready.",
     ]
     assert "job1234 step 1/6" in caplog.text
     assert "job1234 step 6/6" in caplog.text
+    assert "هاي خام" not in caplog.text
     assert "هاي مرتبة" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_process_media_message_applies_default_noise_reduction(
+async def test_process_media_message_applies_default_noise_reduction_without_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeTranscriber:
-        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+        async def transcribe_chunks_async_result(
+            self,
+            chunks: object,
+            progress_callback: object = None,
+        ) -> TranscriptionResult:
             assert list(chunks)[0].name == "audio.mp3"
-            return "done"
+            return TranscriptionResult("done")
 
     def fake_extract_audio(
         video_path: Path,
@@ -661,11 +721,57 @@ async def test_process_media_message_applies_default_noise_reduction(
         status_ref,
         "job1234",
         1.0,
-        "default",
     )
 
-    assert message.status_replies[0].edits[0] == "Step 2/6: extracting MP3 audio at 1x with default noise reduction..."
-    assert message.text_replies == ["Video received. Starting transcription...", "done"]
+    assert message.status_replies[0].edits[1] == "Converting to MP3 with default noise reduction..."
+    assert message.text_replies == ["Video received!", "done"]
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_applies_extra_noise_reduction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeTranscriber:
+        async def transcribe_chunks_async_result(
+            self,
+            chunks: object,
+            progress_callback: object = None,
+        ) -> TranscriptionResult:
+            assert list(chunks)[0].name == "audio.mp3"
+            return TranscriptionResult("done")
+
+    def fake_extract_audio(
+        video_path: Path,
+        audio_path: Path,
+        *,
+        audio_tempo: float,
+        noise_reduction_filter: str | None = None,
+    ) -> Path:
+        assert video_path.exists()
+        assert audio_tempo == 1.0
+        assert noise_reduction_filter == "highpass=f=80,afftdn=nr=15,loudnorm"
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    message = FakeMessage(file=video_file(size=5), media_bytes=b"video")
+    status_ref: dict[str, object] = {"message": None}
+    settings = make_settings()
+    state = make_state(settings=settings, transcriber=FakeTranscriber())
+
+    await process_media_message(
+        message,
+        message,
+        settings,
+        state,
+        status_ref,
+        "job1234",
+        1.0,
+        "extra",
+    )
+
+    assert message.status_replies[0].edits[1] == "Converting to MP3 with extra noise reduction..."
+    assert message.text_replies == ["Video received!", "done"]
 
 
 @pytest.mark.asyncio
@@ -683,8 +789,9 @@ async def test_process_media_message_rejects_downloaded_file_over_size(
 
     await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0)
 
-    assert status_ref["message"] is None
-    assert message.text_replies == []
+    assert status_ref["message"] is not None
+    assert message.text_replies == ["Video received!"]
+    assert message.status_replies[0].edits == ["Downloading..."]
 
 
 @pytest.mark.asyncio
@@ -692,9 +799,13 @@ async def test_process_media_message_skips_extraction_for_small_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeTranscriber:
-        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+        async def transcribe_chunks_async_result(
+            self,
+            chunks: object,
+            progress_callback: object = None,
+        ) -> TranscriptionResult:
             assert list(chunks)[0].name == "source.mp3"
-            return "صار"
+            return TranscriptionResult("صار")
 
     def fail_extract_audio(*_: object, **__: object) -> None:
         raise AssertionError("extract_audio should not run for already-small audio")
@@ -707,7 +818,7 @@ async def test_process_media_message_skips_extraction_for_small_audio(
 
     await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0, None, True)
 
-    assert message.text_replies == ["Audio received. Starting transcription...", "صار"]
+    assert message.text_replies == ["Audio received!", "صار"]
     assert message.downloads and message.downloads[0].endswith("source.mp3")
 
 
@@ -718,9 +829,13 @@ async def test_process_media_message_extracts_oversized_audio(
     extracted = False
 
     class FakeTranscriber:
-        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+        async def transcribe_chunks_async_result(
+            self,
+            chunks: object,
+            progress_callback: object = None,
+        ) -> TranscriptionResult:
             assert list(chunks)[0].name == "audio.mp3"
-            return "done"
+            return TranscriptionResult("done")
 
     def fake_extract_audio(
         source_path: Path,
@@ -732,6 +847,7 @@ async def test_process_media_message_extracts_oversized_audio(
         nonlocal extracted
         extracted = True
         assert source_path.exists()
+        assert noise_reduction_filter == "anlmdn"
         audio_path.write_bytes(b"audio")
         return audio_path
 
@@ -744,7 +860,7 @@ async def test_process_media_message_extracts_oversized_audio(
     await process_media_message(message, message, settings, state, status_ref, "job1234", 1.0, None, True)
 
     assert extracted
-    assert message.text_replies == ["Audio received. Starting transcription...", "done"]
+    assert message.text_replies == ["Audio received!", "done"]
 
 
 @pytest.mark.asyncio

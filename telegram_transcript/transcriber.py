@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,7 @@ DEFAULT_REFINEMENT_MODEL = "gpt-5.4-mini"
 TRANSCRIPTION_CONTEXT_CHARS = 800
 RAW_TRANSCRIPT_START = "<raw_asr_transcript>"
 RAW_TRANSCRIPT_END = "</raw_asr_transcript>"
+TRANSLATION_BLOCK_PATTERN = re.compile(r"<translation>\s*(.*?)\s*</translation>", re.DOTALL | re.IGNORECASE)
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 IRAQI_ARABIC_TRANSCRIPTION_PROMPT = """النص الصوتي باللهجة العراقية/البغدادية.
@@ -70,6 +73,16 @@ class TranscriptionError(RuntimeError):
     """Raised when OpenAI returns an unusable transcription response."""
 
 
+@dataclass(frozen=True)
+class TranscriptionResult:
+    transcription: str
+    refined_message: str | None = None
+
+    @property
+    def best_text(self) -> str:
+        return self.refined_message or self.transcription
+
+
 class OpenAITranscriber:
     def __init__(
         self,
@@ -109,10 +122,17 @@ class OpenAITranscriber:
         )
 
     def transcribe_chunks(self, chunks: Sequence[Path]) -> str:
+        return self.transcribe_chunks_result(chunks).best_text
+
+    def transcribe_chunks_result(self, chunks: Sequence[Path]) -> TranscriptionResult:
         transcript = self.transcribe_chunks_raw(chunks)
         if not transcript.strip() or not self.refine:
-            return transcript
-        return self.refine_transcript(transcript)
+            return TranscriptionResult(transcription=transcript)
+        refined = self.refine_transcript(transcript)
+        return TranscriptionResult(
+            transcription=transcript,
+            refined_message=extract_refined_message(refined),
+        )
 
     def transcribe_chunks_raw(self, chunks: Sequence[Path]) -> str:
         transcripts = []
@@ -141,6 +161,13 @@ class OpenAITranscriber:
         chunks: Sequence[Path],
         progress_callback: ProgressCallback | None = None,
     ) -> str:
+        return (await self.transcribe_chunks_async_result(chunks, progress_callback=progress_callback)).best_text
+
+    async def transcribe_chunks_async_result(
+        self,
+        chunks: Sequence[Path],
+        progress_callback: ProgressCallback | None = None,
+    ) -> TranscriptionResult:
         total = len(chunks)
         transcripts = []
         previous_transcript = ""
@@ -177,7 +204,7 @@ class OpenAITranscriber:
 
         transcript = "\n\n".join(transcripts)
         if not transcript.strip() or not self.refine:
-            return transcript
+            return TranscriptionResult(transcription=transcript)
 
         if progress_callback is not None:
             await progress_callback(
@@ -195,7 +222,10 @@ class OpenAITranscriber:
                     "cleaned_chars": len(refined),
                 },
             )
-        return refined
+        return TranscriptionResult(
+            transcription=transcript,
+            refined_message=extract_refined_message(refined),
+        )
 
 
 def extract_transcript_text(response: Any) -> str:
@@ -224,6 +254,16 @@ def extract_response_text(response: Any) -> str:
         return output_text
 
     raise TranscriptionError("OpenAI refinement response did not include text.")
+
+
+def extract_refined_message(refined: str) -> str:
+    normalized = refined.strip()
+    match = TRANSLATION_BLOCK_PATTERN.search(normalized)
+    if match is None:
+        return normalized
+
+    translation = match.group(1).strip()
+    return translation or normalized
 
 
 def build_refinement_input(transcript: str) -> str:

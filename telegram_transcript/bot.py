@@ -18,7 +18,7 @@ from telethon.tl.types import DocumentAttributeFilename
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
-from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError
+from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError, TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +166,7 @@ async def handle_media_upload(message: Message, state: BotState) -> None:
         return
 
     audio_tempo = get_runtime_audio_tempo(state, settings)
-    noise_reduction_mode = consume_pending_noise_reduction_mode(state, message)
+    noise_reduction_mode = consume_pending_noise_reduction_mode(state, message) or DEFAULT_NOISE_REDUCTION_MODE
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g noise_reduction=%s transcribe_model=%s refine=%s refine_model=%s",
@@ -220,7 +220,8 @@ async def process_media_message(
 ) -> None:
     transcriber = state.transcriber
     job_started = time.monotonic()
-    noise_reduction_filter = get_noise_reduction_filter(noise_reduction_mode)
+    effective_noise_reduction_mode = noise_reduction_mode or DEFAULT_NOISE_REDUCTION_MODE
+    noise_reduction_filter = get_noise_reduction_filter(effective_noise_reduction_mode)
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -273,14 +274,14 @@ async def process_media_message(
             )
             chunks = [source_path]
         else:
-            await edit_status(status, extracting_audio_status_text(audio_tempo, noise_reduction_mode))
+            await edit_status(status, extracting_audio_status_text(audio_tempo, effective_noise_reduction_mode))
             step_started = time.monotonic()
             logger.info(
                 "job %s step 2/6 extracting MP3 audio: source_bytes=%d audio_tempo=%g noise_reduction=%s",
                 job_id,
                 source_bytes,
                 audio_tempo,
-                noise_reduction_mode or "none",
+                effective_noise_reduction_mode,
             )
             await asyncio.to_thread(
                 extract_audio,
@@ -364,23 +365,26 @@ async def process_media_message(
                     progress_data.get("cleaned_chars"),
                 )
 
-        transcript = await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
+        result = await transcriber.transcribe_chunks_async_result(chunks, progress_callback=report_progress)
 
-    transcript = transcript.strip() or "No speech was detected."
+    result = normalize_transcription_result(result)
     await edit_status(status, "Sending transcript...")
     logger.info(
-        "job %s step 6/6 sending transcript: output_chars=%d delivery=%s",
+        "job %s step 6/6 sending transcript: transcription_chars=%d transcription_delivery=%s refined_chars=%d refined_delivery=%s",
         job_id,
-        len(transcript),
-        "text" if should_send_as_text(transcript) else "document",
+        len(result.transcription),
+        get_delivery_method(result.transcription),
+        len(result.refined_message or ""),
+        get_delivery_method(result.refined_message) if result.refined_message else "none",
     )
-    await send_transcript(message, transcript)
+    await send_transcription_result(message, result)
     await edit_status(status, "Transcript ready.")
     logger.info(
-        "job %s completed: duration_ms=%d output_chars=%d",
+        "job %s completed: duration_ms=%d transcription_chars=%d refined_chars=%d",
         job_id,
         elapsed_ms(job_started),
-        len(transcript),
+        len(result.transcription),
+        len(result.refined_message or ""),
     )
 
 
@@ -390,14 +394,36 @@ async def download_attachment(attachment: Message, target_path: Path) -> None:
         raise RuntimeError("Telegram media download did not produce a file.")
 
 
-async def send_transcript(message: Message, transcript: str) -> None:
+async def send_transcription_result(message: Message, result: TranscriptionResult) -> None:
+    await send_transcript(
+        message,
+        result.transcription,
+        caption="Transcription",
+        filename="transcription.txt",
+    )
+    if result.refined_message:
+        await send_transcript(
+            message,
+            result.refined_message,
+            caption="Refined message",
+            filename="refined_message.txt",
+        )
+
+
+async def send_transcript(
+    message: Message,
+    transcript: str,
+    *,
+    caption: str = "Transcript",
+    filename: str = "transcript.txt",
+) -> None:
     if should_send_as_text(transcript):
         for chunk in split_text_for_telegram(transcript):
             await reply_to_source(message, chunk)
         return
 
     transcript_file = BytesIO(transcript.encode("utf-8"))
-    transcript_file.name = "transcript.txt"
+    transcript_file.name = filename
     transcript_file.seek(0)
     client = get_message_client(message)
     if client is None:
@@ -405,10 +431,10 @@ async def send_transcript(message: Message, transcript: str) -> None:
     await client.send_file(
         await get_message_entity(message),
         transcript_file,
-        caption="Transcript",
+        caption=caption,
         force_document=True,
         reply_to=get_message_id(message),
-        attributes=[DocumentAttributeFilename("transcript.txt")],
+        attributes=[DocumentAttributeFilename(filename)],
     )
 
 
@@ -468,8 +494,6 @@ def parse_tempo_command_args(args: object) -> float | None:
 def parse_noise_command_args(args: object) -> str | None:
     if not isinstance(args, list):
         return None
-    if len(args) == 0:
-        return DEFAULT_NOISE_REDUCTION_MODE
     if len(args) == 1 and isinstance(args[0], str) and args[0].casefold() == EXTRA_NOISE_REDUCTION_MODE:
         return EXTRA_NOISE_REDUCTION_MODE
     return None
@@ -504,6 +528,18 @@ def get_noise_reduction_filter(noise_reduction_mode: str | None) -> str | None:
     if noise_reduction_mode is None:
         return None
     return NOISE_REDUCTION_FILTERS.get(noise_reduction_mode)
+
+
+def normalize_transcription_result(result: TranscriptionResult) -> TranscriptionResult:
+    transcription = result.transcription.strip() or "No speech was detected."
+    refined_message = result.refined_message.strip() if result.refined_message else None
+    return TranscriptionResult(transcription=transcription, refined_message=refined_message or None)
+
+
+def get_delivery_method(text: str | None) -> str:
+    if not text:
+        return "none"
+    return "text" if should_send_as_text(text) else "document"
 
 
 def describe_noise_reduction(noise_reduction_mode: str) -> str:

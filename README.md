@@ -9,10 +9,10 @@ A Python Telegram bot that receives a video, voice note, or MP3, gets speech aud
 - Accepts Telegram voice notes and `.mp3` files, transcribing them directly and skipping the `ffmpeg` step when the audio is already within OpenAI's upload limit.
 - Works in private chats, groups, and supergroups.
 - Ignores text, unsupported media, invalid commands, and oversized uploads without replying.
-- Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`, and falls back to the same compression for audio uploads that are too large to send directly.
+- Converts video audio to slowed mono 16 kHz MP3 with default noise reduction through `ffmpeg`, and falls back to the same compression for audio uploads that are too large to send directly.
 - Splits audio into safe chunks when it would exceed OpenAI's per-file upload limit.
-- Converts raw speech-to-text output into a structured Arabic transcript, Persian translation, key-word, and line-break editing aid before replying.
-- Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
+- Converts raw speech-to-text output into a structured Arabic transcript, Persian translation, key-word, and line-break editing aid.
+- Sends the raw transcription first, then sends the refined/translation message. Long outputs are sent as separate `.txt` files.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.
 - Uses Telethon so the bot can download Telegram files up to 2 GiB.
@@ -83,7 +83,7 @@ For groups with topics, set `ALLOWED_TELEGRAM_TOPIC_ID` to make the bot process 
 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
-Use `/noise` before sending a video to apply default one-shot ffmpeg noise reduction to the next video in the same chat or topic. Use `/noise extra` for stronger filtering with high-pass, FFT denoise, and loudness normalization. The setting is consumed by the next accepted video and is not permanent.
+Default ffmpeg noise reduction is applied automatically whenever the bot extracts or recompresses audio. Use `/noise extra` before sending a video to apply stronger one-shot filtering with high-pass, FFT denoise, and loudness normalization to the next accepted media item in the same chat or topic.
 
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 
