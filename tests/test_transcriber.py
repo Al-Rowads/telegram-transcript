@@ -26,7 +26,6 @@ from telegram_transcript.transcriber import (
     render_line_translated_transcript_from_srt,
     render_srt,
     split_srt_by_byte_limit,
-    validate_translated_srt,
 )
 from telegram_transcript import transcriber as transcriber_module
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
@@ -332,7 +331,20 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
     assert len(fake_refiner.calls) == 3
     assert all(len(call.encode("utf-8")) <= 75 for call in fake_refiner.calls)
     assert assemble_srt_chunks(fake_refiner.calls) == raw_srt
-    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=result.translated_srt or "") == result.translated_srt
+    assert result.translated_srt == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "first\n"
+        '<font color="green">ترجمه 1</font>\n\n'
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "second\n"
+        '<font color="green">ترجمه 2</font>\n\n'
+        "3\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "third\n"
+        '<font color="green">ترجمه 3</font>\n'
+    )
     assert result.line_translated_transcript == (
         "first\nترجمه 1\n\nsecond\nترجمه 2\n\nthird\nترجمه 3\n"
     )
@@ -341,6 +353,96 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
         for event, data in progress_events
         if event == "refining_transcript"
     ] == [(1, 3), (2, 3), (3, 3)]
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_async_accepts_flexible_openai_translation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="first second third fourth",
+                subtitle_cues=(
+                    SubtitleCue(0.0, 1.0, "first"),
+                    SubtitleCue(1.0, 2.0, "second"),
+                    SubtitleCue(2.0, 3.0, "third"),
+                    SubtitleCue(3.0, 4.0, "fourth"),
+                ),
+            )
+
+    class FakeRefiner:
+        model = DEFAULT_REFINEMENT_MODEL
+
+        def refine_transcript(self, transcript: str) -> str:
+            return (
+                "1\n"
+                "00:00:00,000 --> 00:00:01,000\n"
+                "first\n\n"
+                "2\n"
+                "00:00:01,000 --> 00:00:02,000\n"
+                "second\n"
+                "ترجمه دوم خط اول\n"
+                "ترجمه دوم خط دوم\n\n"
+                "3\n"
+                "00:00:02,000 --> 00:00:03,000\n"
+                "third changed by model\n"
+                '<font color="green">ترجمه سوم</font>\n\n'
+                "4\n"
+                "00:00:03,000 --> 00:00:04,000\n"
+                "fourth\n"
+                "extra model note\n"
+                '<font color="green">ترجمه چهارم</font>\n'
+            )
+
+    transcriber = SpeechTranscriber(
+        speech_to_text_provider=FakeSpeechToTextProvider(),
+        refiner=FakeRefiner(),
+    )
+
+    result = await transcriber.transcribe_chunks_async([audio])
+
+    assert result.translated_srt == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "first\n\n"
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "second\n"
+        "ترجمه دوم خط اول\n"
+        "ترجمه دوم خط دوم\n\n"
+        "3\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "third changed by model\n"
+        '<font color="green">ترجمه سوم</font>\n\n'
+        "4\n"
+        "00:00:03,000 --> 00:00:04,000\n"
+        "fourth\n"
+        "extra model note\n"
+        '<font color="green">ترجمه چهارم</font>\n'
+    )
+    assert result.line_translated_transcript == (
+        "first\n\n"
+        "second\n"
+        "ترجمه دوم خط اول\n"
+        "ترجمه دوم خط دوم\n\n"
+        "third changed by model\n"
+        "ترجمه سوم\n\n"
+        "fourth\n"
+        "extra model note\n"
+        "ترجمه چهارم\n"
+    )
 
 
 def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
@@ -372,6 +474,17 @@ def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
             "temperature": 0,
         }
     ]
+
+
+def test_transcript_refiner_accepts_empty_response_text() -> None:
+    class FakeResponses:
+        def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
+            return SimpleNamespace(output_text=" ")
+
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    refiner = TranscriptRefiner(api_key="key", client=fake_client)
+
+    assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == ""
 
 
 def test_refinement_input_uses_delimited_raw_transcript() -> None:
@@ -588,30 +701,6 @@ def test_assemble_srt_chunks_reassembles_through_parsed_blocks() -> None:
     )
 
 
-def test_validate_translated_srt_accepts_green_persian_line() -> None:
-    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-    translated_srt = (
-        "1\n"
-        "00:00:00,001 --> 00:00:01,000\n"
-        "هلا بالعالم\n"
-        '<font color="green">سلام دنیا</font>\n'
-    )
-
-    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt) == translated_srt
-
-
-def test_validate_translated_srt_wraps_plain_persian_line() -> None:
-    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-    translated_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\nسلام دنیا\n"
-
-    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt) == (
-        "1\n"
-        "00:00:00,001 --> 00:00:01,000\n"
-        "هلا بالعالم\n"
-        '<font color="green">سلام دنیا</font>\n'
-    )
-
-
 def test_render_line_translated_transcript_from_srt_removes_srt_structure_and_font_markup() -> None:
     translated_srt = (
         "1\n"
@@ -633,40 +722,6 @@ def test_render_line_translated_transcript_from_srt_keeps_plain_translation_text
     translated_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\nسلام دنیا\n"
 
     assert render_line_translated_transcript_from_srt(translated_srt) == "هلا بالعالم\nسلام دنیا\n"
-
-
-def test_validate_translated_srt_rejects_changed_timestamp() -> None:
-    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-    translated_srt = (
-        "1\n"
-        "00:00:00,002 --> 00:00:01,000\n"
-        "هلا بالعالم\n"
-        '<font color="green">سلام دنیا</font>\n'
-    )
-
-    with pytest.raises(TranscriptionError, match="timestamp"):
-        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
-
-
-def test_validate_translated_srt_rejects_changed_arabic_text() -> None:
-    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-    translated_srt = (
-        "1\n"
-        "00:00:00,001 --> 00:00:01,000\n"
-        "مرحبا بالعالم\n"
-        '<font color="green">سلام دنیا</font>\n'
-    )
-
-    with pytest.raises(TranscriptionError, match="Arabic"):
-        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
-
-
-def test_validate_translated_srt_rejects_missing_translation_line() -> None:
-    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-    translated_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
-
-    with pytest.raises(TranscriptionError, match="exactly one Persian line"):
-        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
 
 
 def test_transcript_refiner_raises_when_refinement_has_no_text() -> None:

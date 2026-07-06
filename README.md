@@ -82,7 +82,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 ## Subtitle Files
 
-When Deepgram returns timestamps, the bot sends `transcript.srt` after the Arabic transcript. With `REFINE=false`, the SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. With `REFINE=true`, OpenAI receives only the rendered SRT and adds a green Persian translation line below each original Arabic cue while preserving cue numbers, timestamps, and Arabic text. The bot then derives a third message or text file locally by removing SRT cue numbers, timestamps, blank subtitle structure, and green font markup, leaving each Arabic subtitle line followed by its Persian translation and a blank line before the next pair.
+When Deepgram returns timestamps, the bot sends `transcript.srt` after the Arabic transcript. With `REFINE=false`, the SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. With `REFINE=true`, OpenAI receives the rendered SRT and returns Persian-enhanced subtitle text. The bot accepts OpenAI's response without validating cue counts, timestamps, Arabic text, or Persian line counts, then derives a third message or text file with best-effort cleanup by removing SRT cue numbers, timestamps, and green font markup when present.
 
 Deepgram provides subtitle timestamps in the default configuration. OpenAI is not used for audio transcription; it is only used for optional SRT translation.
 

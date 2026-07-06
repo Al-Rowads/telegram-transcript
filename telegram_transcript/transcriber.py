@@ -21,32 +21,34 @@ ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
 
-You will receive a complete SRT subtitle file. Your job is to add one Persian translation line to each subtitle cue while preserving the SRT file structure exactly.
+You will receive a complete SRT subtitle file. Your job is to add Persian translations to the subtitle cues while keeping the output useful as subtitles.
 
 Rules:
-- Do not change cue numbers.
-- Do not change timestamps.
-- Do not change blank lines between cues.
-- Do not change, correct, normalize, or translate the original Arabic subtitle text.
-- Add exactly one Persian translation line after the original Arabic text in every cue.
-- Wrap only the Persian translation line in this exact tag format: <font color="green">Persian translation</font>.
+- Keep cue numbers, timestamps, blank lines, and original Arabic subtitle text when practical.
+- Add Persian translation text after the related Arabic subtitle text.
+- Use as many Persian lines as needed for a natural translation.
+- Wrap Persian translation lines in this tag format when practical: <font color="green">Persian translation</font>.
 - Keep names, numbers, brands, and technical terms accurate.
-- Output only the final SRT text.
+- Output only the translated subtitle text.
 
 Example output cue:
 1103
 01:07:29,610 --> 01:07:30,810
 {{Arabic text}}
-<font color="green">{{Persian translation for that line}}</font>"""
+<font color="green">{{Persian translation for that cue}}</font>"""
 
 SRT_TRANSLATION_REQUEST = (
-    "Add Persian translations to this SRT file. Preserve every cue number, timestamp, "
-    "blank line, and original Arabic subtitle line exactly. Output only valid SRT."
+    "Add Persian translations to this SRT file. Keep cue numbers, timestamps, "
+    "blank lines, and original Arabic subtitle lines when practical. Output only the translated subtitle text."
 )
 
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = SRT_TRANSLATION_SYSTEM_PROMPT
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = SRT_TRANSLATION_REQUEST
 GREEN_FONT_RE = re.compile(r'^<font\s+color=["\']?green["\']?>\s*(.*?)\s*</font>$', re.IGNORECASE)
+SRT_CUE_NUMBER_RE = re.compile(r"^\d+$")
+SRT_TIMESTAMP_RE = re.compile(
+    r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}(?:\s+.*)?$"
+)
 
 
 class TranscriptionError(RuntimeError):
@@ -120,10 +122,7 @@ class TranscriptRefiner:
             input=build_refinement_input(transcript),
             temperature=0,
         )
-        refined = extract_response_text(response).strip()
-        if not refined:
-            raise TranscriptionError("OpenAI refinement returned empty text.")
-        return refined
+        return extract_response_text(response).strip()
 
 
 class SpeechTranscriber:
@@ -248,11 +247,8 @@ class SpeechTranscriber:
                     },
                 )
             translated_srt_chunk = await asyncio.to_thread(self.refine_transcript, raw_srt_chunk)
-            translated_srt_chunks.append(
-                validate_translated_srt(raw_srt=raw_srt_chunk, translated_srt=translated_srt_chunk)
-            )
-        translated_srt = assemble_srt_chunks(translated_srt_chunks)
-        translated_srt = validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
+            translated_srt_chunks.append(translated_srt_chunk)
+        translated_srt = join_translated_srt_chunks(translated_srt_chunks)
         line_translated_transcript = render_line_translated_transcript_from_srt(translated_srt)
         if progress_callback is not None:
             await progress_callback(
@@ -454,6 +450,11 @@ def assemble_srt_chunks(chunks: Sequence[str]) -> str:
     return render_srt_blocks(blocks)
 
 
+def join_translated_srt_chunks(chunks: Sequence[str]) -> str:
+    translated_chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+    return "\n\n".join(translated_chunks) + ("\n" if translated_chunks else "")
+
+
 def parse_srt_blocks(srt: str) -> tuple[SrtBlock, ...]:
     normalized = srt.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
@@ -477,61 +478,20 @@ def parse_srt_blocks(srt: str) -> tuple[SrtBlock, ...]:
     return tuple(blocks)
 
 
-def validate_translated_srt(*, raw_srt: str, translated_srt: str) -> str:
-    raw_blocks = parse_srt_blocks(raw_srt)
-    translated_blocks = parse_srt_blocks(translated_srt)
-    if len(raw_blocks) != len(translated_blocks):
-        raise TranscriptionError("OpenAI translated SRT changed the cue count.")
-
-    normalized_blocks = []
-    for raw_block, translated_block in zip(raw_blocks, translated_blocks, strict=True):
-        if raw_block.index != translated_block.index:
-            raise TranscriptionError("OpenAI translated SRT changed a cue number.")
-        if raw_block.timestamp != translated_block.timestamp:
-            raise TranscriptionError("OpenAI translated SRT changed a timestamp.")
-
-        expected_line_count = len(raw_block.text_lines) + 1
-        if len(translated_block.text_lines) != expected_line_count:
-            raise TranscriptionError("OpenAI translated SRT must add exactly one Persian line per cue.")
-
-        original_lines = translated_block.text_lines[: len(raw_block.text_lines)]
-        if original_lines != raw_block.text_lines:
-            raise TranscriptionError("OpenAI translated SRT changed the original Arabic text.")
-
-        persian_line = translated_block.text_lines[-1].strip()
-        match = GREEN_FONT_RE.fullmatch(persian_line)
-        if match is not None:
-            persian_text = match.group(1).strip()
-        elif persian_line.lower().startswith("<font"):
-            raise TranscriptionError("OpenAI translated SRT used unsupported color markup.")
-        else:
-            persian_text = persian_line
-        if not persian_text:
-            raise TranscriptionError("OpenAI translated SRT included an empty Persian translation.")
-
-        normalized_blocks.append(
-            "\n".join(
-                [
-                    raw_block.index,
-                    raw_block.timestamp,
-                    *raw_block.text_lines,
-                    f'<font color="green">{persian_text}</font>',
-                ]
-            )
-        )
-    return "\n\n".join(normalized_blocks) + ("\n" if normalized_blocks else "")
-
-
 def render_line_translated_transcript_from_srt(translated_srt: str) -> str:
-    blocks = []
-    for block in parse_srt_blocks(translated_srt):
-        text_lines = []
-        for line in block.text_lines:
-            stripped_line = line.strip()
-            match = GREEN_FONT_RE.fullmatch(stripped_line)
-            text_lines.append(match.group(1).strip() if match is not None else stripped_line)
-        blocks.append("\n".join(text_lines))
-    return "\n\n".join(blocks) + ("\n" if blocks else "")
+    text_lines = []
+    for line in translated_srt.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped_line = line.strip()
+        if SRT_CUE_NUMBER_RE.fullmatch(stripped_line) or SRT_TIMESTAMP_RE.fullmatch(stripped_line):
+            continue
+        match = GREEN_FONT_RE.fullmatch(stripped_line)
+        text_lines.append(match.group(1).strip() if match is not None else stripped_line)
+
+    while text_lines and not text_lines[0]:
+        text_lines.pop(0)
+    while text_lines and not text_lines[-1]:
+        text_lines.pop()
+    return "\n".join(text_lines) + ("\n" if text_lines else "")
 
 
 def extract_response_text(response: Any) -> str:
