@@ -29,7 +29,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.deepgram_transcribe_model == "nova-3"
     assert settings.deepgram_language == "ar"
     assert settings.openai_api_key == ""
-    assert settings.openai_refine_model == "gpt-5.4-mini"
+    assert settings.openai_refine_model == "gpt-5.4"
     assert settings.refine is False
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0

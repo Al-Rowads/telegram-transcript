@@ -35,6 +35,7 @@ class TranscriptionResult:
     raw_transcript: str
     refined_transcript: str | None = None
     subtitle_cues: tuple[SubtitleCue, ...] = ()
+    translated_srt: str | None = None
 
     @property
     def final_transcript(self) -> str:

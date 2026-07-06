@@ -7,14 +7,14 @@ from types import SimpleNamespace
 import pytest
 
 from telegram_transcript.transcriber import (
-    BAGHDADI_ARABIC_REFINEMENT_REQUEST,
-    BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT,
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DeepgramSpeechToTextProvider,
     RAW_TRANSCRIPT_END,
     RAW_TRANSCRIPT_START,
+    SRT_TRANSLATION_REQUEST,
+    SRT_TRANSLATION_SYSTEM_PROMPT,
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
@@ -22,6 +22,7 @@ from telegram_transcript.transcriber import (
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
     render_srt,
+    validate_translated_srt,
 )
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
 
@@ -179,7 +180,16 @@ async def test_transcribe_chunks_reports_progress_and_refines(
 
         def refine_transcript(self, transcript: str) -> str:
             self.calls.append({"transcript": transcript})
-            return "cleaned transcript"
+            return (
+                "1\n"
+                "00:00:00,500 --> 00:00:01,000\n"
+                "first\n"
+                '<font color="green">اول</font>\n\n'
+                "2\n"
+                "00:00:10,500 --> 00:00:11,000\n"
+                "second\n"
+                '<font color="green">دوم</font>\n'
+            )
 
     fake_provider = FakeSpeechToTextProvider()
     fake_refiner = FakeRefiner()
@@ -198,8 +208,18 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     )
 
     assert result.raw_transcript == "first\n\nsecond"
-    assert result.refined_transcript == "cleaned transcript"
-    assert result.final_transcript == "cleaned transcript"
+    assert result.refined_transcript is None
+    assert result.final_transcript == "first\n\nsecond"
+    assert result.translated_srt == (
+        "1\n"
+        "00:00:00,500 --> 00:00:01,000\n"
+        "first\n"
+        '<font color="green">اول</font>\n\n'
+        "2\n"
+        "00:00:10,500 --> 00:00:11,000\n"
+        "second\n"
+        '<font color="green">دوم</font>\n'
+    )
     assert result.subtitle_cues == (
         SubtitleCue(0.5, 1.0, "first"),
         SubtitleCue(10.5, 11.0, "second"),
@@ -208,7 +228,18 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         {"file": "first", "previous_transcript": ""},
         {"file": "second", "previous_transcript": "first"},
     ]
-    assert fake_refiner.calls == [{"transcript": "first\n\nsecond"}]
+    assert fake_refiner.calls == [
+        {
+            "transcript": (
+                "1\n"
+                "00:00:00,500 --> 00:00:01,000\n"
+                "first\n\n"
+                "2\n"
+                "00:00:10,500 --> 00:00:11,000\n"
+                "second\n"
+            )
+        }
+    ]
     assert [event for event, _ in progress_events] == [
         "transcribing_chunk",
         "chunk_transcribed",
@@ -243,23 +274,23 @@ def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
     fake_client = SimpleNamespace(responses=fake_responses)
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
 
-    assert refiner.refine_transcript("first\n\nsecond") == "cleaned transcript"
+    assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == "cleaned transcript"
     assert fake_responses.calls == [
         {
             "model": DEFAULT_REFINEMENT_MODEL,
-            "instructions": BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT,
-            "input": build_refinement_input("first\n\nsecond"),
+            "instructions": SRT_TRANSLATION_SYSTEM_PROMPT,
+            "input": build_refinement_input("1\n00:00:00,000 --> 00:00:01,000\nهاي\n"),
             "temperature": 0,
         }
     ]
 
 
 def test_refinement_input_uses_delimited_raw_transcript() -> None:
-    raw = "هاي تجربة"
+    raw = "1\n00:00:00,000 --> 00:00:01,000\nهاي تجربة\n"
 
     refinement_input = build_refinement_input(raw)
 
-    assert BAGHDADI_ARABIC_REFINEMENT_REQUEST in refinement_input
+    assert SRT_TRANSLATION_REQUEST in refinement_input
     assert RAW_TRANSCRIPT_START in refinement_input
     assert RAW_TRANSCRIPT_END in refinement_input
     assert raw in refinement_input
@@ -302,6 +333,31 @@ def test_transcribe_chunks_skips_refinement_when_disabled(tmp_path: Path) -> Non
             return "raw transcript"
 
     transcriber = SpeechTranscriber(speech_to_text_provider=FakeSpeechToTextProvider())
+
+    assert transcriber.transcribe_chunks([audio]) == "raw transcript"
+
+
+def test_transcribe_chunks_skips_refinement_without_subtitle_cues(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+
+        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+            return "raw transcript"
+
+    class FakeRefiner:
+        model = DEFAULT_REFINEMENT_MODEL
+
+        def refine_transcript(self, transcript: str) -> str:
+            raise AssertionError("SRT refinement requires subtitle cues.")
+
+    transcriber = SpeechTranscriber(
+        speech_to_text_provider=FakeSpeechToTextProvider(),
+        refiner=FakeRefiner(),
+    )
 
     assert transcriber.transcribe_chunks([audio]) == "raw transcript"
 
@@ -400,26 +456,70 @@ def test_render_srt_formats_cues() -> None:
     )
 
 
-def test_transcribe_chunks_raises_when_refinement_has_no_text(tmp_path: Path) -> None:
-    audio = tmp_path / "audio.mp3"
-    audio.write_bytes(b"audio")
+def test_validate_translated_srt_accepts_green_persian_line() -> None:
+    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+    translated_srt = (
+        "1\n"
+        "00:00:00,001 --> 00:00:01,000\n"
+        "هلا بالعالم\n"
+        '<font color="green">سلام دنیا</font>\n'
+    )
 
-    class FakeSpeechToTextProvider:
-        provider_name = "deepgram"
-        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt) == translated_srt
 
-        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
-            return "raw transcript"
 
+def test_validate_translated_srt_wraps_plain_persian_line() -> None:
+    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+    translated_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\nسلام دنیا\n"
+
+    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt) == (
+        "1\n"
+        "00:00:00,001 --> 00:00:01,000\n"
+        "هلا بالعالم\n"
+        '<font color="green">سلام دنیا</font>\n'
+    )
+
+
+def test_validate_translated_srt_rejects_changed_timestamp() -> None:
+    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+    translated_srt = (
+        "1\n"
+        "00:00:00,002 --> 00:00:01,000\n"
+        "هلا بالعالم\n"
+        '<font color="green">سلام دنیا</font>\n'
+    )
+
+    with pytest.raises(TranscriptionError, match="timestamp"):
+        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
+
+
+def test_validate_translated_srt_rejects_changed_arabic_text() -> None:
+    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+    translated_srt = (
+        "1\n"
+        "00:00:00,001 --> 00:00:01,000\n"
+        "مرحبا بالعالم\n"
+        '<font color="green">سلام دنیا</font>\n'
+    )
+
+    with pytest.raises(TranscriptionError, match="Arabic"):
+        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
+
+
+def test_validate_translated_srt_rejects_missing_translation_line() -> None:
+    raw_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+    translated_srt = "1\n00:00:00,001 --> 00:00:01,000\nهلا بالعالم\n"
+
+    with pytest.raises(TranscriptionError, match="exactly one Persian line"):
+        validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
+
+
+def test_transcript_refiner_raises_when_refinement_has_no_text() -> None:
     class FakeResponses:
         def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
             return SimpleNamespace()
 
     fake_client = SimpleNamespace(responses=FakeResponses())
-    transcriber = SpeechTranscriber(
-        speech_to_text_provider=FakeSpeechToTextProvider(),
-        refiner=TranscriptRefiner(api_key="key", client=fake_client),
-    )
-
+    refiner = TranscriptRefiner(api_key="key", client=fake_client)
     with pytest.raises(TranscriptionError, match="refinement response"):
-        transcriber.transcribe_chunks([audio])
+        refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")

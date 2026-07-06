@@ -422,14 +422,19 @@ async def test_process_video_message_reports_step_by_step_flow(
                 "refining_transcript",
                 {
                     "raw_chars": 12,
-                    "model": "gpt-5.4-mini",
+                    "model": "gpt-5.4",
                 },
             )
-            await progress_callback("refinement_complete", {"cleaned_chars": 9})
+            await progress_callback("refinement_complete", {"translated_srt_chars": 95})
             return TranscriptionResult(
                 raw_transcript="هاي خام",
-                refined_transcript="هاي مرتبة",
                 subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
+                translated_srt=(
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,250\n"
+                    "هاي خام\n"
+                    '<font color="green">این خام است</font>\n'
+                ),
             )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
@@ -455,7 +460,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
 
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
-    assert message.text_replies == ["Video received. Starting transcription...", "هاي خام", "هاي مرتبة"]
+    assert message.text_replies == ["Video received. Starting transcription...", "هاي خام"]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     status = message.status_replies[0]
     assert status.edits == [
@@ -463,13 +468,13 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 2/6: extracting MP3 audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
-        "Step 5/6: refining transcript...",
+        "Step 5/6: translating subtitles...",
         "Step 6/6: sending transcript...",
         "Transcript ready.",
     ]
     assert "job1234 step 1/6" in caplog.text
     assert "job1234 step 6/6" in caplog.text
-    assert "هاي مرتبة" not in caplog.text
+    assert "این خام است" not in caplog.text
 
 
 @pytest.mark.asyncio
