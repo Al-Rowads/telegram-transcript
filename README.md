@@ -12,7 +12,7 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Converts media audio to slowed mono 16 kHz MP3 with `ffmpeg`.
 - Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to Deepgram.
 - Uses Deepgram Nova-3 Arabic for speech-to-text by default.
-- Optionally adds Persian translations to each SRT cue and sends a line-by-line Arabic/Persian transcript.
+- Optionally adds Persian translations to each SRT cue and derives a line-by-line Arabic/Persian transcript from the translated SRT.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
 - Optional Telegram user allowlist to control usage.
@@ -38,8 +38,8 @@ Optional variables:
 
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to `ar`.
-- `OPENAI_REFINE_MODEL`: text model used to add Persian translations to SRT subtitles and transcript lines. Defaults to `gpt-5.4`.
-- `REFINE`: set to `true` to run OpenAI SRT and line-by-line transcript translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
+- `OPENAI_REFINE_MODEL`: text model used to add Persian translations to SRT subtitles. Defaults to `gpt-5.4`.
+- `REFINE`: set to `true` to run OpenAI SRT translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
@@ -82,7 +82,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 ## Subtitle Files
 
-When Deepgram returns timestamps, the bot sends `transcript.srt` after the Arabic transcript. With `REFINE=false`, the SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. With `REFINE=true`, OpenAI receives the rendered SRT and adds a green Persian translation line below each original Arabic cue while preserving cue numbers, timestamps, and Arabic text. The bot then sends a third message or text file with each Arabic transcript line followed by its Persian translation and a blank line before the next pair.
+When Deepgram returns timestamps, the bot sends `transcript.srt` after the Arabic transcript. With `REFINE=false`, the SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. With `REFINE=true`, OpenAI receives only the rendered SRT and adds a green Persian translation line below each original Arabic cue while preserving cue numbers, timestamps, and Arabic text. The bot then derives a third message or text file locally by removing SRT cue numbers, timestamps, blank subtitle structure, and green font markup, leaving each Arabic subtitle line followed by its Persian translation and a blank line before the next pair.
 
 Deepgram provides subtitle timestamps in the default configuration. OpenAI is not used for audio transcription; it is only used for optional SRT translation.
 

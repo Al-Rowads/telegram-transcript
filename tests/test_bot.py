@@ -479,7 +479,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 2/6: extracting MP3 audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
-        "Step 5/6: translating subtitles and transcript...",
+        "Step 5/6: translating subtitles...",
         "Step 6/6: sending transcript...",
         "Transcript ready.",
     ]
