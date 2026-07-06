@@ -18,13 +18,17 @@ from telegram_transcript.transcriber import (
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
+    assemble_srt_chunks,
     build_refinement_input,
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
+    parse_srt_blocks,
     render_line_translated_transcript_from_srt,
     render_srt,
+    split_srt_by_byte_limit,
     validate_translated_srt,
 )
+from telegram_transcript import transcriber as transcriber_module
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
 
 
@@ -257,6 +261,88 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     assert progress_events[5][1]["line_translated_transcript_chars"] == len("first\nاول\n\nsecond\nدوم\n")
 
 
+@pytest.mark.asyncio
+async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    monkeypatch.setattr(transcriber_module, "MAX_SRT_TRANSLATION_CHUNK_BYTES", 75)
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="first second third",
+                subtitle_cues=(
+                    SubtitleCue(0.0, 1.0, "first"),
+                    SubtitleCue(1.0, 2.0, "second"),
+                    SubtitleCue(2.0, 3.0, "third"),
+                ),
+            )
+
+    class FakeRefiner:
+        model = DEFAULT_REFINEMENT_MODEL
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def refine_transcript(self, transcript: str) -> str:
+            self.calls.append(transcript)
+            translated_blocks = []
+            for block in parse_srt_blocks(transcript):
+                translated_blocks.append(
+                    "\n".join(
+                        [
+                            block.index,
+                            block.timestamp,
+                            *block.text_lines,
+                            f'<font color="green">ترجمه {block.index}</font>',
+                        ]
+                    )
+                )
+            return "\n\n".join(translated_blocks) + "\n"
+
+    fake_refiner = FakeRefiner()
+    transcriber = SpeechTranscriber(
+        speech_to_text_provider=FakeSpeechToTextProvider(),
+        refiner=fake_refiner,
+    )
+    progress_events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        progress_events.append((event, dict(data)))
+
+    result = await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress)
+
+    raw_srt = render_srt(
+        (
+            SubtitleCue(0.0, 1.0, "first"),
+            SubtitleCue(1.0, 2.0, "second"),
+            SubtitleCue(2.0, 3.0, "third"),
+        )
+    )
+    assert len(fake_refiner.calls) == 3
+    assert all(len(call.encode("utf-8")) <= 75 for call in fake_refiner.calls)
+    assert assemble_srt_chunks(fake_refiner.calls) == raw_srt
+    assert validate_translated_srt(raw_srt=raw_srt, translated_srt=result.translated_srt or "") == result.translated_srt
+    assert result.line_translated_transcript == (
+        "first\nترجمه 1\n\nsecond\nترجمه 2\n\nthird\nترجمه 3\n"
+    )
+    assert [
+        (data["index"], data["total"])
+        for event, data in progress_events
+        if event == "refining_transcript"
+    ] == [(1, 3), (2, 3), (3, 3)]
+
+
 def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
     class FakeResponses:
         def __init__(self) -> None:
@@ -456,6 +542,49 @@ def test_render_srt_formats_cues() -> None:
         "1\n"
         "00:00:00,001 --> 00:01:01,234\n"
         "hello world\n"
+    )
+
+
+def test_split_srt_by_byte_limit_preserves_complete_blocks() -> None:
+    srt = render_srt(
+        (
+            SubtitleCue(0.0, 1.0, "first"),
+            SubtitleCue(1.0, 2.0, "second"),
+            SubtitleCue(2.0, 3.0, "third"),
+        )
+    )
+
+    chunks = split_srt_by_byte_limit(srt, max_bytes=75)
+
+    assert len(chunks) == 3
+    assert all(len(chunk.encode("utf-8")) <= 75 for chunk in chunks)
+    assert assemble_srt_chunks(chunks) == srt
+    assert [block.index for chunk in chunks for block in parse_srt_blocks(chunk)] == ["1", "2", "3"]
+
+
+def test_split_srt_by_byte_limit_keeps_oversized_single_block_intact() -> None:
+    srt = render_srt((SubtitleCue(0.0, 1.0, "x" * 100),))
+
+    chunks = split_srt_by_byte_limit(srt, max_bytes=40)
+
+    assert chunks == (srt,)
+    assert len(chunks[0].encode("utf-8")) > 40
+    assert assemble_srt_chunks(chunks) == srt
+
+
+def test_assemble_srt_chunks_reassembles_through_parsed_blocks() -> None:
+    first = "1\n00:00:00,000 --> 00:00:01,000\nهاي\n<font color=\"green\">سلام</font>\n"
+    second = "2\n00:00:01,000 --> 00:00:02,000\nشلونك\n<font color=\"green\">چطوری</font>\n"
+
+    assert assemble_srt_chunks((first, second)) == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "هاي\n"
+        '<font color="green">سلام</font>\n\n'
+        "2\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "شلونك\n"
+        '<font color="green">چطوری</font>\n'
     )
 
 

@@ -14,6 +14,7 @@ from telegram_transcript.models import AudioChunk, FileTranscriptionResult, Subt
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar"
 DEFAULT_REFINEMENT_MODEL = "gpt-5.4"
+MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
 RAW_TRANSCRIPT_START = "<srt_file>"
 RAW_TRANSCRIPT_END = "</srt_file>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
@@ -232,15 +233,25 @@ class SpeechTranscriber:
             return TranscriptionResult(raw_transcript=transcript, subtitle_cues=tuple(subtitle_cues))
 
         raw_srt = render_srt(subtitle_cues)
-        if progress_callback is not None:
-            await progress_callback(
-                "refining_transcript",
-                {
-                    "raw_chars": len(raw_srt),
-                    "model": self.refiner.model,
-                },
+        raw_srt_chunks = split_srt_by_byte_limit(raw_srt, MAX_SRT_TRANSLATION_CHUNK_BYTES)
+        translated_srt_chunks = []
+        for index, raw_srt_chunk in enumerate(raw_srt_chunks, start=1):
+            if progress_callback is not None:
+                await progress_callback(
+                    "refining_transcript",
+                    {
+                        "index": index,
+                        "total": len(raw_srt_chunks),
+                        "raw_chars": len(raw_srt_chunk),
+                        "raw_bytes": len(raw_srt_chunk.encode("utf-8")),
+                        "model": self.refiner.model,
+                    },
+                )
+            translated_srt_chunk = await asyncio.to_thread(self.refine_transcript, raw_srt_chunk)
+            translated_srt_chunks.append(
+                validate_translated_srt(raw_srt=raw_srt_chunk, translated_srt=translated_srt_chunk)
             )
-        translated_srt = await asyncio.to_thread(self.refine_transcript, raw_srt)
+        translated_srt = assemble_srt_chunks(translated_srt_chunks)
         translated_srt = validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
         line_translated_transcript = render_line_translated_transcript_from_srt(translated_srt)
         if progress_callback is not None:
@@ -406,6 +417,41 @@ def render_srt(cues: Sequence[SubtitleCue]) -> str:
             )
         )
     return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def render_srt_blocks(blocks: Sequence[SrtBlock]) -> str:
+    rendered_blocks = [
+        "\n".join([block.index, block.timestamp, *block.text_lines])
+        for block in blocks
+    ]
+    return "\n\n".join(rendered_blocks) + ("\n" if rendered_blocks else "")
+
+
+def split_srt_by_byte_limit(srt: str, max_bytes: int = MAX_SRT_TRANSLATION_CHUNK_BYTES) -> tuple[str, ...]:
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be greater than zero.")
+
+    chunks: list[str] = []
+    current_blocks: list[SrtBlock] = []
+    for block in parse_srt_blocks(srt):
+        candidate_blocks = [*current_blocks, block]
+        candidate = render_srt_blocks(candidate_blocks)
+        if current_blocks and len(candidate.encode("utf-8")) > max_bytes:
+            chunks.append(render_srt_blocks(current_blocks))
+            current_blocks = [block]
+            continue
+        current_blocks = candidate_blocks
+
+    if current_blocks:
+        chunks.append(render_srt_blocks(current_blocks))
+    return tuple(chunks)
+
+
+def assemble_srt_chunks(chunks: Sequence[str]) -> str:
+    blocks: list[SrtBlock] = []
+    for chunk in chunks:
+        blocks.extend(parse_srt_blocks(chunk))
+    return render_srt_blocks(blocks)
 
 
 def parse_srt_blocks(srt: str) -> tuple[SrtBlock, ...]:

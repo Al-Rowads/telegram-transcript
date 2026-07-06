@@ -314,11 +314,19 @@ async def process_media_message(
                     progress_data.get("raw_chars"),
                 )
             elif event == "refining_transcript":
-                await status.edit_text("Step 5/6: translating subtitles...")
+                index = progress_data.get("index")
+                total = progress_data.get("total")
+                if isinstance(total, int) and total > 1:
+                    await status.edit_text(f"Step 5/6: translating subtitles chunk {index}/{total}...")
+                else:
+                    await status.edit_text("Step 5/6: translating subtitles...")
                 logger.info(
-                    "job %s step 5/6 translating subtitles: srt_chars=%s model=%s",
+                    "job %s step 5/6 translating subtitles chunk %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
+                    index,
+                    total,
                     progress_data.get("raw_chars"),
+                    progress_data.get("raw_bytes"),
                     progress_data.get("model"),
                 )
             elif event == "refinement_complete":

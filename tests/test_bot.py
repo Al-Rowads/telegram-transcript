@@ -489,6 +489,68 @@ async def test_process_video_message_reports_step_by_step_flow(
 
 
 @pytest.mark.asyncio
+async def test_process_video_message_reports_translation_chunk_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = 5
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+            assert progress_callback is not None
+            await progress_callback(
+                "refining_transcript",
+                {"index": 1, "total": 2, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
+            )
+            await progress_callback(
+                "refining_transcript",
+                {"index": 2, "total": 2, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
+            )
+            await progress_callback(
+                "refinement_complete",
+                {"translated_srt_chars": 95, "line_translated_transcript_chars": 17},
+            )
+            return TranscriptionResult(
+                raw_transcript="هاي خام",
+                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
+                translated_srt=(
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,250\n"
+                    "هاي خام\n"
+                    '<font color="green">این خام است</font>\n'
+                ),
+                line_translated_transcript="هاي خام\nاین خام است\n",
+            )
+
+    def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
+    message = FakeMessage()
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(
+        bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
+    )
+
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+
+    assert "Step 5/6: translating subtitles chunk 1/2..." in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitles chunk 2/2..." in message.status_replies[0].edits
+
+
+@pytest.mark.asyncio
 async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
