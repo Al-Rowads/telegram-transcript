@@ -44,6 +44,30 @@ def test_extract_deepgram_transcript_text_from_dict() -> None:
     assert extract_deepgram_transcript_text(response) == "هلا بالعالم"
 
 
+def test_extract_deepgram_transcript_text_prefers_paragraphs() -> None:
+    response = {
+        "results": {
+            "channels": [
+                {
+                    "alternatives": [
+                        {
+                            "transcript": "flat transcript should not be used",
+                            "paragraphs": {
+                                "paragraphs": [
+                                    {"text": "first paragraph"},
+                                    {"text": "second paragraph"},
+                                ]
+                            },
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+
+    assert extract_deepgram_transcript_text(response) == "first paragraph\n\nsecond paragraph"
+
+
 def test_extract_deepgram_transcript_text_rejects_missing_transcript() -> None:
     with pytest.raises(TranscriptionError, match="Deepgram"):
         extract_deepgram_transcript_text({"results": {"channels": []}})

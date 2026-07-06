@@ -15,7 +15,11 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
-from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
+from telegram_transcript.telegram_utils import (
+    format_transcript_for_delivery,
+    should_send_as_text,
+    split_text_for_telegram,
+)
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
 from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
@@ -386,12 +390,13 @@ async def send_transcript(
     filename: str = "transcript.txt",
     caption: str = "Transcript",
 ) -> None:
-    if should_send_as_text(transcript):
-        for chunk in split_text_for_telegram(transcript):
+    formatted_transcript = format_transcript_for_delivery(transcript)
+    if should_send_as_text(formatted_transcript):
+        for chunk in split_text_for_telegram(formatted_transcript):
             await reply_to_source(message, chunk)
         return
 
-    transcript_file = BytesIO(transcript.encode("utf-8"))
+    transcript_file = BytesIO(formatted_transcript.encode("utf-8"))
     transcript_file.name = filename
     transcript_file.seek(0)
     await message.reply_document(

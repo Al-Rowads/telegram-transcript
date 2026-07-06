@@ -1,6 +1,32 @@
 from __future__ import annotations
 
+import textwrap
+
 TELEGRAM_TEXT_LIMIT = 3900
+TRANSCRIPT_WRAP_WIDTH = 100
+
+
+def format_transcript_for_delivery(text: str, width: int = TRANSCRIPT_WRAP_WIDTH) -> str:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    lines: list[str] = []
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+
+        wrapped = textwrap.wrap(
+            line,
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        lines.extend(wrapped or [""])
+
+    return "\n".join(lines).strip()
 
 
 def split_text_for_telegram(text: str, limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:

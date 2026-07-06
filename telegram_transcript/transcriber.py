@@ -255,6 +255,19 @@ def create_deepgram_client(api_key: str) -> Any:
 
 
 def extract_deepgram_transcript_text(response: Any) -> str:
+    paragraphs = get_nested_response_value(
+        response,
+        ("results", "channels", 0, "alternatives", 0, "paragraphs", "paragraphs"),
+    )
+    if isinstance(paragraphs, Sequence) and not isinstance(paragraphs, (str, bytes)):
+        paragraph_texts = [
+            text.strip()
+            for paragraph in paragraphs
+            if isinstance((text := get_response_field(paragraph, "text")), str) and text.strip()
+        ]
+        if paragraph_texts:
+            return "\n\n".join(paragraph_texts)
+
     transcript = get_nested_response_value(
         response,
         ("results", "channels", 0, "alternatives", 0, "transcript"),

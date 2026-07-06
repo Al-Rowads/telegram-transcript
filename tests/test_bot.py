@@ -189,6 +189,25 @@ async def test_send_transcript_sends_long_text_as_document() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_transcript_formats_long_document_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeInputFile:
+        def __init__(self, file: object, *, filename: str) -> None:
+            self.filename = filename
+            self.content = file.getvalue()
+
+    monkeypatch.setattr(bot_module, "InputFile", FakeInputFile)
+    message = FakeMessage()
+
+    await send_transcript(message, "word " * 1000)
+
+    document, _ = message.document_replies[0]
+    assert document.filename == "transcript.txt"
+    body = document.content.decode("utf-8")
+    assert "\n" in body
+    assert all(len(line) <= 100 for line in body.splitlines())
+
+
+@pytest.mark.asyncio
 async def test_handle_non_video_ignores_group_messages() -> None:
     message = FakeMessage(chat_type=ChatType.GROUP)
     update = SimpleNamespace(effective_message=message)

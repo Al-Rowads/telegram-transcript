@@ -1,6 +1,29 @@
 from __future__ import annotations
 
-from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
+from telegram_transcript.telegram_utils import (
+    format_transcript_for_delivery,
+    should_send_as_text,
+    split_text_for_telegram,
+)
+
+
+def test_format_transcript_for_delivery_wraps_long_single_line() -> None:
+    formatted = format_transcript_for_delivery(
+        "one two three four five six seven eight nine ten",
+        width=20,
+    )
+
+    assert formatted == "one two three four\nfive six seven eight\nnine ten"
+
+
+def test_format_transcript_for_delivery_preserves_paragraph_breaks() -> None:
+    formatted = format_transcript_for_delivery(" first paragraph \r\n\r\n second paragraph ", width=80)
+
+    assert formatted == "first paragraph\n\nsecond paragraph"
+
+
+def test_format_transcript_for_delivery_returns_empty_for_blank_text() -> None:
+    assert format_transcript_for_delivery(" \n\t ") == ""
 
 
 def test_split_text_for_telegram_returns_empty_for_blank_text() -> None:
