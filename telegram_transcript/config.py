@@ -7,7 +7,15 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 
 from telegram_transcript.ffmpeg import DEFAULT_AUDIO_TEMPO
-from telegram_transcript.transcriber import DEFAULT_REFINEMENT_MODEL, DEFAULT_TRANSCRIPTION_MODEL
+from telegram_transcript.transcriber import (
+    DEFAULT_DEEPGRAM_LANGUAGE,
+    DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
+    DEFAULT_REFINEMENT_MODEL,
+    DEFAULT_TRANSCRIPTION_MODEL,
+)
+
+DEFAULT_SPEECH_TO_TEXT_PROVIDER = "deepgram"
+SUPPORTED_SPEECH_TO_TEXT_PROVIDERS = {"deepgram", "openai"}
 
 
 class ConfigError(RuntimeError):
@@ -17,13 +25,17 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
-    openai_api_key: str
+    speech_to_text_provider: str = DEFAULT_SPEECH_TO_TEXT_PROVIDER
+    deepgram_api_key: str = ""
+    deepgram_transcribe_model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+    deepgram_language: str = DEFAULT_DEEPGRAM_LANGUAGE
+    openai_api_key: str = ""
     openai_transcribe_model: str = DEFAULT_TRANSCRIPTION_MODEL
     openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
-    refine: bool = True
+    refine: bool = False
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
-    max_openai_audio_mb: float = 24.0
+    max_audio_mb: float = 24.0
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
 
@@ -32,8 +44,16 @@ class Settings:
         return mb_to_bytes(self.max_video_mb)
 
     @property
+    def max_audio_bytes(self) -> int:
+        return mb_to_bytes(self.max_audio_mb)
+
+    @property
+    def max_openai_audio_mb(self) -> float:
+        return self.max_audio_mb
+
+    @property
     def max_openai_audio_bytes(self) -> int:
-        return mb_to_bytes(self.max_openai_audio_mb)
+        return self.max_audio_bytes
 
 
 def load_settings(
@@ -46,29 +66,49 @@ def load_settings(
 
     source = env if env is not None else os.environ
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
-    openai_api_key = require_value(source, "OPENAI_API_KEY")
-    model = source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip() or DEFAULT_TRANSCRIPTION_MODEL
+    provider = parse_speech_to_text_provider(source.get("SPEECH_TO_TEXT_PROVIDER"))
+    refine = parse_bool(source.get("REFINE"), "REFINE", False)
+
+    deepgram_api_key = source.get("DEEPGRAM_API_KEY", "").strip()
+    if provider == "deepgram" and not deepgram_api_key:
+        raise ConfigError("DEEPGRAM_API_KEY is required when SPEECH_TO_TEXT_PROVIDER=deepgram.")
+    deepgram_model = (
+        source.get("DEEPGRAM_TRANSCRIBE_MODEL", DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL).strip()
+        or DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+    )
+    deepgram_language = source.get("DEEPGRAM_LANGUAGE", DEFAULT_DEEPGRAM_LANGUAGE).strip() or DEFAULT_DEEPGRAM_LANGUAGE
+
+    openai_api_key = source.get("OPENAI_API_KEY", "").strip()
+    if (provider == "openai" or refine) and not openai_api_key:
+        raise ConfigError("OPENAI_API_KEY is required when OpenAI transcription or refinement is enabled.")
+    openai_model = (
+        source.get("OPENAI_TRANSCRIBE_MODEL", DEFAULT_TRANSCRIPTION_MODEL).strip()
+        or DEFAULT_TRANSCRIPTION_MODEL
+    )
     refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
-    refine = parse_bool(source.get("REFINE"), "REFINE", True)
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
-    max_openai_audio_mb = parse_positive_float(
-        source.get("MAX_OPENAI_AUDIO_MB"),
-        "MAX_OPENAI_AUDIO_MB",
+    max_audio_mb = parse_positive_float(
+        source.get("MAX_AUDIO_MB", source.get("MAX_OPENAI_AUDIO_MB")),
+        "MAX_AUDIO_MB",
         24.0,
     )
-    if max_openai_audio_mb >= 25:
-        raise ConfigError("MAX_OPENAI_AUDIO_MB must be below OpenAI's 25 MB upload limit.")
+    if max_audio_mb >= 25:
+        raise ConfigError("MAX_AUDIO_MB must be below 25 MB.")
     audio_tempo = parse_audio_tempo(source.get("AUDIO_TEMPO"))
 
     return Settings(
         telegram_bot_token=telegram_bot_token,
+        speech_to_text_provider=provider,
+        deepgram_api_key=deepgram_api_key,
+        deepgram_transcribe_model=deepgram_model,
+        deepgram_language=deepgram_language,
         openai_api_key=openai_api_key,
-        openai_transcribe_model=model,
+        openai_transcribe_model=openai_model,
         openai_refine_model=refine_model,
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,
-        max_openai_audio_mb=max_openai_audio_mb,
+        max_audio_mb=max_audio_mb,
         audio_tempo=audio_tempo,
         max_concurrent_jobs=parse_positive_int(
             source.get("MAX_CONCURRENT_JOBS"),
@@ -82,6 +122,16 @@ def require_value(env: Mapping[str, str], name: str) -> str:
     value = env.get(name, "").strip()
     if not value:
         raise ConfigError(f"{name} is required.")
+    return value
+
+
+def parse_speech_to_text_provider(raw: str | None) -> str:
+    if raw is None or not raw.strip():
+        return DEFAULT_SPEECH_TO_TEXT_PROVIDER
+    value = raw.strip().lower()
+    if value not in SUPPORTED_SPEECH_TO_TEXT_PROVIDERS:
+        providers = ", ".join(sorted(SUPPORTED_SPEECH_TO_TEXT_PROVIDERS))
+        raise ConfigError(f"SPEECH_TO_TEXT_PROVIDER must be one of: {providers}.")
     return value
 
 

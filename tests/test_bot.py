@@ -335,6 +335,11 @@ async def test_process_video_message_reports_step_by_step_flow(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
     class FakeTelegramFile:
         async def download_to_drive(self, *, custom_path: str) -> None:
             Path(custom_path).write_bytes(b"video")

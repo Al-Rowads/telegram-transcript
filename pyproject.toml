@@ -5,10 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "telegram-transcript"
 version = "0.1.0"
-description = "Telegram bot that transcribes uploaded videos with ffmpeg and OpenAI."
+description = "Telegram bot that transcribes uploaded videos with ffmpeg and selectable speech-to-text providers."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "deepgram-sdk>=5.3,<6",
   "openai>=1.84.0,<3",
   "python-dotenv>=1.0.1,<2",
   "python-telegram-bot>=21.6,<23",

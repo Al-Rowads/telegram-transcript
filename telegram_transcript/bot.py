@@ -15,7 +15,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
-from telegram_transcript.transcriber import OpenAITranscriber, TranscriptionError
+from telegram_transcript.transcriber import (
+    DeepgramSpeechToTextProvider,
+    OpenAISpeechToTextProvider,
+    SpeechTranscriber,
+    TranscriptRefiner,
+    TranscriptionError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,12 +31,7 @@ GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
 def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
-    transcriber = OpenAITranscriber(
-        api_key=settings.openai_api_key,
-        model=settings.openai_transcribe_model,
-        refinement_model=settings.openai_refine_model,
-        refine=settings.refine,
-    )
+    transcriber = create_transcriber(settings)
 
     app = Application.builder().token(settings.telegram_bot_token).build()
     app.bot_data["settings"] = settings
@@ -44,6 +45,32 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(MessageHandler(video_message_filter(), handle_video_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_video))
     return app
+
+
+def create_transcriber(settings: Settings) -> SpeechTranscriber:
+    if settings.speech_to_text_provider == "deepgram":
+        speech_to_text_provider = DeepgramSpeechToTextProvider(
+            api_key=settings.deepgram_api_key,
+            model=settings.deepgram_transcribe_model,
+            language=settings.deepgram_language,
+        )
+    elif settings.speech_to_text_provider == "openai":
+        speech_to_text_provider = OpenAISpeechToTextProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_transcribe_model,
+        )
+    else:
+        raise ConfigError(f"Unsupported speech-to-text provider: {settings.speech_to_text_provider}")
+
+    refiner = (
+        TranscriptRefiner(
+            api_key=settings.openai_api_key,
+            model=settings.openai_refine_model,
+        )
+        if settings.refine
+        else None
+    )
+    return SpeechTranscriber(speech_to_text_provider=speech_to_text_provider, refiner=refiner)
 
 
 def video_message_filter() -> filters.BaseFilter:
@@ -100,12 +127,13 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     audio_tempo = get_runtime_audio_tempo(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g transcribe_model=%s refine=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
         job_id,
         get_attachment_suffix(attachment),
         file_size,
         audio_tempo,
-        settings.openai_transcribe_model,
+        settings.speech_to_text_provider,
+        get_transcribe_model_name(settings),
         settings.refine,
         settings.openai_refine_model,
     )
@@ -137,7 +165,7 @@ async def process_video_message(
     job_id: str,
     audio_tempo: float,
 ) -> None:
-    transcriber: OpenAITranscriber = context.bot_data["transcriber"]
+    transcriber: SpeechTranscriber = context.bot_data["transcriber"]
     job_started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
@@ -201,16 +229,16 @@ async def process_video_message(
             "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
             job_id,
             audio_bytes,
-            settings.max_openai_audio_bytes,
+            settings.max_audio_bytes,
         )
-        if audio_bytes <= settings.max_openai_audio_bytes:
+        if audio_bytes <= settings.max_audio_bytes:
             chunks = [audio_path]
         else:
             chunks = await asyncio.to_thread(
                 split_audio_to_chunks,
                 audio_path,
                 work_dir / "chunks",
-                settings.max_openai_audio_bytes,
+                settings.max_audio_bytes,
             )
         chunk_sizes = [chunk.stat().st_size for chunk in chunks]
         logger.info(
@@ -230,11 +258,12 @@ async def process_video_message(
                 total = progress_data.get("total")
                 await status.edit_text(f"Step 4/6: transcribing chunk {index}/{total}...")
                 logger.info(
-                    "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s model=%s",
+                    "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
                     job_id,
                     index,
                     total,
                     progress_data.get("chunk_bytes"),
+                    progress_data.get("provider"),
                     progress_data.get("model"),
                 )
             elif event == "chunk_transcribed":
@@ -333,6 +362,12 @@ def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settin
         return parse_audio_tempo(str(candidate))
     except ConfigError:
         return settings.audio_tempo
+
+
+def get_transcribe_model_name(settings: Settings) -> str:
+    if settings.speech_to_text_provider == "deepgram":
+        return settings.deepgram_transcribe_model
+    return settings.openai_transcribe_model
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:
