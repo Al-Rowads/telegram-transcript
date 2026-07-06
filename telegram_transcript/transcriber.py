@@ -7,6 +7,8 @@ from typing import Any, Protocol
 
 from openai import OpenAI
 
+from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptionResult
+
 DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar"
@@ -14,6 +16,11 @@ DEFAULT_REFINEMENT_MODEL = "gpt-5.4-mini"
 TRANSCRIPTION_CONTEXT_CHARS = 800
 RAW_TRANSCRIPT_START = "<raw_asr_transcript>"
 RAW_TRANSCRIPT_END = "</raw_asr_transcript>"
+OPENAI_JSON_ONLY_TRANSCRIPTION_MODELS = {
+    "gpt-4o-transcribe",
+    "gpt-4o-mini-transcribe",
+    "gpt-4o-transcribe-diarize",
+}
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 IRAQI_ARABIC_TRANSCRIPTION_PROMPT = """النص الصوتي باللهجة العراقية/البغدادية.
@@ -78,13 +85,20 @@ class OpenAISpeechToTextProvider:
         self.client = client if client is not None else OpenAI(api_key=api_key)
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
+
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+        request: dict[str, object] = {
+            "model": self.model,
+            "prompt": self.build_transcription_prompt(previous_transcript),
+        }
+        if supports_openai_segment_timestamps(self.model):
+            request["response_format"] = "verbose_json"
+            request["timestamp_granularities"] = ["segment"]
+
         with audio_path.open("rb") as audio_file:
-            response = self.client.audio.transcriptions.create(
-                model=self.model,
-                file=audio_file,
-                prompt=self.build_transcription_prompt(previous_transcript),
-            )
-        return extract_transcript_text(response)
+            response = self.client.audio.transcriptions.create(file=audio_file, **request)
+        return extract_openai_file_transcription_result(response)
 
     def build_transcription_prompt(self, previous_transcript: str = "") -> str:
         previous_tail = previous_transcript.strip()[-TRANSCRIPTION_CONTEXT_CHARS:]
@@ -112,6 +126,9 @@ class DeepgramSpeechToTextProvider:
         self.client = client if client is not None else create_deepgram_client(api_key)
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
+
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
         del previous_transcript
         with audio_path.open("rb") as audio_file:
             response = self.client.listen.v1.media.transcribe_file(
@@ -121,8 +138,9 @@ class DeepgramSpeechToTextProvider:
                 smart_format=True,
                 punctuate=True,
                 paragraphs=True,
+                utterances=True,
             )
-        return extract_deepgram_transcript_text(response)
+        return extract_deepgram_file_transcription_result(response)
 
 
 class TranscriptRefiner:
@@ -183,6 +201,14 @@ class SpeechTranscriber:
             previous_transcript=previous_transcript,
         )
 
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+        transcribe_file_result = getattr(self.speech_to_text_provider, "transcribe_file_result", None)
+        if callable(transcribe_file_result):
+            return transcribe_file_result(audio_path, previous_transcript=previous_transcript)
+        return FileTranscriptionResult(
+            transcript=self.transcribe_file(audio_path, previous_transcript=previous_transcript)
+        )
+
     def transcribe_chunks(self, chunks: Sequence[Path]) -> str:
         transcript = self.transcribe_chunks_raw(chunks)
         if not transcript.strip() or self.refiner is None:
@@ -206,34 +232,38 @@ class SpeechTranscriber:
 
     async def transcribe_chunks_async(
         self,
-        chunks: Sequence[Path],
+        chunks: Sequence[Path | AudioChunk],
         progress_callback: ProgressCallback | None = None,
-    ) -> str:
+    ) -> TranscriptionResult:
         total = len(chunks)
         transcripts = []
+        subtitle_cues: list[SubtitleCue] = []
         previous_transcript = ""
         for index, chunk in enumerate(chunks, start=1):
+            audio_chunk = normalize_audio_chunk(chunk)
             if progress_callback is not None:
                 await progress_callback(
                     "transcribing_chunk",
                     {
                         "index": index,
                         "total": total,
-                        "chunk_bytes": chunk.stat().st_size,
+                        "chunk_bytes": audio_chunk.path.stat().st_size,
                         "provider": self.provider_name,
                         "model": self.model,
                     },
                 )
-            text = (
+            file_result = (
                 await asyncio.to_thread(
-                    self.transcribe_file,
-                    chunk,
+                    self.transcribe_file_result,
+                    audio_chunk.path,
                     previous_transcript=previous_transcript,
                 )
-            ).strip()
+            )
+            text = file_result.transcript.strip()
             if text:
                 transcripts.append(text)
                 previous_transcript = text
+            subtitle_cues.extend(cue.shifted(audio_chunk.start_seconds) for cue in file_result.subtitle_cues)
             if progress_callback is not None:
                 await progress_callback(
                     "chunk_transcribed",
@@ -246,7 +276,7 @@ class SpeechTranscriber:
 
         transcript = "\n\n".join(transcripts)
         if not transcript.strip() or self.refiner is None:
-            return transcript
+            return TranscriptionResult(raw_transcript=transcript, subtitle_cues=tuple(subtitle_cues))
 
         if progress_callback is not None:
             await progress_callback(
@@ -264,7 +294,11 @@ class SpeechTranscriber:
                     "cleaned_chars": len(refined),
                 },
             )
-        return refined
+        return TranscriptionResult(
+            raw_transcript=transcript,
+            refined_transcript=refined,
+            subtitle_cues=tuple(subtitle_cues),
+        )
 
 
 class OpenAITranscriber(SpeechTranscriber):
@@ -319,6 +353,30 @@ def extract_transcript_text(response: Any) -> str:
     raise TranscriptionError("OpenAI transcription response did not include text.")
 
 
+def extract_openai_file_transcription_result(response: Any) -> FileTranscriptionResult:
+    return FileTranscriptionResult(
+        transcript=extract_transcript_text(response),
+        subtitle_cues=extract_openai_subtitle_cues(response),
+    )
+
+
+def extract_openai_subtitle_cues(response: Any) -> tuple[SubtitleCue, ...]:
+    segments = get_nested_response_value(response, ("segments",))
+    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
+        return ()
+
+    cues = []
+    for segment in segments:
+        cue = build_subtitle_cue(
+            start=get_response_field(segment, "start"),
+            end=get_response_field(segment, "end"),
+            text=get_response_field(segment, "text"),
+        )
+        if cue is not None:
+            cues.append(cue)
+    return tuple(cues)
+
+
 def extract_deepgram_transcript_text(response: Any) -> str:
     transcript = get_nested_response_value(
         response,
@@ -327,6 +385,55 @@ def extract_deepgram_transcript_text(response: Any) -> str:
     if isinstance(transcript, str):
         return transcript
     raise TranscriptionError("Deepgram transcription response did not include transcript.")
+
+
+def extract_deepgram_file_transcription_result(response: Any) -> FileTranscriptionResult:
+    return FileTranscriptionResult(
+        transcript=extract_deepgram_transcript_text(response),
+        subtitle_cues=extract_deepgram_subtitle_cues(response),
+    )
+
+
+def extract_deepgram_subtitle_cues(response: Any) -> tuple[SubtitleCue, ...]:
+    utterance_cues = extract_deepgram_utterance_cues(response)
+    if utterance_cues:
+        return utterance_cues
+    return extract_deepgram_word_cues(response)
+
+
+def extract_deepgram_utterance_cues(response: Any) -> tuple[SubtitleCue, ...]:
+    utterances = get_nested_response_value(response, ("results", "utterances"))
+    if not isinstance(utterances, Sequence) or isinstance(utterances, (str, bytes)):
+        return ()
+
+    cues = []
+    for utterance in utterances:
+        cue = build_subtitle_cue(
+            start=get_response_field(utterance, "start"),
+            end=get_response_field(utterance, "end"),
+            text=get_response_field(utterance, "transcript"),
+        )
+        if cue is not None:
+            cues.append(cue)
+    return tuple(cues)
+
+
+def extract_deepgram_word_cues(response: Any) -> tuple[SubtitleCue, ...]:
+    words = get_nested_response_value(response, ("results", "channels", 0, "alternatives", 0, "words"))
+    if not isinstance(words, Sequence) or isinstance(words, (str, bytes)):
+        return ()
+
+    cues = []
+    for word in words:
+        text = get_response_field(word, "punctuated_word") or get_response_field(word, "word")
+        cue = build_subtitle_cue(
+            start=get_response_field(word, "start"),
+            end=get_response_field(word, "end"),
+            text=text,
+        )
+        if cue is not None:
+            cues.append(cue)
+    return tuple(cues)
 
 
 def get_nested_response_value(response: Any, path: Sequence[str | int]) -> Any:
@@ -348,6 +455,58 @@ def get_nested_response_value(response: Any, path: Sequence[str | int]) -> Any:
         if current is None:
             return None
     return current
+
+
+def get_response_field(response: Any, name: str) -> Any:
+    if isinstance(response, Mapping):
+        return response.get(name)
+    return getattr(response, name, None)
+
+
+def build_subtitle_cue(*, start: Any, end: Any, text: Any) -> SubtitleCue | None:
+    if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+        return None
+    if end <= start:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return SubtitleCue(start_seconds=float(start), end_seconds=float(end), text=text.strip())
+
+
+def supports_openai_segment_timestamps(model: str) -> bool:
+    return model not in OPENAI_JSON_ONLY_TRANSCRIPTION_MODELS
+
+
+def normalize_audio_chunk(chunk: Path | AudioChunk) -> AudioChunk:
+    if isinstance(chunk, AudioChunk):
+        return chunk
+    return AudioChunk(path=chunk)
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    total_milliseconds = max(0, round(seconds * 1000))
+    milliseconds = total_milliseconds % 1000
+    total_seconds = total_milliseconds // 1000
+    seconds_part = total_seconds % 60
+    total_minutes = total_seconds // 60
+    minutes = total_minutes % 60
+    hours = total_minutes // 60
+    return f"{hours:02d}:{minutes:02d}:{seconds_part:02d},{milliseconds:03d}"
+
+
+def render_srt(cues: Sequence[SubtitleCue]) -> str:
+    blocks = []
+    for index, cue in enumerate(cues, start=1):
+        blocks.append(
+            "\n".join(
+                [
+                    str(index),
+                    f"{format_srt_timestamp(cue.start_seconds)} --> {format_srt_timestamp(cue.end_seconds)}",
+                    cue.text,
+                ]
+            )
+        )
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
 def extract_response_text(response: Any) -> str:

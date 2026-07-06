@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from telegram_transcript.models import AudioChunk
+
 
 DEFAULT_AUDIO_BITRATE_KBPS = 64
 DEFAULT_AUDIO_TEMPO = 1.0
@@ -165,6 +167,45 @@ def split_audio_to_chunks(
     executable: str = "ffmpeg",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
 ) -> list[Path]:
+    chunks, _chunk_seconds = split_audio_to_chunks_with_duration(
+        audio_path,
+        chunks_dir,
+        max_audio_bytes,
+        executable=executable,
+        audio_bitrate_kbps=audio_bitrate_kbps,
+    )
+    return chunks
+
+
+def split_audio_to_timed_chunks(
+    audio_path: Path,
+    chunks_dir: Path,
+    max_audio_bytes: int,
+    *,
+    executable: str = "ffmpeg",
+    audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
+) -> list[AudioChunk]:
+    chunks, chunk_seconds = split_audio_to_chunks_with_duration(
+        audio_path,
+        chunks_dir,
+        max_audio_bytes,
+        executable=executable,
+        audio_bitrate_kbps=audio_bitrate_kbps,
+    )
+    return [
+        AudioChunk(path=chunk, start_seconds=index * chunk_seconds)
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def split_audio_to_chunks_with_duration(
+    audio_path: Path,
+    chunks_dir: Path,
+    max_audio_bytes: int,
+    *,
+    executable: str = "ffmpeg",
+    audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
+) -> tuple[list[Path], int]:
     chunks_dir.mkdir(parents=True, exist_ok=True)
     bytes_per_second = audio_bitrate_kbps * 1000 / 8
 
@@ -181,7 +222,7 @@ def split_audio_to_chunks(
         )
         chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
         if chunks and all(chunk.stat().st_size <= max_audio_bytes for chunk in chunks):
-            return chunks
+            return chunks, chunk_seconds
 
     raise FfmpegError("Unable to split audio into chunks below the configured upload limit.")
 

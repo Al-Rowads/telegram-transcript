@@ -13,7 +13,8 @@ from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
-from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_chunks
+from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
+from telegram_transcript.models import AudioChunk, TranscriptionResult
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
@@ -21,6 +22,7 @@ from telegram_transcript.transcriber import (
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
+    render_srt,
 )
 
 logger = logging.getLogger(__name__)
@@ -232,15 +234,15 @@ async def process_video_message(
             settings.max_audio_bytes,
         )
         if audio_bytes <= settings.max_audio_bytes:
-            chunks = [audio_path]
+            chunks = [AudioChunk(path=audio_path)]
         else:
             chunks = await asyncio.to_thread(
-                split_audio_to_chunks,
+                split_audio_to_timed_chunks,
                 audio_path,
                 work_dir / "chunks",
                 settings.max_audio_bytes,
             )
-        chunk_sizes = [chunk.stat().st_size for chunk in chunks]
+        chunk_sizes = [chunk.path.stat().st_size for chunk in chunks]
         logger.info(
             "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
             job_id,
@@ -289,40 +291,88 @@ async def process_video_message(
                     progress_data.get("cleaned_chars"),
                 )
 
-        transcript = await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
+        transcription_result = normalize_transcription_result(
+            await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
+        )
 
-    transcript = transcript.strip() or "No speech was detected."
+    raw_transcript = transcription_result.raw_transcript.strip() or "No speech was detected."
+    refined_transcript = (
+        transcription_result.refined_transcript.strip()
+        if transcription_result.refined_transcript is not None
+        else None
+    )
+    srt = render_srt(transcription_result.subtitle_cues)
     await status.edit_text("Step 6/6: sending transcript...")
     logger.info(
-        "job %s step 6/6 sending transcript: output_chars=%d delivery=%s",
+        "job %s step 6/6 sending transcript: raw_chars=%d refined_chars=%s srt_cues=%d raw_delivery=%s",
         job_id,
-        len(transcript),
-        "text" if should_send_as_text(transcript) else "document",
+        len(raw_transcript),
+        len(refined_transcript) if refined_transcript is not None else None,
+        len(transcription_result.subtitle_cues),
+        "text" if should_send_as_text(raw_transcript) else "document",
     )
-    await send_transcript(message, transcript)
-    await status.edit_text("Transcript ready.")
+    await send_transcript(message, raw_transcript, caption="Transcription")
+    if refined_transcript:
+        await send_transcript(
+            message,
+            refined_transcript,
+            filename="refined_transcript.txt",
+            caption="Refined transcript",
+        )
+    if srt:
+        await send_srt(message, srt)
+        await status.edit_text("Transcript ready.")
+    else:
+        await status.edit_text("Transcript ready. SRT unavailable for this provider/model.")
     logger.info(
-        "job %s completed: duration_ms=%d output_chars=%d",
+        "job %s completed: duration_ms=%d raw_chars=%d refined_chars=%s srt_cues=%d",
         job_id,
         elapsed_ms(job_started),
-        len(transcript),
+        len(raw_transcript),
+        len(refined_transcript) if refined_transcript is not None else None,
+        len(transcription_result.subtitle_cues),
     )
 
 
-async def send_transcript(message: Message, transcript: str) -> None:
+async def send_transcript(
+    message: Message,
+    transcript: str,
+    *,
+    filename: str = "transcript.txt",
+    caption: str = "Transcript",
+) -> None:
     if should_send_as_text(transcript):
         for chunk in split_text_for_telegram(transcript):
             await reply_to_source(message, chunk)
         return
 
     transcript_file = BytesIO(transcript.encode("utf-8"))
-    transcript_file.name = "transcript.txt"
+    transcript_file.name = filename
     transcript_file.seek(0)
     await message.reply_document(
-        document=InputFile(transcript_file, filename="transcript.txt"),
-        caption="Transcript",
+        document=InputFile(transcript_file, filename=filename),
+        caption=caption,
         **source_reply_kwargs(message),
     )
+
+
+async def send_srt(message: Message, srt: str) -> None:
+    srt_file = BytesIO(srt.encode("utf-8"))
+    srt_file.name = "transcript.srt"
+    srt_file.seek(0)
+    await message.reply_document(
+        document=InputFile(srt_file, filename="transcript.srt"),
+        caption="SRT subtitles",
+        **source_reply_kwargs(message),
+    )
+
+
+def normalize_transcription_result(result: object) -> TranscriptionResult:
+    if isinstance(result, TranscriptionResult):
+        return result
+    if isinstance(result, str):
+        return TranscriptionResult(raw_transcript=result)
+    raise TranscriptionError("Transcriber returned an unsupported result.")
 
 
 async def reply_to_source(message: Message, text: str) -> Message:

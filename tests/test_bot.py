@@ -20,6 +20,7 @@ from telegram_transcript.bot import (
     send_transcript,
 )
 from telegram_transcript.config import Settings
+from telegram_transcript.models import TranscriptionResult, SubtitleCue
 
 
 class FakeMessage:
@@ -352,7 +353,7 @@ async def test_process_video_message_reports_step_by_step_flow(
             return FakeTelegramFile()
 
     class FakeTranscriber:
-        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> str:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
             chunk = list(chunks)[0]
             assert progress_callback is not None
             await progress_callback(
@@ -360,7 +361,7 @@ async def test_process_video_message_reports_step_by_step_flow(
                 {
                     "index": 1,
                     "total": 1,
-                    "chunk_bytes": chunk.stat().st_size,
+                    "chunk_bytes": chunk.path.stat().st_size,
                     "model": "gpt-4o-transcribe",
                 },
             )
@@ -373,7 +374,11 @@ async def test_process_video_message_reports_step_by_step_flow(
                 },
             )
             await progress_callback("refinement_complete", {"cleaned_chars": 9})
-            return "هاي مرتبة"
+            return TranscriptionResult(
+                raw_transcript="هاي خام",
+                refined_transcript="هاي مرتبة",
+                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
+            )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
         assert video_path.exists()
@@ -390,7 +395,8 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
 
-    assert message.text_replies == ["Video received. Starting transcription...", "هاي مرتبة"]
+    assert message.text_replies == ["Video received. Starting transcription...", "هاي خام", "هاي مرتبة"]
+    assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     status = message.status_replies[0]
     assert status.edits == [
         "Step 2/6: extracting MP3 audio at 1.4x...",
@@ -403,6 +409,47 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert "job1234 step 1/6" in caplog.text
     assert "job1234 step 6/6" in caplog.text
     assert "هاي مرتبة" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    class FakeTelegramFile:
+        async def download_to_drive(self, *, custom_path: str) -> None:
+            Path(custom_path).write_bytes(b"video")
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = 5
+
+        async def get_file(self) -> FakeTelegramFile:
+            return FakeTelegramFile()
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+            return TranscriptionResult(raw_transcript="raw only")
+
+    def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    message = FakeMessage()
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+
+    assert message.text_replies == ["Video received. Starting transcription...", "raw only"]
+    assert message.document_replies == []
+    assert message.status_replies[0].edits[-1] == "Transcript ready. SRT unavailable for this provider/model."
 
 
 @pytest.mark.asyncio

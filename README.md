@@ -12,7 +12,8 @@ A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`
 - Splits audio into safe upload chunks.
 - Uses Deepgram Nova-3 Arabic for speech-to-text by default.
 - Optionally refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
-- Sends short transcripts as Telegram messages and long transcripts as `transcript.txt`.
+- Sends raw transcripts first, optional refined transcripts second, and `transcript.srt` third when timestamps are available.
+- Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.
 
@@ -78,6 +79,12 @@ Add the bot to a group or supergroup to transcribe videos posted there. The bot 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
+
+## Subtitle Files
+
+When the transcription provider returns timestamps, the bot sends `transcript.srt` after the text replies. The SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. Refined GPT text is sent as a separate second response when `REFINE=true`.
+
+Deepgram can provide subtitle timestamps in the default configuration. OpenAI `gpt-4o-transcribe` currently returns JSON text only, so the bot still sends the transcript but skips the SRT file for that model.
 
 ## Tests
 

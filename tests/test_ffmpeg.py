@@ -54,6 +54,25 @@ def test_split_audio_to_chunks_retries_until_chunks_fit(tmp_path: Path, monkeypa
     assert [chunk.name for chunk in chunks] == ["chunk_000.mp3", "chunk_001.mp3"]
 
 
+def test_split_audio_to_timed_chunks_uses_segment_offsets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    audio_path = tmp_path / "audio.mp3"
+    audio_path.write_bytes(b"x" * 2000)
+    chunks_dir = tmp_path / "chunks"
+
+    def fake_run_command(command: list[str]) -> None:
+        chunks_dir.mkdir(exist_ok=True)
+        (chunks_dir / "chunk_000.mp3").write_bytes(b"x" * 500)
+        (chunks_dir / "chunk_001.mp3").write_bytes(b"x" * 500)
+        assert command[command.index("-segment_time") + 1] == "30"
+
+    monkeypatch.setattr(ffmpeg, "run_command", fake_run_command)
+
+    chunks = ffmpeg.split_audio_to_timed_chunks(audio_path, chunks_dir, max_audio_bytes=1000)
+
+    assert [chunk.path.name for chunk in chunks] == ["chunk_000.mp3", "chunk_001.mp3"]
+    assert [chunk.start_seconds for chunk in chunks] == [0, 30]
+
+
 def test_prepare_audio_chunks_returns_single_audio_when_under_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -23,9 +23,13 @@ from telegram_transcript.transcriber import (
     TranscriptRefiner,
     TranscriptionError,
     build_refinement_input,
+    extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
+    extract_openai_file_transcription_result,
     extract_transcript_text,
+    render_srt,
 )
+from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
 
 
 def test_extract_transcript_text_from_object() -> None:
@@ -77,6 +81,7 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             smart_format: bool,
             punctuate: bool,
             paragraphs: bool,
+            utterances: bool,
         ) -> object:
             self.calls.append(
                 {
@@ -86,6 +91,7 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
                     "smart_format": smart_format,
                     "punctuate": punctuate,
                     "paragraphs": paragraphs,
+                    "utterances": utterances,
                 }
             )
             return {
@@ -115,6 +121,7 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             "smart_format": True,
             "punctuate": True,
             "paragraphs": True,
+            "utterances": True,
         }
     ]
 
@@ -149,6 +156,12 @@ async def test_transcribe_chunks_reports_progress_and_refines(
             )
             return audio_path.stem
 
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript=self.transcribe_file(audio_path, previous_transcript=previous_transcript),
+                subtitle_cues=(SubtitleCue(0.5, 1.0, audio_path.stem),),
+            )
+
     class FakeRefiner:
         model = DEFAULT_REFINEMENT_MODEL
 
@@ -170,7 +183,18 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     async def record_progress(event: str, data: object) -> None:
         progress_events.append((event, dict(data)))
 
-    assert await transcriber.transcribe_chunks_async([first, second], progress_callback=record_progress) == "cleaned transcript"
+    result = await transcriber.transcribe_chunks_async(
+        [AudioChunk(first, 0.0), AudioChunk(second, 10.0)],
+        progress_callback=record_progress,
+    )
+
+    assert result.raw_transcript == "first\n\nsecond"
+    assert result.refined_transcript == "cleaned transcript"
+    assert result.final_transcript == "cleaned transcript"
+    assert result.subtitle_cues == (
+        SubtitleCue(0.5, 1.0, "first"),
+        SubtitleCue(10.5, 11.0, "second"),
+    )
     assert fake_provider.calls == [
         {"file": "first", "previous_transcript": ""},
         {"file": "second", "previous_transcript": "first"},
@@ -215,6 +239,35 @@ def test_openai_provider_uses_iraqi_arabic_prompt_context(tmp_path: Path) -> Non
     assert fake_transcriptions.calls[0]["prompt"] == IRAQI_ARABIC_TRANSCRIPTION_PROMPT
     assert fake_transcriptions.calls[1]["prompt"].startswith(IRAQI_ARABIC_TRANSCRIPTION_PROMPT)
     assert "first" in fake_transcriptions.calls[1]["prompt"]
+
+
+def test_openai_provider_requests_segment_timestamps_for_timestamp_capable_model(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return {
+                "text": "hello world",
+                "segments": [
+                    {"start": 0.1, "end": 1.2, "text": "hello world"},
+                ],
+            }
+
+    fake_transcriptions = FakeTranscriptions()
+    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
+    provider = OpenAISpeechToTextProvider(api_key="key", model="whisper-1", client=fake_client)
+
+    result = provider.transcribe_file_result(audio)
+
+    assert result.transcript == "hello world"
+    assert result.subtitle_cues == (SubtitleCue(0.1, 1.2, "hello world"),)
+    assert fake_transcriptions.calls[0]["response_format"] == "verbose_json"
+    assert fake_transcriptions.calls[0]["timestamp_granularities"] == ["segment"]
 
 
 def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
@@ -331,8 +384,87 @@ async def test_transcribe_chunks_async_skips_refinement_when_disabled(
     async def record_progress(event: str, data: object) -> None:
         progress_events.append(event)
 
-    assert await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress) == "raw transcript"
+    result = await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress)
+
+    assert result.raw_transcript == "raw transcript"
+    assert result.refined_transcript is None
     assert progress_events == ["transcribing_chunk", "chunk_transcribed"]
+
+
+def test_extract_deepgram_file_transcription_result_prefers_utterance_cues() -> None:
+    response = {
+        "results": {
+            "channels": [
+                {
+                    "alternatives": [
+                        {
+                            "transcript": "هلا بالعالم",
+                            "words": [
+                                {"start": 0.1, "end": 0.3, "word": "هلا"},
+                            ],
+                        }
+                    ]
+                }
+            ],
+            "utterances": [
+                {"start": 0.1, "end": 1.4, "transcript": "هلا بالعالم"},
+            ],
+        }
+    }
+
+    result = extract_deepgram_file_transcription_result(response)
+
+    assert result.transcript == "هلا بالعالم"
+    assert result.subtitle_cues == (SubtitleCue(0.1, 1.4, "هلا بالعالم"),)
+
+
+def test_extract_deepgram_file_transcription_result_falls_back_to_word_cues() -> None:
+    response = {
+        "results": {
+            "channels": [
+                {
+                    "alternatives": [
+                        {
+                            "transcript": "هلا بالعالم",
+                            "words": [
+                                {"start": 0.1, "end": 0.3, "punctuated_word": "هلا"},
+                                {"start": 0.4, "end": 0.8, "word": "بالعالم"},
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+    }
+
+    result = extract_deepgram_file_transcription_result(response)
+
+    assert result.subtitle_cues == (
+        SubtitleCue(0.1, 0.3, "هلا"),
+        SubtitleCue(0.4, 0.8, "بالعالم"),
+    )
+
+
+def test_extract_openai_file_transcription_result_uses_segment_cues() -> None:
+    result = extract_openai_file_transcription_result(
+        {
+            "text": "hello world",
+            "segments": [
+                {"start": 0.001, "end": 61.234, "text": "hello world"},
+            ],
+        }
+    )
+
+    assert result.transcript == "hello world"
+    assert result.subtitle_cues == (SubtitleCue(0.001, 61.234, "hello world"),)
+
+
+def test_render_srt_formats_cues() -> None:
+    assert render_srt((SubtitleCue(0.001, 61.234, "hello world"),)) == (
+        "1\n"
+        "00:00:00,001 --> 00:01:01,234\n"
+        "hello world\n"
+    )
 
 
 def test_transcribe_chunks_raises_when_refinement_has_no_text(tmp_path: Path) -> None:
