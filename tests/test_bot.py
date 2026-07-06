@@ -425,7 +425,13 @@ async def test_process_video_message_reports_step_by_step_flow(
                     "model": "gpt-5.4",
                 },
             )
-            await progress_callback("refinement_complete", {"translated_srt_chars": 95})
+            await progress_callback(
+                "refinement_complete",
+                {
+                    "translated_srt_chars": 95,
+                    "line_translated_transcript_chars": 17,
+                },
+            )
             return TranscriptionResult(
                 raw_transcript="هاي خام",
                 subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
@@ -435,6 +441,7 @@ async def test_process_video_message_reports_step_by_step_flow(
                     "هاي خام\n"
                     '<font color="green">این خام است</font>\n'
                 ),
+                line_translated_transcript="هاي خام\nاین خام است\n",
             )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
@@ -460,7 +467,11 @@ async def test_process_video_message_reports_step_by_step_flow(
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
 
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
-    assert message.text_replies == ["Video received. Starting transcription...", "هاي خام"]
+    assert message.text_replies == [
+        "Video received. Starting transcription...",
+        "هاي خام",
+        "هاي خام\nاین خام است",
+    ]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     status = message.status_replies[0]
     assert status.edits == [
@@ -468,7 +479,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 2/6: extracting MP3 audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
-        "Step 5/6: translating subtitles...",
+        "Step 5/6: translating subtitles and transcript...",
         "Step 6/6: sending transcript...",
         "Transcript ready.",
     ]

@@ -11,17 +11,23 @@ from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DeepgramSpeechToTextProvider,
+    LINE_TRANSLATION_REQUEST,
+    LINE_TRANSLATION_SYSTEM_PROMPT,
     RAW_TRANSCRIPT_END,
     RAW_TRANSCRIPT_START,
+    RAW_LINE_TRANSCRIPT_END,
+    RAW_LINE_TRANSCRIPT_START,
     SRT_TRANSLATION_REQUEST,
     SRT_TRANSLATION_SYSTEM_PROMPT,
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
+    build_line_translation_input,
     build_refinement_input,
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
     render_srt,
+    validate_line_translated_transcript,
     validate_translated_srt,
 )
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
@@ -191,6 +197,10 @@ async def test_transcribe_chunks_reports_progress_and_refines(
                 '<font color="green">دوم</font>\n'
             )
 
+        def translate_transcript_lines(self, transcript: str) -> str:
+            self.calls.append({"line_transcript": transcript})
+            return "first\nاول\n\nsecond\nدوم\n"
+
     fake_provider = FakeSpeechToTextProvider()
     fake_refiner = FakeRefiner()
     transcriber = SpeechTranscriber(
@@ -220,6 +230,7 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         "second\n"
         '<font color="green">دوم</font>\n'
     )
+    assert result.line_translated_transcript == "first\nاول\n\nsecond\nدوم\n"
     assert result.subtitle_cues == (
         SubtitleCue(0.5, 1.0, "first"),
         SubtitleCue(10.5, 11.0, "second"),
@@ -238,7 +249,8 @@ async def test_transcribe_chunks_reports_progress_and_refines(
                 "00:00:10,500 --> 00:00:11,000\n"
                 "second\n"
             )
-        }
+        },
+        {"line_transcript": "first\n\nsecond"},
     ]
     assert [event for event, _ in progress_events] == [
         "transcribing_chunk",
@@ -252,6 +264,7 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     assert progress_events[0][1]["provider"] == "deepgram"
     assert progress_events[2][1]["index"] == 2
     assert progress_events[4][1]["model"] == DEFAULT_REFINEMENT_MODEL
+    assert progress_events[5][1]["line_translated_transcript_chars"] == len("first\nاول\n\nsecond\nدوم\n")
 
 
 def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
@@ -285,6 +298,37 @@ def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
     ]
 
 
+def test_transcript_refiner_uses_delimited_line_translation_transcript() -> None:
+    class FakeResponses:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
+            self.calls.append(
+                {
+                    "model": model,
+                    "instructions": instructions,
+                    "input": input,
+                    "temperature": temperature,
+                }
+            )
+            return SimpleNamespace(output_text="هاي\nسلام\n")
+
+    fake_responses = FakeResponses()
+    fake_client = SimpleNamespace(responses=fake_responses)
+    refiner = TranscriptRefiner(api_key="key", client=fake_client)
+
+    assert refiner.translate_transcript_lines("هاي\n") == "هاي\nسلام"
+    assert fake_responses.calls == [
+        {
+            "model": DEFAULT_REFINEMENT_MODEL,
+            "instructions": LINE_TRANSLATION_SYSTEM_PROMPT,
+            "input": build_line_translation_input("هاي\n"),
+            "temperature": 0,
+        }
+    ]
+
+
 def test_refinement_input_uses_delimited_raw_transcript() -> None:
     raw = "1\n00:00:00,000 --> 00:00:01,000\nهاي تجربة\n"
 
@@ -294,6 +338,17 @@ def test_refinement_input_uses_delimited_raw_transcript() -> None:
     assert RAW_TRANSCRIPT_START in refinement_input
     assert RAW_TRANSCRIPT_END in refinement_input
     assert raw in refinement_input
+
+
+def test_line_translation_input_uses_delimited_raw_transcript() -> None:
+    raw = "هاي تجربة\nسطر ثاني\n"
+
+    translation_input = build_line_translation_input(raw)
+
+    assert LINE_TRANSLATION_REQUEST in translation_input
+    assert RAW_LINE_TRANSCRIPT_START in translation_input
+    assert RAW_LINE_TRANSCRIPT_END in translation_input
+    assert raw in translation_input
 
 
 def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path) -> None:
@@ -478,6 +533,48 @@ def test_validate_translated_srt_wraps_plain_persian_line() -> None:
         "هلا بالعالم\n"
         '<font color="green">سلام دنیا</font>\n'
     )
+
+
+def test_validate_line_translated_transcript_accepts_pairs() -> None:
+    raw_transcript = "هلا بالعالم\n\nشلونك؟\n"
+    translated_transcript = "هلا بالعالم\nسلام دنیا\n\nشلونك؟\nحالت چطوره؟\n"
+
+    assert validate_line_translated_transcript(
+        raw_transcript=raw_transcript,
+        translated_transcript=translated_transcript,
+    ) == "هلا بالعالم\nسلام دنیا\n\nشلونك؟\nحالت چطوره؟\n"
+
+
+def test_validate_line_translated_transcript_canonicalizes_missing_blank_lines() -> None:
+    raw_transcript = "هلا بالعالم\nشلونك؟\n"
+    translated_transcript = "هلا بالعالم\nسلام دنیا\nشلونك؟\nحالت چطوره؟\n"
+
+    assert validate_line_translated_transcript(
+        raw_transcript=raw_transcript,
+        translated_transcript=translated_transcript,
+    ) == "هلا بالعالم\nسلام دنیا\n\nشلونك؟\nحالت چطوره؟\n"
+
+
+def test_validate_line_translated_transcript_rejects_changed_arabic_text() -> None:
+    raw_transcript = "هلا بالعالم\n"
+    translated_transcript = "مرحبا بالعالم\nسلام دنیا\n"
+
+    with pytest.raises(TranscriptionError, match="Arabic"):
+        validate_line_translated_transcript(
+            raw_transcript=raw_transcript,
+            translated_transcript=translated_transcript,
+        )
+
+
+def test_validate_line_translated_transcript_rejects_missing_translation_line() -> None:
+    raw_transcript = "هلا بالعالم\n"
+    translated_transcript = "هلا بالعالم\n"
+
+    with pytest.raises(TranscriptionError, match="exactly one Persian line"):
+        validate_line_translated_transcript(
+            raw_transcript=raw_transcript,
+            translated_transcript=translated_transcript,
+        )
 
 
 def test_validate_translated_srt_rejects_changed_timestamp() -> None:

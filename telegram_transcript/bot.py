@@ -314,18 +314,19 @@ async def process_media_message(
                     progress_data.get("raw_chars"),
                 )
             elif event == "refining_transcript":
-                await status.edit_text("Step 5/6: translating subtitles...")
+                await status.edit_text("Step 5/6: translating subtitles and transcript...")
                 logger.info(
-                    "job %s step 5/6 translating subtitles: srt_chars=%s model=%s",
+                    "job %s step 5/6 translating subtitles and transcript: srt_chars=%s model=%s",
                     job_id,
                     progress_data.get("raw_chars"),
                     progress_data.get("model"),
                 )
             elif event == "refinement_complete":
                 logger.info(
-                    "job %s step 5/6 translated SRT: translated_srt_chars=%s",
+                    "job %s step 5/6 translated SRT and transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
                     job_id,
                     progress_data.get("translated_srt_chars"),
+                    progress_data.get("line_translated_transcript_chars"),
                 )
 
         transcription_result = normalize_transcription_result(
@@ -336,28 +337,43 @@ async def process_media_message(
     translated_srt = (
         transcription_result.translated_srt.strip() if transcription_result.translated_srt is not None else None
     )
+    line_translated_transcript = (
+        transcription_result.line_translated_transcript.strip()
+        if transcription_result.line_translated_transcript is not None
+        else None
+    )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
     await status.edit_text("Step 6/6: sending transcript...")
     logger.info(
-        "job %s step 6/6 sending transcript: raw_chars=%d translated_srt_chars=%s srt_cues=%d raw_delivery=%s",
+        "job %s step 6/6 sending transcript: raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d raw_delivery=%s",
         job_id,
         len(raw_transcript),
         len(translated_srt) if translated_srt is not None else None,
+        len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
         "text" if should_send_as_text(raw_transcript) else "document",
     )
     await send_transcript(message, raw_transcript, caption="Transcription")
     if srt:
         await send_srt(message, srt)
+    if line_translated_transcript:
+        await send_transcript(
+            message,
+            line_translated_transcript,
+            filename="translated-transcript.txt",
+            caption="Line-by-line translation",
+        )
+    if srt:
         await status.edit_text("Transcript ready.")
     else:
         await status.edit_text("Transcript ready. SRT unavailable for this provider/model.")
     logger.info(
-        "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s srt_cues=%d",
+        "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
         elapsed_ms(job_started),
         len(raw_transcript),
         len(translated_srt) if translated_srt is not None else None,
+        len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
     )
 

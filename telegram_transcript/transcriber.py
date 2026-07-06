@@ -16,6 +16,8 @@ DEFAULT_DEEPGRAM_LANGUAGE = "ar"
 DEFAULT_REFINEMENT_MODEL = "gpt-5.4"
 RAW_TRANSCRIPT_START = "<srt_file>"
 RAW_TRANSCRIPT_END = "</srt_file>"
+RAW_LINE_TRANSCRIPT_START = "<arabic_transcript>"
+RAW_LINE_TRANSCRIPT_END = "</arabic_transcript>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
@@ -41,6 +43,31 @@ Example output cue:
 SRT_TRANSLATION_REQUEST = (
     "Add Persian translations to this SRT file. Preserve every cue number, timestamp, "
     "blank line, and original Arabic subtitle line exactly. Output only valid SRT."
+)
+
+LINE_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian translator.
+
+You will receive an Arabic transcript. Your job is to add one Persian translation line after each Arabic transcript line.
+
+Rules:
+- Do not change, correct, normalize, or translate the original Arabic line.
+- Ignore empty Arabic transcript lines.
+- Add exactly one Persian translation line after each Arabic line.
+- Add exactly one empty line after each Arabic/Persian pair.
+- Do not add headings, numbering, bullets, timestamps, code fences, or explanations.
+- Keep names, numbers, brands, and technical terms accurate.
+- Output only the final line-by-line Arabic and Persian text.
+
+Example output:
+{{Arabic transcription line}}
+{{Persian translation for that line}}
+
+{{Next Arabic transcription line}}
+{{Persian translation for that line}}"""
+
+LINE_TRANSLATION_REQUEST = (
+    "Translate this Arabic transcript to Persian line by line. Preserve each original Arabic line exactly, "
+    "add one Persian translation on the next line, then add an empty line before the next Arabic line."
 )
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = SRT_TRANSLATION_SYSTEM_PROMPT
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = SRT_TRANSLATION_REQUEST
@@ -122,6 +149,18 @@ class TranscriptRefiner:
         if not refined:
             raise TranscriptionError("OpenAI refinement returned empty text.")
         return refined
+
+    def translate_transcript_lines(self, transcript: str) -> str:
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=LINE_TRANSLATION_SYSTEM_PROMPT,
+            input=build_line_translation_input(transcript),
+            temperature=0,
+        )
+        translated = extract_response_text(response).strip()
+        if not translated:
+            raise TranscriptionError("OpenAI transcript translation returned empty text.")
+        return translated
 
 
 class SpeechTranscriber:
@@ -241,17 +280,27 @@ class SpeechTranscriber:
             )
         translated_srt = await asyncio.to_thread(self.refine_transcript, raw_srt)
         translated_srt = validate_translated_srt(raw_srt=raw_srt, translated_srt=translated_srt)
+        line_translated_transcript = await asyncio.to_thread(
+            self.refiner.translate_transcript_lines,
+            transcript,
+        )
+        line_translated_transcript = validate_line_translated_transcript(
+            raw_transcript=transcript,
+            translated_transcript=line_translated_transcript,
+        )
         if progress_callback is not None:
             await progress_callback(
                 "refinement_complete",
                 {
                     "translated_srt_chars": len(translated_srt),
+                    "line_translated_transcript_chars": len(line_translated_transcript),
                 },
             )
         return TranscriptionResult(
             raw_transcript=transcript,
             subtitle_cues=tuple(subtitle_cues),
             translated_srt=translated_srt,
+            line_translated_transcript=line_translated_transcript,
         )
 
 
@@ -472,6 +521,35 @@ def validate_translated_srt(*, raw_srt: str, translated_srt: str) -> str:
     return "\n\n".join(normalized_blocks) + ("\n" if normalized_blocks else "")
 
 
+def validate_line_translated_transcript(*, raw_transcript: str, translated_transcript: str) -> str:
+    raw_lines = transcript_content_lines(raw_transcript)
+    translated_lines = transcript_content_lines(translated_transcript)
+    if len(translated_lines) != len(raw_lines) * 2:
+        raise TranscriptionError("OpenAI transcript translation must add exactly one Persian line per Arabic line.")
+
+    normalized_blocks = []
+    for index, raw_line in enumerate(raw_lines):
+        translated_index = index * 2
+        original_line = translated_lines[translated_index]
+        if original_line != raw_line:
+            raise TranscriptionError("OpenAI transcript translation changed the original Arabic text.")
+
+        persian_line = translated_lines[translated_index + 1]
+        if not persian_line:
+            raise TranscriptionError("OpenAI transcript translation included an empty Persian translation.")
+        normalized_blocks.append("\n".join([raw_line, persian_line]))
+
+    return "\n\n".join(normalized_blocks) + ("\n" if normalized_blocks else "")
+
+
+def transcript_content_lines(transcript: str) -> tuple[str, ...]:
+    return tuple(
+        line.strip()
+        for line in transcript.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip()
+    )
+
+
 def extract_response_text(response: Any) -> str:
     if isinstance(response, str):
         return response
@@ -489,3 +567,7 @@ def extract_response_text(response: Any) -> str:
 
 def build_refinement_input(transcript: str) -> str:
     return f"{SRT_TRANSLATION_REQUEST}\n\n{RAW_TRANSCRIPT_START}\n{transcript}\n{RAW_TRANSCRIPT_END}"
+
+
+def build_line_translation_input(transcript: str) -> str:
+    return f"{LINE_TRANSLATION_REQUEST}\n\n{RAW_LINE_TRANSCRIPT_START}\n{transcript}\n{RAW_LINE_TRANSCRIPT_END}"
