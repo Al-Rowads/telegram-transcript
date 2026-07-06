@@ -8,7 +8,7 @@ import uuid
 from io import BytesIO
 from pathlib import Path
 
-from telegram import Document, InputFile, Message, Update, Video
+from telegram import Audio, Document, InputFile, Message, Update, Video, Voice
 from telegram.constants import ChatType
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -16,6 +16,7 @@ from telegram_transcript.config import ConfigError, Settings, load_settings, par
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
+from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
 from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
     SpeechTranscriber,
@@ -27,6 +28,18 @@ from telegram_transcript.transcriber import (
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+AUDIO_EXTENSIONS = {".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav"}
+AUDIO_SUFFIX_BY_MIME = {
+    "audio/aac": ".aac",
+    "audio/flac": ".flac",
+    "audio/m4a": ".m4a",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/opus": ".opus",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+}
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 
 
@@ -34,7 +47,13 @@ def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
     transcriber = create_transcriber(settings)
 
-    app = Application.builder().token(settings.telegram_bot_token).build()
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(start_media_downloader)
+        .post_shutdown(stop_media_downloader)
+        .build()
+    )
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
@@ -43,8 +62,8 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
-    app.add_handler(MessageHandler(video_message_filter(), handle_video_upload))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_video))
+    app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_media))
     return app
 
 
@@ -66,9 +85,25 @@ def create_transcriber(settings: Settings) -> SpeechTranscriber:
     return SpeechTranscriber(speech_to_text_provider=speech_to_text_provider, refiner=refiner)
 
 
+async def start_media_downloader(application: Application) -> None:
+    settings: Settings = application.bot_data["settings"]
+    downloader = TelegramMediaDownloader(settings)
+    await downloader.start()
+    application.bot_data["media_downloader"] = downloader
+
+
+async def stop_media_downloader(application: Application) -> None:
+    downloader = application.bot_data.get("media_downloader")
+    if isinstance(downloader, TelegramMediaDownloader):
+        await downloader.close()
+
+
+def media_message_filter() -> filters.BaseFilter:
+    return filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL
+
+
 def video_message_filter() -> filters.BaseFilter:
-    document_video_filter = getattr(filters.Document, "VIDEO", filters.Document.ALL)
-    return filters.VIDEO | document_video_filter
+    return media_message_filter()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -79,8 +114,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     return
 
 
-async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_non_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     return
+
+
+async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_non_media(update, context)
 
 
 async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -96,7 +135,7 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
 
-async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
         return
@@ -109,11 +148,11 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
 
-    attachment = get_video_attachment(message)
+    attachment = get_media_attachment(message)
     if attachment is None:
         return
 
-    file_size = getattr(attachment, "file_size", None)
+    file_size = get_attachment_file_size(attachment)
     if file_size is not None and file_size > settings.max_video_bytes:
         return
 
@@ -122,7 +161,7 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
         job_id,
-        get_attachment_suffix(attachment),
+        get_media_attachment_suffix(attachment),
         file_size,
         audio_tempo,
         "deepgram",
@@ -136,22 +175,26 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     async with semaphore:
         try:
             logger.info("job %s started", job_id)
-            await process_video_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
-        except (FfmpegError, TranscriptionError) as exc:
-            logger.exception("job %s video transcription failed", job_id)
+            await process_media_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
+        except (FfmpegError, TelegramDownloadError, TranscriptionError) as exc:
+            logger.exception("job %s media transcription failed", job_id)
             status = status_ref["message"]
             if status is not None:
                 await status.edit_text(f"Transcription failed: {exc}")
         except Exception:
-            logger.exception("job %s unexpected video transcription failure", job_id)
+            logger.exception("job %s unexpected media transcription failure", job_id)
             status = status_ref["message"]
             if status is not None:
                 await status.edit_text("Transcription failed because of an unexpected error.")
 
 
-async def process_video_message(
+async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await handle_media_upload(update, context)
+
+
+async def process_media_message(
     message: Message,
-    attachment: Video | Document,
+    attachment: Video | Audio | Voice | Document,
     settings: Settings,
     context: ContextTypes.DEFAULT_TYPE,
     status_ref: dict[str, Message | None],
@@ -163,48 +206,52 @@ async def process_video_message(
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
-        video_path = work_dir / f"video{get_attachment_suffix(attachment)}"
+        source_path = work_dir / f"source{get_media_attachment_suffix(attachment)}"
         audio_path = work_dir / "audio.mp3"
 
-        step_started = time.monotonic()
-        logger.info(
-            "job %s step 1/6 downloading video: suffix=%s telegram_file_size=%s",
-            job_id,
-            get_attachment_suffix(attachment),
-            getattr(attachment, "file_size", None),
+        status = await reply_to_source(
+            message,
+            f"{get_media_kind_label(message, attachment)} received. Starting transcription...",
         )
-        telegram_file = await attachment.get_file()
-        await telegram_file.download_to_drive(custom_path=str(video_path))
-        video_bytes = video_path.stat().st_size
+        status_ref["message"] = status
+
+        step_started = time.monotonic()
+        await status.edit_text("Step 1/6: downloading media...")
         logger.info(
-            "job %s step 1/6 downloaded video: video_bytes=%d duration_ms=%d",
+            "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
             job_id,
-            video_bytes,
+            get_media_attachment_suffix(attachment),
+            get_attachment_file_size(attachment),
+        )
+        await download_message_media(context, message, source_path)
+        source_bytes = source_path.stat().st_size
+        logger.info(
+            "job %s step 1/6 downloaded media: source_bytes=%d duration_ms=%d",
+            job_id,
+            source_bytes,
             elapsed_ms(step_started),
         )
-        if video_bytes > settings.max_video_bytes:
+        if source_bytes > settings.max_video_bytes:
             logger.info(
-                "job %s rejected after download: video_bytes=%d max_video_bytes=%d",
+                "job %s rejected after download: source_bytes=%d max_video_bytes=%d",
                 job_id,
-                video_bytes,
+                source_bytes,
                 settings.max_video_bytes,
             )
+            await status.edit_text("Media is larger than the configured upload limit.")
             return
-
-        status = await reply_to_source(message, "Video received. Starting transcription...")
-        status_ref["message"] = status
 
         await status.edit_text(f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...")
         step_started = time.monotonic()
         logger.info(
-            "job %s step 2/6 extracting MP3 audio: video_bytes=%d audio_tempo=%g",
+            "job %s step 2/6 extracting MP3 audio: source_bytes=%d audio_tempo=%g",
             job_id,
-            video_bytes,
+            source_bytes,
             audio_tempo,
         )
         await asyncio.to_thread(
             extract_audio,
-            video_path,
+            source_path,
             audio_path,
             audio_tempo=audio_tempo,
         )
@@ -320,6 +367,18 @@ async def process_video_message(
     )
 
 
+async def process_video_message(
+    message: Message,
+    attachment: Video | Document,
+    settings: Settings,
+    context: ContextTypes.DEFAULT_TYPE,
+    status_ref: dict[str, Message | None],
+    job_id: str,
+    audio_tempo: float,
+) -> None:
+    await process_media_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
+
+
 async def send_transcript(
     message: Message,
     transcript: str,
@@ -410,27 +469,115 @@ def is_authorized(settings: Settings, user_id: int | None) -> bool:
     return user_id in settings.allowed_telegram_user_ids
 
 
+async def download_message_media(context: ContextTypes.DEFAULT_TYPE, message: Message, target_path: Path) -> Path:
+    downloader = context.bot_data.get("media_downloader")
+    download_media = getattr(downloader, "download_message_media", None)
+    if not callable(download_media):
+        raise TelegramDownloadError("Telegram media downloader is not available.")
+
+    chat_id = get_message_chat_id(message)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        raise TelegramDownloadError("Telegram message did not include chat and message identifiers.")
+    return await download_media(chat_id, message_id, target_path)
+
+
+def get_message_chat_id(message: Message) -> int | None:
+    chat_id = getattr(message, "chat_id", None)
+    if isinstance(chat_id, int):
+        return chat_id
+    chat = getattr(message, "chat", None)
+    candidate = getattr(chat, "id", None)
+    return candidate if isinstance(candidate, int) else None
+
+
+def get_media_attachment(message: Message) -> Video | Audio | Voice | Document | None:
+    video = getattr(message, "video", None)
+    if video is not None:
+        return video
+    audio = getattr(message, "audio", None)
+    if audio is not None:
+        return audio
+    voice = getattr(message, "voice", None)
+    if voice is not None:
+        return voice
+    document = getattr(message, "document", None)
+    if document is not None and (is_video_document(document) or is_audio_document(document)):
+        return document
+    return None
+
+
 def get_video_attachment(message: Message) -> Video | Document | None:
-    if message.video is not None:
-        return message.video
-    document = message.document
+    video = getattr(message, "video", None)
+    if video is not None:
+        return video
+    document = getattr(message, "document", None)
     if document is not None and is_video_document(document):
         return document
     return None
 
 
+def is_audio_document(document: Document) -> bool:
+    mime_type = getattr(document, "mime_type", None) or ""
+    if mime_type.startswith("audio/"):
+        return True
+    file_name = getattr(document, "file_name", None) or ""
+    return Path(file_name).suffix.lower() in AUDIO_EXTENSIONS
+
+
 def is_video_document(document: Document) -> bool:
-    mime_type = document.mime_type or ""
+    mime_type = getattr(document, "mime_type", None) or ""
     if mime_type.startswith("video/"):
         return True
-    file_name = document.file_name or ""
+    file_name = getattr(document, "file_name", None) or ""
     return Path(file_name).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def get_media_attachment_suffix(attachment: Video | Audio | Voice | Document) -> str:
+    if is_audio_attachment(attachment):
+        return get_audio_attachment_suffix(attachment)
+    return get_attachment_suffix(attachment)
+
+
+def get_audio_attachment_suffix(attachment: Audio | Voice | Document) -> str:
+    file_name = getattr(attachment, "file_name", None)
+    suffix = Path(file_name).suffix.lower() if file_name else ""
+    if suffix in AUDIO_EXTENSIONS:
+        return suffix
+
+    mime_type = getattr(attachment, "mime_type", None)
+    if isinstance(mime_type, str):
+        return AUDIO_SUFFIX_BY_MIME.get(mime_type, ".ogg")
+    return ".ogg"
 
 
 def get_attachment_suffix(attachment: Video | Document) -> str:
     file_name = getattr(attachment, "file_name", None)
     suffix = Path(file_name).suffix.lower() if file_name else ""
     return suffix if suffix in VIDEO_EXTENSIONS else ".mp4"
+
+
+def is_audio_attachment(attachment: Video | Audio | Voice | Document) -> bool:
+    mime_type = getattr(attachment, "mime_type", "") or ""
+    if isinstance(mime_type, str) and mime_type.startswith("audio/"):
+        return True
+    file_name = getattr(attachment, "file_name", None)
+    if isinstance(file_name, str) and Path(file_name).suffix.lower() in AUDIO_EXTENSIONS:
+        return True
+    return isinstance(attachment, (Audio, Voice))
+
+
+def get_media_kind_label(message: Message, attachment: Video | Audio | Voice | Document) -> str:
+    if getattr(message, "voice", None) is attachment:
+        return "Voice note"
+    if is_audio_attachment(attachment):
+        return "Audio"
+    return "Video"
+
+
+def get_attachment_file_size(attachment: Video | Audio | Voice | Document) -> int | None:
+    file_size = getattr(attachment, "file_size", None)
+    return file_size if isinstance(file_size, int) else None
 
 
 def elapsed_ms(started_at: float) -> int:
@@ -443,7 +590,7 @@ def main() -> None:
         settings = load_settings()
         ensure_ffmpeg_available()
         create_application(settings).run_polling(allowed_updates=Update.ALL_TYPES)
-    except (ConfigError, FfmpegError) as exc:
+    except (ConfigError, FfmpegError, TelegramDownloadError) as exc:
         raise SystemExit(str(exc)) from exc
 
 

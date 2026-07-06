@@ -13,6 +13,8 @@ from telegram_transcript.config import (
 
 BASE_ENV = {
     "TELEGRAM_BOT_TOKEN": "telegram-token",
+    "TELEGRAM_API_ID": "12345",
+    "TELEGRAM_API_HASH": "telegram-api-hash",
     "DEEPGRAM_API_KEY": "deepgram-key",
 }
 
@@ -21,13 +23,15 @@ def test_load_settings_uses_defaults() -> None:
     settings = load_settings(BASE_ENV, load_dotenv_file=False)
 
     assert settings.telegram_bot_token == "telegram-token"
+    assert settings.telegram_api_id == 12345
+    assert settings.telegram_api_hash == "telegram-api-hash"
     assert settings.deepgram_api_key == "deepgram-key"
     assert settings.deepgram_transcribe_model == "nova-3"
     assert settings.deepgram_language == "ar"
     assert settings.openai_api_key == ""
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.refine is False
-    assert settings.max_video_bytes == mb_to_bytes(100)
+    assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
 
@@ -35,8 +39,7 @@ def test_load_settings_uses_defaults() -> None:
 def test_load_settings_parses_optional_values() -> None:
     settings = load_settings(
         {
-            "TELEGRAM_BOT_TOKEN": "telegram-token",
-            "DEEPGRAM_API_KEY": "deepgram-key",
+            **BASE_ENV,
             "OPENAI_API_KEY": "openai-key",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
             "REFINE": "true",
@@ -60,12 +63,52 @@ def test_load_settings_parses_optional_values() -> None:
 
 def test_load_settings_requires_credentials() -> None:
     with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
-        load_settings({"OPENAI_API_KEY": "openai-key"}, load_dotenv_file=False)
+        load_settings(
+            {
+                "TELEGRAM_API_ID": "12345",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
+                "DEEPGRAM_API_KEY": "deepgram-key",
+            },
+            load_dotenv_file=False,
+        )
+
+    with pytest.raises(ConfigError, match="TELEGRAM_API_ID"):
+        load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
+                "DEEPGRAM_API_KEY": "deepgram-key",
+            },
+            load_dotenv_file=False,
+        )
+
+    with pytest.raises(ConfigError, match="TELEGRAM_API_HASH"):
+        load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_ID": "12345",
+                "DEEPGRAM_API_KEY": "deepgram-key",
+            },
+            load_dotenv_file=False,
+        )
+
+
+@pytest.mark.parametrize("api_id", ["nope", "0"])
+def test_load_settings_rejects_invalid_telegram_api_id(api_id: str) -> None:
+    with pytest.raises(ConfigError, match="TELEGRAM_API_ID"):
+        load_settings({**BASE_ENV, "TELEGRAM_API_ID": api_id}, load_dotenv_file=False)
 
 
 def test_deepgram_provider_requires_deepgram_api_key() -> None:
     with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY"):
-        load_settings({"TELEGRAM_BOT_TOKEN": "telegram-token"}, load_dotenv_file=False)
+        load_settings(
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_ID": "12345",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
+            },
+            load_dotenv_file=False,
+        )
 
 
 def test_legacy_provider_setting_does_not_replace_deepgram() -> None:
@@ -73,6 +116,8 @@ def test_legacy_provider_setting_does_not_replace_deepgram() -> None:
         load_settings(
             {
                 "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "TELEGRAM_API_ID": "12345",
+                "TELEGRAM_API_HASH": "telegram-api-hash",
                 "SPEECH_TO_TEXT_PROVIDER": "openai",
                 "OPENAI_API_KEY": "openai-key",
             },
@@ -88,6 +133,11 @@ def test_refinement_requires_openai_api_key() -> None:
 def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:
     with pytest.raises(ConfigError, match="AUDIO_TEMPO"):
         load_settings({**BASE_ENV, "AUDIO_TEMPO": "0.25"}, load_dotenv_file=False)
+
+
+def test_max_video_limit_cannot_exceed_telegram_two_gib_limit() -> None:
+    with pytest.raises(ConfigError, match="2048 MB"):
+        load_settings({**BASE_ENV, "MAX_VIDEO_MB": "2049"}, load_dotenv_file=False)
 
 
 def test_parse_user_ids_rejects_invalid_values() -> None:

@@ -10,12 +10,15 @@ from telegram.constants import ChatType
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
     get_attachment_suffix,
+    get_media_attachment,
     get_video_attachment,
     handle_non_video,
     handle_tempo_command,
     handle_video_upload,
+    is_audio_document,
     is_authorized,
     is_video_document,
+    process_media_message,
     process_video_message,
     send_transcript,
 )
@@ -28,14 +31,20 @@ class FakeMessage:
         self,
         *,
         video: object | None = None,
+        audio: object | None = None,
+        voice: object | None = None,
         document: object | None = None,
         chat_type: str = ChatType.PRIVATE,
+        chat_id: int = 100,
         message_id: int = 42,
         message_thread_id: int | None = None,
     ) -> None:
         self.video = video
+        self.audio = audio
+        self.voice = voice
         self.document = document
-        self.chat = SimpleNamespace(type=chat_type)
+        self.chat = SimpleNamespace(type=chat_type, id=chat_id)
+        self.chat_id = chat_id
         self.message_id = message_id
         self.message_thread_id = message_thread_id
         self.text_replies: list[str] = []
@@ -62,6 +71,17 @@ class FakeStatus:
 
     async def edit_text(self, text: str) -> None:
         self.edits.append(text)
+
+
+class FakeMediaDownloader:
+    def __init__(self, media_bytes: bytes = b"video") -> None:
+        self.media_bytes = media_bytes
+        self.downloads: list[tuple[int, int, Path]] = []
+
+    async def download_message_media(self, chat_id: int, message_id: int, target_path: Path) -> Path:
+        self.downloads.append((chat_id, message_id, target_path))
+        target_path.write_bytes(self.media_bytes)
+        return target_path
 
 
 def test_is_authorized_allows_everyone_without_allowlist() -> None:
@@ -91,6 +111,26 @@ def test_is_video_document_accepts_video_extension() -> None:
     document = SimpleNamespace(mime_type="application/octet-stream", file_name="clip.mov")
 
     assert is_video_document(document)
+
+
+def test_is_audio_document_accepts_audio_mime_type() -> None:
+    document = SimpleNamespace(mime_type="audio/mpeg", file_name="upload.bin")
+
+    assert is_audio_document(document)
+
+
+def test_get_media_attachment_accepts_voice() -> None:
+    voice = SimpleNamespace(file_size=1, mime_type="audio/ogg")
+    message = FakeMessage(voice=voice)
+
+    assert get_media_attachment(message) is voice
+
+
+def test_get_media_attachment_accepts_audio_document() -> None:
+    document = SimpleNamespace(mime_type="application/octet-stream", file_name="clip.mp3")
+    message = FakeMessage(document=document)
+
+    assert get_media_attachment(message) is document
 
 
 def test_get_video_attachment_prefers_video() -> None:
@@ -315,7 +355,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
     )
     processed = False
 
-    async def fake_process_video_message(*args: object) -> None:
+    async def fake_process_media_message(*args: object) -> None:
         nonlocal processed
         processed = True
         assert args[0] is message
@@ -323,7 +363,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
         assert args[6] == 1.4
         context.bot_data["audio_tempo"] = 2.0
 
-    monkeypatch.setattr(bot_module, "process_video_message", fake_process_video_message)
+    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
     await handle_video_upload(update, context)
 
@@ -341,16 +381,9 @@ async def test_process_video_message_reports_step_by_step_flow(
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
 
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"video")
-
     class FakeAttachment:
         file_name = "clip.mp4"
         file_size = 5
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
 
     class FakeTranscriber:
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
@@ -397,14 +430,17 @@ async def test_process_video_message_reports_step_by_step_flow(
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
     settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+    downloader = FakeMediaDownloader()
+    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber(), "media_downloader": downloader})
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.4)
 
+    assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
     assert message.text_replies == ["Video received. Starting transcription...", "هاي خام", "هاي مرتبة"]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     status = message.status_replies[0]
     assert status.edits == [
+        "Step 1/6: downloading media...",
         "Step 2/6: extracting MP3 audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
@@ -426,16 +462,9 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
 
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"video")
-
     class FakeAttachment:
         file_name = "clip.mp4"
         file_size = 5
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
 
     class FakeTranscriber:
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
@@ -453,7 +482,9 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
     settings = Settings(telegram_bot_token="token", openai_api_key="key")
-    context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber()})
+    context = SimpleNamespace(
+        bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
+    )
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
@@ -463,19 +494,48 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
 
 
 @pytest.mark.asyncio
+async def test_process_media_message_accepts_voice_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+            return TranscriptionResult(raw_transcript="voice transcript")
+
+    def fake_extract_audio(source_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        assert source_path.name == "source.ogg"
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
+    voice = SimpleNamespace(file_size=5, mime_type="audio/ogg")
+    message = FakeMessage(voice=voice)
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(
+        bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader(b"voice")}
+    )
+
+    await process_media_message(message, voice, settings, context, status_ref, "job1234", 1.0)
+
+    assert message.text_replies == ["Voice note received. Starting transcription...", "voice transcript"]
+
+
+@pytest.mark.asyncio
 async def test_process_video_message_rejects_downloaded_file_over_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class FakeTelegramFile:
-        async def download_to_drive(self, *, custom_path: str) -> None:
-            Path(custom_path).write_bytes(b"x" * 11)
-
     class FakeAttachment:
         file_name = "clip.mp4"
         file_size = None
-
-        async def get_file(self) -> FakeTelegramFile:
-            return FakeTelegramFile()
 
     def fail_extract_audio(*_: object, **__: object) -> None:
         raise AssertionError("extract_audio should not run for an oversized downloaded video")
@@ -488,9 +548,15 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
         openai_api_key="key",
         max_video_mb=10 / 1024 / 1024,
     )
-    context = SimpleNamespace(bot_data={"transcriber": object()})
+    context = SimpleNamespace(
+        bot_data={"transcriber": object(), "media_downloader": FakeMediaDownloader(b"x" * 11)}
+    )
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
-    assert status_ref["message"] is None
-    assert message.text_replies == []
+    assert status_ref["message"] is not None
+    assert message.text_replies == ["Video received. Starting transcription..."]
+    assert message.status_replies[0].edits == [
+        "Step 1/6: downloading media...",
+        "Media is larger than the configured upload limit.",
+    ]

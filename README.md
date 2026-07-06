@@ -1,14 +1,15 @@
 # Telegram Video Transcription Bot
 
-A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`, sends the audio to Deepgram transcription, and replies with the transcript.
+A Python Telegram bot that receives video or audio media, downloads it with Telethon, extracts speech audio with `ffmpeg`, sends the audio to Deepgram transcription, and replies with the transcript.
 
 ## Features
 
 - Telegram long polling, so no public webhook URL is required.
-- Accepts Telegram video messages and video documents.
+- Accepts Telegram video messages, video documents, audio messages, audio documents, and voice notes.
 - Works in private chats, groups, and supergroups.
-- Ignores text, non-video media, invalid commands, and oversized videos without replying.
-- Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`.
+- Ignores text, unsupported media, invalid commands, and oversized media without replying.
+- Downloads bot media through Telethon, allowing media up to Telegram's 2 GiB file limit.
+- Converts media audio to slowed mono 16 kHz MP3 with `ffmpeg`.
 - Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to Deepgram.
 - Uses Deepgram Nova-3 Arabic for speech-to-text by default.
 - Optionally refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
@@ -28,6 +29,8 @@ cp .env.example .env
 Required variables:
 
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
+- `TELEGRAM_API_ID`: Telegram API ID from https://my.telegram.org for Telethon downloads.
+- `TELEGRAM_API_HASH`: Telegram API hash from https://my.telegram.org for Telethon downloads.
 - `DEEPGRAM_API_KEY`: Deepgram API key for transcription.
 - `OPENAI_API_KEY`: OpenAI API key when `REFINE=true`.
 
@@ -38,7 +41,7 @@ Optional variables:
 - `OPENAI_REFINE_MODEL`: text model used to refine raw speech-to-text output. Defaults to `gpt-5.4-mini`.
 - `REFINE`: set to `true` to run OpenAI refinement after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
-- `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
+- `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
 
