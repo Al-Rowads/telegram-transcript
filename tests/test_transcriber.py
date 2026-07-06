@@ -68,8 +68,26 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def transcribe_file(self, *, request: bytes, model: str, language: str) -> object:
-            self.calls.append({"request": request, "model": model, "language": language})
+        def transcribe_file(
+            self,
+            *,
+            request: bytes,
+            model: str,
+            language: str,
+            smart_format: bool,
+            punctuate: bool,
+            paragraphs: bool,
+        ) -> object:
+            self.calls.append(
+                {
+                    "request": request,
+                    "model": model,
+                    "language": language,
+                    "smart_format": smart_format,
+                    "punctuate": punctuate,
+                    "paragraphs": paragraphs,
+                }
+            )
             return {
                 "results": {
                     "channels": [
@@ -94,6 +112,9 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             "request": b"audio",
             "model": DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
             "language": DEFAULT_DEEPGRAM_LANGUAGE,
+            "smart_format": True,
+            "punctuate": True,
+            "paragraphs": True,
         }
     ]
 

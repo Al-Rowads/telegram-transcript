@@ -118,6 +118,9 @@ class DeepgramSpeechToTextProvider:
                 request=audio_file.read(),
                 model=self.model,
                 language=self.language,
+                smart_format=True,
+                punctuate=True,
+                paragraphs=True,
             )
         return extract_deepgram_transcript_text(response)
 
