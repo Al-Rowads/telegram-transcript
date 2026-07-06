@@ -362,7 +362,7 @@ async def test_process_video_message_reports_step_by_step_flow(
                     "index": 1,
                     "total": 1,
                     "chunk_bytes": chunk.path.stat().st_size,
-                    "model": "gpt-4o-transcribe",
+                    "model": "nova-3",
                 },
             )
             await progress_callback("chunk_transcribed", {"index": 1, "total": 1, "raw_chars": 12})

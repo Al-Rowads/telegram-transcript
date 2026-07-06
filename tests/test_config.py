@@ -27,12 +27,10 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.deepgram_transcribe_model == "nova-3"
     assert settings.deepgram_language == "ar"
     assert settings.openai_api_key == ""
-    assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "gpt-5.4-mini"
     assert settings.refine is False
     assert settings.max_video_bytes == mb_to_bytes(100)
     assert settings.max_audio_bytes == mb_to_bytes(24)
-    assert settings.max_openai_audio_bytes == mb_to_bytes(24)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
 
@@ -41,9 +39,9 @@ def test_load_settings_parses_optional_values() -> None:
     settings = load_settings(
         {
             "TELEGRAM_BOT_TOKEN": "telegram-token",
-            "SPEECH_TO_TEXT_PROVIDER": "openai",
+            "SPEECH_TO_TEXT_PROVIDER": "deepgram",
+            "DEEPGRAM_API_KEY": "deepgram-key",
             "OPENAI_API_KEY": "openai-key",
-            "OPENAI_TRANSCRIBE_MODEL": "gpt-4o-transcribe",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
             "REFINE": "true",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
@@ -55,15 +53,14 @@ def test_load_settings_parses_optional_values() -> None:
         load_dotenv_file=False,
     )
 
-    assert settings.speech_to_text_provider == "openai"
+    assert settings.speech_to_text_provider == "deepgram"
+    assert settings.deepgram_api_key == "deepgram-key"
     assert settings.openai_api_key == "openai-key"
-    assert settings.openai_transcribe_model == "gpt-4o-transcribe"
     assert settings.openai_refine_model == "custom-refine-model"
     assert settings.refine is True
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5
     assert settings.max_audio_mb == 12
-    assert settings.max_openai_audio_mb == 12
     assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
 
@@ -78,10 +75,14 @@ def test_deepgram_provider_requires_deepgram_api_key() -> None:
         load_settings({"TELEGRAM_BOT_TOKEN": "telegram-token"}, load_dotenv_file=False)
 
 
-def test_openai_provider_requires_openai_api_key() -> None:
-    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
+def test_openai_transcription_provider_is_not_supported() -> None:
+    with pytest.raises(ConfigError, match="SPEECH_TO_TEXT_PROVIDER"):
         load_settings(
-            {"TELEGRAM_BOT_TOKEN": "telegram-token", "SPEECH_TO_TEXT_PROVIDER": "openai"},
+            {
+                "TELEGRAM_BOT_TOKEN": "telegram-token",
+                "SPEECH_TO_TEXT_PROVIDER": "openai",
+                "OPENAI_API_KEY": "openai-key",
+            },
             load_dotenv_file=False,
         )
 

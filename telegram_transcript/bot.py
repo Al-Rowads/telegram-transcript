@@ -18,7 +18,6 @@ from telegram_transcript.models import AudioChunk, TranscriptionResult
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
-    OpenAISpeechToTextProvider,
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
@@ -50,19 +49,13 @@ def create_application(settings: Settings | None = None) -> Application:
 
 
 def create_transcriber(settings: Settings) -> SpeechTranscriber:
-    if settings.speech_to_text_provider == "deepgram":
-        speech_to_text_provider = DeepgramSpeechToTextProvider(
-            api_key=settings.deepgram_api_key,
-            model=settings.deepgram_transcribe_model,
-            language=settings.deepgram_language,
-        )
-    elif settings.speech_to_text_provider == "openai":
-        speech_to_text_provider = OpenAISpeechToTextProvider(
-            api_key=settings.openai_api_key,
-            model=settings.openai_transcribe_model,
-        )
-    else:
+    if settings.speech_to_text_provider != "deepgram":
         raise ConfigError(f"Unsupported speech-to-text provider: {settings.speech_to_text_provider}")
+    speech_to_text_provider = DeepgramSpeechToTextProvider(
+        api_key=settings.deepgram_api_key,
+        model=settings.deepgram_transcribe_model,
+        language=settings.deepgram_language,
+    )
 
     refiner = (
         TranscriptRefiner(
@@ -415,9 +408,7 @@ def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settin
 
 
 def get_transcribe_model_name(settings: Settings) -> str:
-    if settings.speech_to_text_provider == "deepgram":
-        return settings.deepgram_transcribe_model
-    return settings.openai_transcribe_model
+    return settings.deepgram_transcribe_model
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:

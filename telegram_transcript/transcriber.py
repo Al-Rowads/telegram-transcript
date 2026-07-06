@@ -9,26 +9,12 @@ from openai import OpenAI
 
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptionResult
 
-DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar"
 DEFAULT_REFINEMENT_MODEL = "gpt-5.4-mini"
-TRANSCRIPTION_CONTEXT_CHARS = 800
 RAW_TRANSCRIPT_START = "<raw_asr_transcript>"
 RAW_TRANSCRIPT_END = "</raw_asr_transcript>"
-OPENAI_JSON_ONLY_TRANSCRIPTION_MODELS = {
-    "gpt-4o-transcribe",
-    "gpt-4o-mini-transcribe",
-    "gpt-4o-transcribe-diarize",
-}
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
-
-IRAQI_ARABIC_TRANSCRIPTION_PROMPT = """النص الصوتي باللهجة العراقية/البغدادية.
-فرّغ الكلام بكتابة عراقية طبيعية وواضحة، بدون ترجمة وبدون فصحى إلا إذا المتحدث يستخدمها.
-حافظ على المعنى، الأسماء، الأرقام، والعبارات الأجنبية المعروفة مثل Alain de Botton.
-استخدم ترقيم بسيط وقسّم الكلام بشكل مفهوم."""
-
-IRAQI_ARABIC_SYSTEM_PROMPT = IRAQI_ARABIC_TRANSCRIPTION_PROMPT
 
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = """You are an expert Arabic transcript editor specializing in accurate Baghdadi Iraqi Arabic.
 
@@ -68,47 +54,6 @@ class SpeechToTextProvider(Protocol):
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
         ...
-
-
-class OpenAISpeechToTextProvider:
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = DEFAULT_TRANSCRIPTION_MODEL,
-        prompt: str = IRAQI_ARABIC_SYSTEM_PROMPT,
-        client: Any | None = None,
-    ) -> None:
-        self.provider_name = "openai"
-        self.model = model
-        self.prompt = prompt
-        self.client = client if client is not None else OpenAI(api_key=api_key)
-
-    def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
-        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
-
-    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        request: dict[str, object] = {
-            "model": self.model,
-            "prompt": self.build_transcription_prompt(previous_transcript),
-        }
-        if supports_openai_segment_timestamps(self.model):
-            request["response_format"] = "verbose_json"
-            request["timestamp_granularities"] = ["segment"]
-
-        with audio_path.open("rb") as audio_file:
-            response = self.client.audio.transcriptions.create(file=audio_file, **request)
-        return extract_openai_file_transcription_result(response)
-
-    def build_transcription_prompt(self, previous_transcript: str = "") -> str:
-        previous_tail = previous_transcript.strip()[-TRANSCRIPTION_CONTEXT_CHARS:]
-        if not previous_tail:
-            return self.prompt
-        return (
-            f"{self.prompt}\n\n"
-            "سياق آخر مقطع سابق للاستمرارية فقط، لا تكرره إلا إذا كان مسموعاً في هذا المقطع:\n"
-            f"{previous_tail}"
-        )
 
 
 class DeepgramSpeechToTextProvider:
@@ -301,80 +246,12 @@ class SpeechTranscriber:
         )
 
 
-class OpenAITranscriber(SpeechTranscriber):
-    def __init__(
-        self,
-        *,
-        api_key: str,
-        model: str = DEFAULT_TRANSCRIPTION_MODEL,
-        prompt: str = IRAQI_ARABIC_SYSTEM_PROMPT,
-        refinement_model: str = DEFAULT_REFINEMENT_MODEL,
-        refinement_system_prompt: str = BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT,
-        refine: bool = True,
-        client: Any | None = None,
-    ) -> None:
-        provider = OpenAISpeechToTextProvider(
-            api_key=api_key,
-            model=model,
-            prompt=prompt,
-            client=client,
-        )
-        refiner = (
-            TranscriptRefiner(
-                api_key=api_key,
-                model=refinement_model,
-                system_prompt=refinement_system_prompt,
-                client=client,
-            )
-            if refine
-            else None
-        )
-        super().__init__(speech_to_text_provider=provider, refiner=refiner)
-
-
 def create_deepgram_client(api_key: str) -> Any:
     try:
         from deepgram import DeepgramClient
     except ImportError as exc:
         raise TranscriptionError("deepgram-sdk is required when SPEECH_TO_TEXT_PROVIDER=deepgram.") from exc
     return DeepgramClient(api_key=api_key)
-
-
-def extract_transcript_text(response: Any) -> str:
-    if isinstance(response, str):
-        return response
-    if isinstance(response, dict) and isinstance(response.get("text"), str):
-        return response["text"]
-
-    text = getattr(response, "text", None)
-    if isinstance(text, str):
-        return text
-
-    raise TranscriptionError("OpenAI transcription response did not include text.")
-
-
-def extract_openai_file_transcription_result(response: Any) -> FileTranscriptionResult:
-    return FileTranscriptionResult(
-        transcript=extract_transcript_text(response),
-        subtitle_cues=extract_openai_subtitle_cues(response),
-    )
-
-
-def extract_openai_subtitle_cues(response: Any) -> tuple[SubtitleCue, ...]:
-    segments = get_nested_response_value(response, ("segments",))
-    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)):
-        return ()
-
-    cues = []
-    for segment in segments:
-        cue = build_subtitle_cue(
-            start=get_response_field(segment, "start"),
-            end=get_response_field(segment, "end"),
-            text=get_response_field(segment, "text"),
-        )
-        if cue is not None:
-            cues.append(cue)
-    return tuple(cues)
 
 
 def extract_deepgram_transcript_text(response: Any) -> str:
@@ -471,10 +348,6 @@ def build_subtitle_cue(*, start: Any, end: Any, text: Any) -> SubtitleCue | None
     if not isinstance(text, str) or not text.strip():
         return None
     return SubtitleCue(start_seconds=float(start), end_seconds=float(end), text=text.strip())
-
-
-def supports_openai_segment_timestamps(model: str) -> bool:
-    return model not in OPENAI_JSON_ONLY_TRANSCRIPTION_MODELS
 
 
 def normalize_audio_chunk(chunk: Path | AudioChunk) -> AudioChunk:

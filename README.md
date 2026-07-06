@@ -1,6 +1,6 @@
 # Telegram Video Transcription Bot
 
-A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`, sends the audio to Deepgram or OpenAI transcription, and replies with the transcript.
+A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`, sends the audio to Deepgram transcription, and replies with the transcript.
 
 ## Features
 
@@ -28,15 +28,14 @@ cp .env.example .env
 Required variables:
 
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
-- `DEEPGRAM_API_KEY`: Deepgram API key when `SPEECH_TO_TEXT_PROVIDER=deepgram`.
-- `OPENAI_API_KEY`: OpenAI API key when `SPEECH_TO_TEXT_PROVIDER=openai` or `REFINE=true`.
+- `DEEPGRAM_API_KEY`: Deepgram API key for transcription.
+- `OPENAI_API_KEY`: OpenAI API key when `REFINE=true`.
 
 Optional variables:
 
-- `SPEECH_TO_TEXT_PROVIDER`: `deepgram` or `openai`. Defaults to `deepgram`.
+- `SPEECH_TO_TEXT_PROVIDER`: only `deepgram` is supported. Defaults to `deepgram`.
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to `ar`.
-- `OPENAI_TRANSCRIBE_MODEL`: defaults to `gpt-4o-transcribe`.
 - `OPENAI_REFINE_MODEL`: text model used to refine raw speech-to-text output. Defaults to `gpt-5.4-mini`.
 - `REFINE`: set to `true` to run OpenAI refinement after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
@@ -84,7 +83,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 When the transcription provider returns timestamps, the bot sends `transcript.srt` after the text replies. The SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. Refined GPT text is sent as a separate second response when `REFINE=true`.
 
-Deepgram can provide subtitle timestamps in the default configuration. OpenAI `gpt-4o-transcribe` currently returns JSON text only, so the bot still sends the transcript but skips the SRT file for that model.
+Deepgram provides subtitle timestamps in the default configuration. OpenAI is not used for audio transcription; it is only used for optional transcript refinement.
 
 ## Tests
 

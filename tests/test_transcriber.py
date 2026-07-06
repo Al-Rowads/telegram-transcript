@@ -12,11 +12,7 @@ from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
-    DEFAULT_TRANSCRIPTION_MODEL,
     DeepgramSpeechToTextProvider,
-    IRAQI_ARABIC_TRANSCRIPTION_PROMPT,
-    OpenAITranscriber,
-    OpenAISpeechToTextProvider,
     RAW_TRANSCRIPT_END,
     RAW_TRANSCRIPT_START,
     SpeechTranscriber,
@@ -25,20 +21,9 @@ from telegram_transcript.transcriber import (
     build_refinement_input,
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
-    extract_openai_file_transcription_result,
-    extract_transcript_text,
     render_srt,
 )
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
-
-
-def test_extract_transcript_text_from_object() -> None:
-    assert extract_transcript_text(SimpleNamespace(text="hello")) == "hello"
-
-
-def test_extract_transcript_text_rejects_missing_text() -> None:
-    with pytest.raises(TranscriptionError):
-        extract_transcript_text(SimpleNamespace())
 
 
 def test_extract_deepgram_transcript_text_from_dict() -> None:
@@ -141,8 +126,8 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     second.write_bytes(b"second")
 
     class FakeSpeechToTextProvider:
-        provider_name = "openai"
-        model = DEFAULT_TRANSCRIPTION_MODEL
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
 
         def __init__(self) -> None:
             self.calls: list[dict[str, str]] = []
@@ -209,65 +194,9 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         "refinement_complete",
     ]
     assert progress_events[0][1]["index"] == 1
-    assert progress_events[0][1]["provider"] == "openai"
+    assert progress_events[0][1]["provider"] == "deepgram"
     assert progress_events[2][1]["index"] == 2
     assert progress_events[4][1]["model"] == DEFAULT_REFINEMENT_MODEL
-
-
-def test_openai_provider_uses_iraqi_arabic_prompt_context(tmp_path: Path) -> None:
-    first = tmp_path / "first.mp3"
-    second = tmp_path / "second.mp3"
-    first.write_bytes(b"first")
-    second.write_bytes(b"second")
-
-    class FakeTranscriptions:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, str]] = []
-
-        def create(self, *, model: str, file: object, prompt: str) -> object:
-            self.calls.append({"model": model, "file": Path(file.name).stem, "prompt": prompt})
-            return SimpleNamespace(text=Path(file.name).stem)
-
-    fake_transcriptions = FakeTranscriptions()
-    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
-    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
-
-    assert provider.transcribe_file(first) == "first"
-    assert provider.transcribe_file(second, previous_transcript="first") == "second"
-    assert [call["file"] for call in fake_transcriptions.calls] == ["first", "second"]
-    assert fake_transcriptions.calls[0]["model"] == DEFAULT_TRANSCRIPTION_MODEL
-    assert fake_transcriptions.calls[0]["prompt"] == IRAQI_ARABIC_TRANSCRIPTION_PROMPT
-    assert fake_transcriptions.calls[1]["prompt"].startswith(IRAQI_ARABIC_TRANSCRIPTION_PROMPT)
-    assert "first" in fake_transcriptions.calls[1]["prompt"]
-
-
-def test_openai_provider_requests_segment_timestamps_for_timestamp_capable_model(tmp_path: Path) -> None:
-    audio = tmp_path / "audio.mp3"
-    audio.write_bytes(b"audio")
-
-    class FakeTranscriptions:
-        def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
-
-        def create(self, **kwargs: object) -> object:
-            self.calls.append(kwargs)
-            return {
-                "text": "hello world",
-                "segments": [
-                    {"start": 0.1, "end": 1.2, "text": "hello world"},
-                ],
-            }
-
-    fake_transcriptions = FakeTranscriptions()
-    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
-    provider = OpenAISpeechToTextProvider(api_key="key", model="whisper-1", client=fake_client)
-
-    result = provider.transcribe_file_result(audio)
-
-    assert result.transcript == "hello world"
-    assert result.subtitle_cues == (SubtitleCue(0.1, 1.2, "hello world"),)
-    assert fake_transcriptions.calls[0]["response_format"] == "verbose_json"
-    assert fake_transcriptions.calls[0]["timestamp_granularities"] == ["segment"]
 
 
 def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
@@ -316,19 +245,23 @@ def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path)
     audio = tmp_path / "empty.mp3"
     audio.write_bytes(b"empty")
 
-    class FakeTranscriptions:
-        def create(self, *, model: str, file: object, prompt: str) -> object:
-            return SimpleNamespace(text=" ")
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
 
-    class FakeResponses:
-        def create(self, **_: object) -> object:
+        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+            return " "
+
+    class FakeRefiner:
+        model = DEFAULT_REFINEMENT_MODEL
+
+        def refine_transcript(self, transcript: str) -> str:
             raise AssertionError("Empty transcripts should not be refined.")
 
-    fake_client = SimpleNamespace(
-        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
-        responses=FakeResponses(),
+    transcriber = SpeechTranscriber(
+        speech_to_text_provider=FakeSpeechToTextProvider(),
+        refiner=FakeRefiner(),
     )
-    transcriber = OpenAITranscriber(api_key="key", client=fake_client)
 
     assert transcriber.transcribe_chunks([audio]) == ""
 
@@ -337,19 +270,14 @@ def test_transcribe_chunks_skips_refinement_when_disabled(tmp_path: Path) -> Non
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeTranscriptions:
-        def create(self, *, model: str, file: object, prompt: str) -> object:
-            return SimpleNamespace(text="raw transcript")
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
 
-    class FakeResponses:
-        def create(self, **_: object) -> object:
-            raise AssertionError("Refinement should not run when REFINE=false.")
+        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+            return "raw transcript"
 
-    fake_client = SimpleNamespace(
-        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
-        responses=FakeResponses(),
-    )
-    transcriber = OpenAITranscriber(api_key="key", client=fake_client, refine=False)
+    transcriber = SpeechTranscriber(speech_to_text_provider=FakeSpeechToTextProvider())
 
     assert transcriber.transcribe_chunks([audio]) == "raw transcript"
 
@@ -366,19 +294,14 @@ async def test_transcribe_chunks_async_skips_refinement_when_disabled(
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeTranscriptions:
-        def create(self, *, model: str, file: object, prompt: str) -> object:
-            return SimpleNamespace(text="raw transcript")
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
 
-    class FakeResponses:
-        def create(self, **_: object) -> object:
-            raise AssertionError("Refinement should not run when REFINE=false.")
+        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+            return "raw transcript"
 
-    fake_client = SimpleNamespace(
-        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
-        responses=FakeResponses(),
-    )
-    transcriber = OpenAITranscriber(api_key="key", client=fake_client, refine=False)
+    transcriber = SpeechTranscriber(speech_to_text_provider=FakeSpeechToTextProvider())
     progress_events: list[str] = []
 
     async def record_progress(event: str, data: object) -> None:
@@ -445,20 +368,6 @@ def test_extract_deepgram_file_transcription_result_falls_back_to_word_cues() ->
     )
 
 
-def test_extract_openai_file_transcription_result_uses_segment_cues() -> None:
-    result = extract_openai_file_transcription_result(
-        {
-            "text": "hello world",
-            "segments": [
-                {"start": 0.001, "end": 61.234, "text": "hello world"},
-            ],
-        }
-    )
-
-    assert result.transcript == "hello world"
-    assert result.subtitle_cues == (SubtitleCue(0.001, 61.234, "hello world"),)
-
-
 def test_render_srt_formats_cues() -> None:
     assert render_srt((SubtitleCue(0.001, 61.234, "hello world"),)) == (
         "1\n"
@@ -471,19 +380,22 @@ def test_transcribe_chunks_raises_when_refinement_has_no_text(tmp_path: Path) ->
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeTranscriptions:
-        def create(self, *, model: str, file: object, prompt: str) -> object:
-            return SimpleNamespace(text="raw transcript")
+    class FakeSpeechToTextProvider:
+        provider_name = "deepgram"
+        model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
+
+        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+            return "raw transcript"
 
     class FakeResponses:
         def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
             return SimpleNamespace()
 
-    fake_client = SimpleNamespace(
-        audio=SimpleNamespace(transcriptions=FakeTranscriptions()),
-        responses=FakeResponses(),
+    fake_client = SimpleNamespace(responses=FakeResponses())
+    transcriber = SpeechTranscriber(
+        speech_to_text_provider=FakeSpeechToTextProvider(),
+        refiner=TranscriptRefiner(api_key="key", client=fake_client),
     )
-    transcriber = OpenAITranscriber(api_key="key", client=fake_client)
 
     with pytest.raises(TranscriptionError, match="refinement response"):
         transcriber.transcribe_chunks([audio])
