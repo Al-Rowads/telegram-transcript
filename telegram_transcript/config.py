@@ -13,9 +13,6 @@ from telegram_transcript.transcriber import (
     DEFAULT_REFINEMENT_MODEL,
 )
 
-DEFAULT_SPEECH_TO_TEXT_PROVIDER = "deepgram"
-SUPPORTED_SPEECH_TO_TEXT_PROVIDERS = {"deepgram"}
-
 
 class ConfigError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
@@ -24,7 +21,6 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
-    speech_to_text_provider: str = DEFAULT_SPEECH_TO_TEXT_PROVIDER
     deepgram_api_key: str = ""
     deepgram_transcribe_model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
     deepgram_language: str = DEFAULT_DEEPGRAM_LANGUAGE
@@ -33,7 +29,6 @@ class Settings:
     refine: bool = False
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = 100.0
-    max_audio_mb: float = 24.0
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
 
@@ -41,9 +36,6 @@ class Settings:
     def max_video_bytes(self) -> int:
         return mb_to_bytes(self.max_video_mb)
 
-    @property
-    def max_audio_bytes(self) -> int:
-        return mb_to_bytes(self.max_audio_mb)
 
 def load_settings(
     env: Mapping[str, str] | None = None,
@@ -55,12 +47,11 @@ def load_settings(
 
     source = env if env is not None else os.environ
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
-    provider = parse_speech_to_text_provider(source.get("SPEECH_TO_TEXT_PROVIDER"))
     refine = parse_bool(source.get("REFINE"), "REFINE", False)
 
     deepgram_api_key = source.get("DEEPGRAM_API_KEY", "").strip()
-    if provider == "deepgram" and not deepgram_api_key:
-        raise ConfigError("DEEPGRAM_API_KEY is required when SPEECH_TO_TEXT_PROVIDER=deepgram.")
+    if not deepgram_api_key:
+        raise ConfigError("DEEPGRAM_API_KEY is required.")
     deepgram_model = (
         source.get("DEEPGRAM_TRANSCRIBE_MODEL", DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL).strip()
         or DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
@@ -72,14 +63,10 @@ def load_settings(
         raise ConfigError("OPENAI_API_KEY is required when REFINE=true.")
     refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", 100.0)
-    max_audio_mb = parse_positive_float(source.get("MAX_AUDIO_MB"), "MAX_AUDIO_MB", 24.0)
-    if max_audio_mb >= 25:
-        raise ConfigError("MAX_AUDIO_MB must be below 25 MB.")
     audio_tempo = parse_audio_tempo(source.get("AUDIO_TEMPO"))
 
     return Settings(
         telegram_bot_token=telegram_bot_token,
-        speech_to_text_provider=provider,
         deepgram_api_key=deepgram_api_key,
         deepgram_transcribe_model=deepgram_model,
         deepgram_language=deepgram_language,
@@ -88,7 +75,6 @@ def load_settings(
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,
-        max_audio_mb=max_audio_mb,
         audio_tempo=audio_tempo,
         max_concurrent_jobs=parse_positive_int(
             source.get("MAX_CONCURRENT_JOBS"),
@@ -102,16 +88,6 @@ def require_value(env: Mapping[str, str], name: str) -> str:
     value = env.get(name, "").strip()
     if not value:
         raise ConfigError(f"{name} is required.")
-    return value
-
-
-def parse_speech_to_text_provider(raw: str | None) -> str:
-    if raw is None or not raw.strip():
-        return DEFAULT_SPEECH_TO_TEXT_PROVIDER
-    value = raw.strip().lower()
-    if value not in SUPPORTED_SPEECH_TO_TEXT_PROVIDERS:
-        providers = ", ".join(sorted(SUPPORTED_SPEECH_TO_TEXT_PROVIDERS))
-        raise ConfigError(f"SPEECH_TO_TEXT_PROVIDER must be one of: {providers}.")
     return value
 
 

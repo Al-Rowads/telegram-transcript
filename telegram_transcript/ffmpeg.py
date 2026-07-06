@@ -10,17 +10,23 @@ from telegram_transcript.models import AudioChunk
 
 DEFAULT_AUDIO_BITRATE_KBPS = 64
 DEFAULT_AUDIO_TEMPO = 1.0
+DEEPGRAM_CHUNK_SECONDS = 1300
 
 
 class FfmpegError(RuntimeError):
     """Raised when ffmpeg is unavailable or fails."""
 
 
-def ensure_ffmpeg_available(executable: str = "ffmpeg") -> None:
+def ensure_ffmpeg_available(executable: str = "ffmpeg", probe_executable: str = "ffprobe") -> None:
     if shutil.which(executable) is None:
         raise FfmpegError(
             "ffmpeg was not found. Install it locally with `brew install ffmpeg` "
             "or run the Docker image, which includes ffmpeg."
+        )
+    if shutil.which(probe_executable) is None:
+        raise FfmpegError(
+            "ffprobe was not found. Install ffmpeg locally with `brew install ffmpeg` "
+            "or run the Docker image, which includes ffprobe."
         )
 
 
@@ -58,7 +64,7 @@ def build_extract_audio_command(
 def build_split_audio_command(
     audio_path: Path,
     output_pattern: Path,
-    chunk_seconds: int,
+    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
     *,
     executable: str = "ffmpeg",
 ) -> list[str]:
@@ -82,11 +88,36 @@ def build_split_audio_command(
     ]
 
 
+def build_probe_audio_duration_command(
+    audio_path: Path,
+    *,
+    executable: str = "ffprobe",
+) -> list[str]:
+    return [
+        executable,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+
+
 def run_command(command: list[str]) -> None:
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or "unknown ffmpeg error"
         raise FfmpegError(detail)
+
+
+def run_capture_command(command: list[str]) -> str:
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown ffprobe error"
+        raise FfmpegError(detail)
+    return completed.stdout.strip()
 
 
 def extract_audio(
@@ -111,15 +142,30 @@ def extract_audio(
     return audio_path
 
 
+def probe_audio_duration_seconds(
+    audio_path: Path,
+    *,
+    executable: str = "ffprobe",
+) -> float:
+    raw_duration = run_capture_command(build_probe_audio_duration_command(audio_path, executable=executable))
+    try:
+        duration = float(raw_duration)
+    except ValueError as exc:
+        raise FfmpegError(f"ffprobe returned an invalid audio duration: {raw_duration!r}") from exc
+    if duration <= 0:
+        raise FfmpegError(f"ffprobe returned a non-positive audio duration: {duration:g}")
+    return duration
+
+
 def prepare_audio_chunks(
     video_path: Path,
     work_dir: Path,
-    max_audio_bytes: int,
     *,
     executable: str = "ffmpeg",
+    probe_executable: str = "ffprobe",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
-) -> list[Path]:
+) -> list[AudioChunk]:
     audio_path = work_dir / "audio.mp3"
     extract_audio(
         video_path,
@@ -128,103 +174,64 @@ def prepare_audio_chunks(
         audio_bitrate_kbps=audio_bitrate_kbps,
         audio_tempo=audio_tempo,
     )
-    if audio_path.stat().st_size <= max_audio_bytes:
-        return [audio_path]
-    return split_audio_to_chunks(
+    return split_audio_to_timed_chunks(
         audio_path,
         work_dir / "chunks",
-        max_audio_bytes,
         executable=executable,
-        audio_bitrate_kbps=audio_bitrate_kbps,
+        probe_executable=probe_executable,
     )
 
 
 async def prepare_audio_chunks_async(
     video_path: Path,
     work_dir: Path,
-    max_audio_bytes: int,
     *,
     executable: str = "ffmpeg",
+    probe_executable: str = "ffprobe",
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
-) -> list[Path]:
+) -> list[AudioChunk]:
     return await asyncio.to_thread(
         prepare_audio_chunks,
         video_path,
         work_dir,
-        max_audio_bytes,
         executable=executable,
+        probe_executable=probe_executable,
         audio_bitrate_kbps=audio_bitrate_kbps,
         audio_tempo=audio_tempo,
     )
 
 
-def split_audio_to_chunks(
-    audio_path: Path,
-    chunks_dir: Path,
-    max_audio_bytes: int,
-    *,
-    executable: str = "ffmpeg",
-    audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
-) -> list[Path]:
-    chunks, _chunk_seconds = split_audio_to_chunks_with_duration(
-        audio_path,
-        chunks_dir,
-        max_audio_bytes,
-        executable=executable,
-        audio_bitrate_kbps=audio_bitrate_kbps,
-    )
-    return chunks
-
-
 def split_audio_to_timed_chunks(
     audio_path: Path,
     chunks_dir: Path,
-    max_audio_bytes: int,
     *,
     executable: str = "ffmpeg",
-    audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
+    probe_executable: str = "ffprobe",
+    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
 ) -> list[AudioChunk]:
-    chunks, chunk_seconds = split_audio_to_chunks_with_duration(
-        audio_path,
-        chunks_dir,
-        max_audio_bytes,
-        executable=executable,
-        audio_bitrate_kbps=audio_bitrate_kbps,
+    duration_seconds = probe_audio_duration_seconds(audio_path, executable=probe_executable)
+    if duration_seconds <= chunk_seconds:
+        return [AudioChunk(path=audio_path)]
+
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    clear_chunk_dir(chunks_dir)
+    run_command(
+        build_split_audio_command(
+            audio_path,
+            chunks_dir / "chunk_%03d.mp3",
+            chunk_seconds,
+            executable=executable,
+        )
     )
+    chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
+    if not chunks:
+        raise FfmpegError(f"Unable to split audio into {chunk_seconds}-second chunks.")
+
     return [
         AudioChunk(path=chunk, start_seconds=index * chunk_seconds)
         for index, chunk in enumerate(chunks)
     ]
-
-
-def split_audio_to_chunks_with_duration(
-    audio_path: Path,
-    chunks_dir: Path,
-    max_audio_bytes: int,
-    *,
-    executable: str = "ffmpeg",
-    audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
-) -> tuple[list[Path], int]:
-    chunks_dir.mkdir(parents=True, exist_ok=True)
-    bytes_per_second = audio_bitrate_kbps * 1000 / 8
-
-    for safety_factor in (0.90, 0.75, 0.60):
-        clear_chunk_dir(chunks_dir)
-        chunk_seconds = max(30, int((max_audio_bytes / bytes_per_second) * safety_factor))
-        run_command(
-            build_split_audio_command(
-                audio_path,
-                chunks_dir / "chunk_%03d.mp3",
-                chunk_seconds,
-                executable=executable,
-            )
-        )
-        chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
-        if chunks and all(chunk.stat().st_size <= max_audio_bytes for chunk in chunks):
-            return chunks, chunk_seconds
-
-    raise FfmpegError("Unable to split audio into chunks below the configured upload limit.")
 
 
 def clear_chunk_dir(chunks_dir: Path) -> None:

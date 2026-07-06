@@ -9,7 +9,7 @@ A Python Telegram bot that receives a video, extracts speech audio with `ffmpeg`
 - Works in private chats, groups, and supergroups.
 - Ignores text, non-video media, invalid commands, and oversized videos without replying.
 - Converts video audio to slowed mono 16 kHz MP3 with `ffmpeg`.
-- Splits audio into safe upload chunks.
+- Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to Deepgram.
 - Uses Deepgram Nova-3 Arabic for speech-to-text by default.
 - Optionally refines raw speech-to-text output into natural Baghdadi Iraqi Arabic before replying.
 - Sends raw transcripts first, optional refined transcripts second, and `transcript.srt` third when timestamps are available.
@@ -33,14 +33,12 @@ Required variables:
 
 Optional variables:
 
-- `SPEECH_TO_TEXT_PROVIDER`: only `deepgram` is supported. Defaults to `deepgram`.
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to `ar`.
 - `OPENAI_REFINE_MODEL`: text model used to refine raw speech-to-text output. Defaults to `gpt-5.4-mini`.
 - `REFINE`: set to `true` to run OpenAI refinement after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram video size accepted by the bot. Defaults to `100`.
-- `MAX_AUDIO_MB`: maximum generated audio chunk size. Defaults to `24`.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
 
@@ -81,7 +79,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 ## Subtitle Files
 
-When the transcription provider returns timestamps, the bot sends `transcript.srt` after the text replies. The SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. Refined GPT text is sent as a separate second response when `REFINE=true`.
+When Deepgram returns timestamps, the bot sends `transcript.srt` after the text replies. The SRT text uses the raw ASR transcript so subtitle timestamps stay aligned to the extracted audio. Refined text is sent as a separate second response when `REFINE=true`.
 
 Deepgram provides subtitle timestamps in the default configuration. OpenAI is not used for audio transcription; it is only used for optional transcript refinement.
 

@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
-from telegram_transcript.models import AudioChunk, TranscriptionResult
+from telegram_transcript.models import TranscriptionResult
 from telegram_transcript.telegram_utils import should_send_as_text, split_text_for_telegram
 from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
@@ -49,8 +49,6 @@ def create_application(settings: Settings | None = None) -> Application:
 
 
 def create_transcriber(settings: Settings) -> SpeechTranscriber:
-    if settings.speech_to_text_provider != "deepgram":
-        raise ConfigError(f"Unsupported speech-to-text provider: {settings.speech_to_text_provider}")
     speech_to_text_provider = DeepgramSpeechToTextProvider(
         api_key=settings.deepgram_api_key,
         model=settings.deepgram_transcribe_model,
@@ -127,7 +125,7 @@ async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         get_attachment_suffix(attachment),
         file_size,
         audio_tempo,
-        settings.speech_to_text_provider,
+        "deepgram",
         get_transcribe_model_name(settings),
         settings.refine,
         settings.openai_refine_model,
@@ -221,20 +219,15 @@ async def process_video_message(
         await status.edit_text("Step 3/6: preparing audio chunks...")
         step_started = time.monotonic()
         logger.info(
-            "job %s step 3/6 preparing chunks: audio_bytes=%d max_chunk_bytes=%d",
+            "job %s step 3/6 preparing 1300-second chunks: audio_bytes=%d",
             job_id,
             audio_bytes,
-            settings.max_audio_bytes,
         )
-        if audio_bytes <= settings.max_audio_bytes:
-            chunks = [AudioChunk(path=audio_path)]
-        else:
-            chunks = await asyncio.to_thread(
-                split_audio_to_timed_chunks,
-                audio_path,
-                work_dir / "chunks",
-                settings.max_audio_bytes,
-            )
+        chunks = await asyncio.to_thread(
+            split_audio_to_timed_chunks,
+            audio_path,
+            work_dir / "chunks",
+        )
         chunk_sizes = [chunk.path.stat().st_size for chunk in chunks]
         logger.info(
             "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",

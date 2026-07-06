@@ -20,7 +20,7 @@ from telegram_transcript.bot import (
     send_transcript,
 )
 from telegram_transcript.config import Settings
-from telegram_transcript.models import TranscriptionResult, SubtitleCue
+from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
 
 
 class FakeMessage:
@@ -386,7 +386,13 @@ async def test_process_video_message_reports_step_by_step_flow(
         audio_path.write_bytes(b"audio")
         return audio_path
 
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        assert audio_path.name == "audio.mp3"
+        assert chunks_dir.name == "chunks"
+        return [AudioChunk(path=audio_path)]
+
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     caplog.set_level("INFO", logger="telegram_transcript.bot")
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
@@ -439,7 +445,11 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
         audio_path.write_bytes(b"audio")
         return audio_path
 
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
     settings = Settings(telegram_bot_token="token", openai_api_key="key")

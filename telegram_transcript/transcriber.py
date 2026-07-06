@@ -250,7 +250,7 @@ def create_deepgram_client(api_key: str) -> Any:
     try:
         from deepgram import DeepgramClient
     except ImportError as exc:
-        raise TranscriptionError("deepgram-sdk is required when SPEECH_TO_TEXT_PROVIDER=deepgram.") from exc
+        raise TranscriptionError("deepgram-sdk is required for transcription.") from exc
     return DeepgramClient(api_key=api_key)
 
 
