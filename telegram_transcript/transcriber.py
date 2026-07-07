@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -17,32 +18,43 @@ DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe-diarize"
 DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "gemini-3.5-flash"
 DEFAULT_REFINEMENT_MODEL = "gpt-5.4"
 MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
-RAW_TRANSCRIPT_START = "<srt_file>"
-RAW_TRANSCRIPT_END = "</srt_file>"
+CUE_TRANSLATION_START = "<srt_cue>"
+CUE_TRANSLATION_END = "</srt_cue>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
 
-You will receive a complete SRT subtitle file. Your job is to add Persian translations to the subtitle cues while keeping the output useful as subtitles.
+You will receive one numbered SRT subtitle cue. Translate only the spoken subtitle text into Persian.
 
 Rules:
-- Keep cue numbers, timestamps, blank lines, and original Arabic subtitle text when practical.
-- Add Persian translation text after the related Arabic subtitle text.
-- Use as many Persian lines as needed for a natural translation.
-- Wrap Persian translation lines in this tag format when practical: <font color="green">Persian translation</font>.
+- Return exactly one JSON object with a single "translation" string.
+- The translation string must be one Persian line with no newline characters.
+- Do not return cue numbers, timestamps, source text, XML, HTML, Markdown, notes, or extra keys.
 - Keep names, numbers, brands, and technical terms accurate.
-- Output only the translated subtitle text.
-
-Example output cue:
-1103
-01:07:29,610 --> 01:07:30,810
-{{Arabic text}}
-<font color="green">{{Persian translation for that cue}}</font>"""
+- Preserve meaning naturally in Persian."""
 
 SRT_TRANSLATION_REQUEST = (
-    "Add Persian translations to this SRT file. Keep cue numbers, timestamps, "
-    "blank lines, and original Arabic subtitle lines when practical. Output only the translated subtitle text."
+    "Translate the subtitle text in this single SRT cue into exactly one Persian line. "
+    'Return only JSON matching {"translation": "..."}.'
 )
+SRT_CUE_TRANSLATION_TEXT_FORMAT: dict[str, object] = {
+    "format": {
+        "type": "json_schema",
+        "name": "srt_cue_translation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "translation": {
+                    "type": "string",
+                    "minLength": 1,
+                },
+            },
+            "required": ["translation"],
+            "additionalProperties": False,
+        },
+    }
+}
 
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = SRT_TRANSLATION_SYSTEM_PROMPT
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = SRT_TRANSLATION_REQUEST
@@ -188,13 +200,28 @@ class TranscriptRefiner:
         self.client = client if client is not None else OpenAI(api_key=api_key)
 
     def refine_transcript(self, transcript: str) -> str:
+        blocks = parse_srt_blocks(transcript)
+        if len(blocks) != 1:
+            raise TranscriptionError("OpenAI cue translation requires exactly one SRT cue.")
         response = self.client.responses.create(
             model=self.model,
             instructions=self.system_prompt,
-            input=build_refinement_input(transcript),
+            input=build_refinement_input(render_srt_blocks(blocks)),
             temperature=0,
+            text=SRT_CUE_TRANSLATION_TEXT_FORMAT,
         )
-        return extract_response_text(response).strip()
+        translation = parse_srt_cue_translation_response(extract_response_text(response))
+        return render_translated_srt_block(blocks[0], translation)
+
+    def translate_srt_block(self, block: SrtBlock) -> str:
+        response = self.client.responses.create(
+            model=self.model,
+            instructions=self.system_prompt,
+            input=build_refinement_input(render_srt_blocks((block,))),
+            temperature=0,
+            text=SRT_CUE_TRANSLATION_TEXT_FORMAT,
+        )
+        return parse_srt_cue_translation_response(extract_response_text(response))
 
 
 class SpeechTranscriber:
@@ -303,24 +330,23 @@ class SpeechTranscriber:
         if not transcript.strip() or self.refiner is None or not subtitle_cues:
             return TranscriptionResult(raw_transcript=transcript, subtitle_cues=tuple(subtitle_cues))
 
-        raw_srt = render_srt(subtitle_cues)
-        raw_srt_chunks = split_srt_by_byte_limit(raw_srt, MAX_SRT_TRANSLATION_CHUNK_BYTES)
-        translated_srt_chunks = []
-        for index, raw_srt_chunk in enumerate(raw_srt_chunks, start=1):
+        raw_srt_blocks = parse_srt_blocks(render_srt(subtitle_cues))
+        translated_blocks = []
+        for index, raw_srt_block in enumerate(raw_srt_blocks, start=1):
             if progress_callback is not None:
                 await progress_callback(
                     "refining_transcript",
                     {
                         "index": index,
-                        "total": len(raw_srt_chunks),
-                        "raw_chars": len(raw_srt_chunk),
-                        "raw_bytes": len(raw_srt_chunk.encode("utf-8")),
+                        "total": len(raw_srt_blocks),
+                        "raw_chars": len(render_srt_blocks((raw_srt_block,))),
+                        "raw_bytes": len(render_srt_blocks((raw_srt_block,)).encode("utf-8")),
                         "model": self.refiner.model,
                     },
                 )
-            translated_srt_chunk = await asyncio.to_thread(self.refine_transcript, raw_srt_chunk)
-            translated_srt_chunks.append(translated_srt_chunk)
-        translated_srt = join_translated_srt_chunks(translated_srt_chunks)
+            translation = await asyncio.to_thread(self.refiner.translate_srt_block, raw_srt_block)
+            translated_blocks.append(render_translated_srt_block(raw_srt_block, translation))
+        translated_srt = join_translated_srt_chunks(translated_blocks)
         line_translated_transcript = render_line_translated_transcript_from_srt(translated_srt)
         if progress_callback is not None:
             await progress_callback(
@@ -595,6 +621,24 @@ def render_srt_blocks(blocks: Sequence[SrtBlock]) -> str:
     return "\n\n".join(rendered_blocks) + ("\n" if rendered_blocks else "")
 
 
+def render_translated_srt_block(block: SrtBlock, persian_translation: str) -> str:
+    translation = normalize_persian_translation_line(persian_translation)
+    if not translation:
+        raise TranscriptionError("OpenAI cue translation response was empty.")
+    return render_srt_blocks(
+        (
+            SrtBlock(
+                index=block.index,
+                timestamp=block.timestamp,
+                text_lines=(
+                    *block.text_lines,
+                    f'<font color="green">{translation}</font>',
+                ),
+            ),
+        )
+    )
+
+
 def split_srt_by_byte_limit(srt: str, max_bytes: int = MAX_SRT_TRANSLATION_CHUNK_BYTES) -> tuple[str, ...]:
     if max_bytes <= 0:
         raise ValueError("max_bytes must be greater than zero.")
@@ -690,5 +734,27 @@ def extract_response_text(response: Any) -> str:
     raise TranscriptionError("OpenAI refinement response did not include text.")
 
 
+def parse_srt_cue_translation_response(response_text: str) -> str:
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise TranscriptionError("OpenAI cue translation response was not valid JSON.") from exc
+
+    if not isinstance(payload, Mapping):
+        raise TranscriptionError("OpenAI cue translation response was not a JSON object.")
+    translation = payload.get("translation")
+    if not isinstance(translation, str):
+        raise TranscriptionError("OpenAI cue translation response did not include a translation string.")
+
+    normalized = normalize_persian_translation_line(translation)
+    if not normalized:
+        raise TranscriptionError("OpenAI cue translation response was empty.")
+    return normalized
+
+
+def normalize_persian_translation_line(translation: str) -> str:
+    return " ".join(translation.strip().split())
+
+
 def build_refinement_input(transcript: str) -> str:
-    return f"{SRT_TRANSLATION_REQUEST}\n\n{RAW_TRANSCRIPT_START}\n{transcript}\n{RAW_TRANSCRIPT_END}"
+    return f"{SRT_TRANSLATION_REQUEST}\n\n{CUE_TRANSLATION_START}\n{transcript}\n{CUE_TRANSLATION_END}"

@@ -13,7 +13,7 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to the selected provider.
 - Uses Deepgram Nova-3 Arabic for speech-to-text by default.
 - Supports runtime transcription model selection with `/model`: Deepgram Nova-3, OpenAI `gpt-4o-transcribe-diarize`, or Gemini `gemini-3.5-flash`.
-- Optionally adds Persian translations to each SRT cue and derives a line-by-line Arabic/Persian transcript from the translated SRT.
+- Optionally translates each SRT cue to exactly one Persian line and derives a line-by-line Arabic/Persian transcript from the translated SRT.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
 - Optional Telegram user allowlist to control usage.
@@ -88,7 +88,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 When the selected transcription provider returns or can produce timestamps, the bot sends `transcript.srt` after the plain transcript. Deepgram timestamps come from Deepgram utterances or words. OpenAI `gpt-4o-transcribe-diarize` returns diarized JSON rather than direct SRT, so the bot renders those speaker/timestamp segments to SRT locally. Gemini is prompted to return valid SRT directly. The plain transcript message is derived by removing SRT cue numbers, timestamps, and green font markup when present.
 
-With `REFINE=true`, OpenAI receives the rendered SRT and returns Persian-enhanced subtitle text. The bot accepts OpenAI's translation response without validating cue counts, timestamps, Arabic text, or Persian line counts, then derives a third message or text file with best-effort cleanup.
+With `REFINE=true`, each rendered SRT cue is sent to OpenAI separately for Persian translation. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one normalized Persian line per cue, and rejects empty or malformed translation responses.
 
 ## Tests
 

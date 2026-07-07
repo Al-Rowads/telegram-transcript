@@ -421,11 +421,11 @@ async def process_media_message(
                 index = progress_data.get("index")
                 total = progress_data.get("total")
                 if isinstance(total, int) and total > 1:
-                    await status.edit_text(f"Step 5/6: translating subtitles chunk {index}/{total}...")
+                    await status.edit_text(f"Step 5/6: translating subtitle cue {index}/{total}...")
                 else:
                     await status.edit_text("Step 5/6: translating subtitles...")
                 logger.info(
-                    "job %s step 5/6 translating subtitles chunk %s/%s: srt_chars=%s srt_bytes=%s model=%s",
+                    "job %s step 5/6 translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
                     index,
                     total,

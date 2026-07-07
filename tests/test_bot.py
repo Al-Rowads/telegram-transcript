@@ -576,7 +576,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
 
 @pytest.mark.asyncio
-async def test_process_video_message_reports_translation_chunk_progress(
+async def test_process_video_message_reports_translation_cue_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
@@ -633,8 +633,8 @@ async def test_process_video_message_reports_translation_chunk_progress(
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
-    assert "Step 5/6: translating subtitles chunk 1/2..." in message.status_replies[0].edits
-    assert "Step 5/6: translating subtitles chunk 2/2..." in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 1/2..." in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 2/2..." in message.status_replies[0].edits
 
 
 @pytest.mark.asyncio

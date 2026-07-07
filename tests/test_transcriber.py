@@ -15,8 +15,8 @@ from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
     GeminiSpeechToTextProvider,
     OpenAISpeechToTextProvider,
-    RAW_TRANSCRIPT_END,
-    RAW_TRANSCRIPT_START,
+    CUE_TRANSLATION_END,
+    CUE_TRANSLATION_START,
     SRT_TRANSLATION_REQUEST,
     SRT_TRANSLATION_SYSTEM_PROMPT,
     SpeechTranscriber,
@@ -26,12 +26,13 @@ from telegram_transcript.transcriber import (
     build_refinement_input,
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
+    parse_srt_cue_translation_response,
     parse_srt_blocks,
     render_line_translated_transcript_from_srt,
     render_srt,
+    render_translated_srt_block,
     split_srt_by_byte_limit,
 )
-from telegram_transcript import transcriber as transcriber_module
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
 
 
@@ -322,20 +323,11 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         model = DEFAULT_REFINEMENT_MODEL
 
         def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
+            self.calls: list[object] = []
 
-        def refine_transcript(self, transcript: str) -> str:
-            self.calls.append({"transcript": transcript})
-            return (
-                "1\n"
-                "00:00:00,500 --> 00:00:01,000\n"
-                "first\n"
-                '<font color="green">اول</font>\n\n'
-                "2\n"
-                "00:00:10,500 --> 00:00:11,000\n"
-                "second\n"
-                '<font color="green">دوم</font>\n'
-            )
+        def translate_srt_block(self, block: object) -> str:
+            self.calls.append(block)
+            return "اول" if getattr(block, "index") == "1" else "دوم"
 
     fake_provider = FakeSpeechToTextProvider()
     fake_refiner = FakeRefiner()
@@ -375,17 +367,10 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         {"file": "first", "previous_transcript": ""},
         {"file": "second", "previous_transcript": "first"},
     ]
-    assert fake_refiner.calls == [
-        {
-            "transcript": (
-                "1\n"
-                "00:00:00,500 --> 00:00:01,000\n"
-                "first\n\n"
-                "2\n"
-                "00:00:10,500 --> 00:00:11,000\n"
-                "second\n"
-            )
-        }
+    assert [getattr(block, "index") for block in fake_refiner.calls] == ["1", "2"]
+    assert [getattr(block, "timestamp") for block in fake_refiner.calls] == [
+        "00:00:00,500 --> 00:00:01,000",
+        "00:00:10,500 --> 00:00:11,000",
     ]
     assert [event for event, _ in progress_events] == [
         "transcribing_chunk",
@@ -393,17 +378,20 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         "transcribing_chunk",
         "chunk_transcribed",
         "refining_transcript",
+        "refining_transcript",
         "refinement_complete",
     ]
     assert progress_events[0][1]["index"] == 1
     assert progress_events[0][1]["provider"] == "deepgram"
     assert progress_events[2][1]["index"] == 2
     assert progress_events[4][1]["model"] == DEFAULT_REFINEMENT_MODEL
-    assert progress_events[5][1]["line_translated_transcript_chars"] == len("first\nاول\n\nsecond\nدوم\n")
+    assert progress_events[4][1]["index"] == 1
+    assert progress_events[5][1]["index"] == 2
+    assert progress_events[6][1]["line_translated_transcript_chars"] == len("first\nاول\n\nsecond\nدوم\n")
 
 
 @pytest.mark.asyncio
-async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
+async def test_transcribe_chunks_async_translates_each_srt_cue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -411,7 +399,6 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
         return func(*args, **kwargs)
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
-    monkeypatch.setattr(transcriber_module, "MAX_SRT_TRANSLATION_CHUNK_BYTES", 75)
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
@@ -433,23 +420,11 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
         model = DEFAULT_REFINEMENT_MODEL
 
         def __init__(self) -> None:
-            self.calls: list[str] = []
+            self.calls: list[object] = []
 
-        def refine_transcript(self, transcript: str) -> str:
-            self.calls.append(transcript)
-            translated_blocks = []
-            for block in parse_srt_blocks(transcript):
-                translated_blocks.append(
-                    "\n".join(
-                        [
-                            block.index,
-                            block.timestamp,
-                            *block.text_lines,
-                            f'<font color="green">ترجمه {block.index}</font>',
-                        ]
-                    )
-                )
-            return "\n\n".join(translated_blocks) + "\n"
+        def translate_srt_block(self, block: object) -> str:
+            self.calls.append(block)
+            return f"ترجمه {getattr(block, 'index')}"
 
     fake_refiner = FakeRefiner()
     transcriber = SpeechTranscriber(
@@ -463,16 +438,12 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
 
     result = await transcriber.transcribe_chunks_async([audio], progress_callback=record_progress)
 
-    raw_srt = render_srt(
-        (
-            SubtitleCue(0.0, 1.0, "first"),
-            SubtitleCue(1.0, 2.0, "second"),
-            SubtitleCue(2.0, 3.0, "third"),
-        )
-    )
     assert len(fake_refiner.calls) == 3
-    assert all(len(call.encode("utf-8")) <= 75 for call in fake_refiner.calls)
-    assert assemble_srt_chunks(fake_refiner.calls) == raw_srt
+    assert [getattr(block, "text_lines") for block in fake_refiner.calls] == [
+        ("first",),
+        ("second",),
+        ("third",),
+    ]
     assert result.translated_srt == (
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
@@ -498,7 +469,7 @@ async def test_transcribe_chunks_async_refines_large_srt_in_valid_chunks(
 
 
 @pytest.mark.asyncio
-async def test_transcribe_chunks_async_accepts_flexible_openai_translation(
+async def test_transcribe_chunks_async_collapses_multiline_persian_translation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -515,38 +486,17 @@ async def test_transcribe_chunks_async_accepts_flexible_openai_translation(
 
         def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
             return FileTranscriptionResult(
-                transcript="first second third fourth",
+                transcript="first second",
                 subtitle_cues=(
-                    SubtitleCue(0.0, 1.0, "first"),
-                    SubtitleCue(1.0, 2.0, "second"),
-                    SubtitleCue(2.0, 3.0, "third"),
-                    SubtitleCue(3.0, 4.0, "fourth"),
+                    SubtitleCue(0.0, 1.0, "first\nsecond"),
                 ),
             )
 
     class FakeRefiner:
         model = DEFAULT_REFINEMENT_MODEL
 
-        def refine_transcript(self, transcript: str) -> str:
-            return (
-                "1\n"
-                "00:00:00,000 --> 00:00:01,000\n"
-                "first\n\n"
-                "2\n"
-                "00:00:01,000 --> 00:00:02,000\n"
-                "second\n"
-                "ترجمه دوم خط اول\n"
-                "ترجمه دوم خط دوم\n\n"
-                "3\n"
-                "00:00:02,000 --> 00:00:03,000\n"
-                "third changed by model\n"
-                '<font color="green">ترجمه سوم</font>\n\n'
-                "4\n"
-                "00:00:03,000 --> 00:00:04,000\n"
-                "fourth\n"
-                "extra model note\n"
-                '<font color="green">ترجمه چهارم</font>\n'
-            )
+        def translate_srt_block(self, block: object) -> str:
+            return "ترجمه خط اول\nترجمه   خط دوم"
 
     transcriber = SpeechTranscriber(
         speech_to_text_provider=FakeSpeechToTextProvider(),
@@ -558,75 +508,70 @@ async def test_transcribe_chunks_async_accepts_flexible_openai_translation(
     assert result.translated_srt == (
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
-        "first\n\n"
-        "2\n"
-        "00:00:01,000 --> 00:00:02,000\n"
+        "first\n"
         "second\n"
-        "ترجمه دوم خط اول\n"
-        "ترجمه دوم خط دوم\n\n"
-        "3\n"
-        "00:00:02,000 --> 00:00:03,000\n"
-        "third changed by model\n"
-        '<font color="green">ترجمه سوم</font>\n\n'
-        "4\n"
-        "00:00:03,000 --> 00:00:04,000\n"
-        "fourth\n"
-        "extra model note\n"
-        '<font color="green">ترجمه چهارم</font>\n'
+        '<font color="green">ترجمه خط اول ترجمه خط دوم</font>\n'
     )
     assert result.line_translated_transcript == (
-        "first\n\n"
+        "first\n"
         "second\n"
-        "ترجمه دوم خط اول\n"
-        "ترجمه دوم خط دوم\n\n"
-        "third changed by model\n"
-        "ترجمه سوم\n\n"
-        "fourth\n"
-        "extra model note\n"
-        "ترجمه چهارم\n"
+        "ترجمه خط اول ترجمه خط دوم\n"
     )
 
 
-def test_transcript_refiner_uses_delimited_raw_transcript() -> None:
+def test_transcript_refiner_uses_structured_one_cue_translation_request() -> None:
     class FakeResponses:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
+        def create(
+            self,
+            *,
+            model: str,
+            instructions: str,
+            input: str,
+            temperature: int,
+            text: object,
+        ) -> object:
             self.calls.append(
                 {
                     "model": model,
                     "instructions": instructions,
                     "input": input,
                     "temperature": temperature,
+                    "text": text,
                 }
             )
-            return SimpleNamespace(output_text="cleaned transcript")
+            return SimpleNamespace(output_text='{"translation": "سلام"}')
 
     fake_responses = FakeResponses()
     fake_client = SimpleNamespace(responses=fake_responses)
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
 
-    assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == "cleaned transcript"
-    assert fake_responses.calls == [
-        {
-            "model": DEFAULT_REFINEMENT_MODEL,
-            "instructions": SRT_TRANSLATION_SYSTEM_PROMPT,
-            "input": build_refinement_input("1\n00:00:00,000 --> 00:00:01,000\nهاي\n"),
-            "temperature": 0,
-        }
-    ]
+    assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == (
+        "1\n"
+        "00:00:00,000 --> 00:00:01,000\n"
+        "هاي\n"
+        '<font color="green">سلام</font>\n'
+    )
+    assert fake_responses.calls[0]["model"] == DEFAULT_REFINEMENT_MODEL
+    assert fake_responses.calls[0]["instructions"] == SRT_TRANSLATION_SYSTEM_PROMPT
+    assert fake_responses.calls[0]["input"] == build_refinement_input("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
+    assert fake_responses.calls[0]["temperature"] == 0
+    assert fake_responses.calls[0]["text"]["format"]["type"] == "json_schema"
+    assert fake_responses.calls[0]["text"]["format"]["strict"] is True
 
 
-def test_transcript_refiner_accepts_empty_response_text() -> None:
+def test_transcript_refiner_rejects_empty_translation() -> None:
     class FakeResponses:
-        def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
-            return SimpleNamespace(output_text=" ")
+        def create(self, **_: object) -> object:
+            return SimpleNamespace(output_text='{"translation": " "}')
 
     fake_client = SimpleNamespace(responses=FakeResponses())
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
 
-    assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == ""
+    with pytest.raises(TranscriptionError, match="empty"):
+        refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
 
 
 def test_refinement_input_uses_delimited_raw_transcript() -> None:
@@ -635,8 +580,8 @@ def test_refinement_input_uses_delimited_raw_transcript() -> None:
     refinement_input = build_refinement_input(raw)
 
     assert SRT_TRANSLATION_REQUEST in refinement_input
-    assert RAW_TRANSCRIPT_START in refinement_input
-    assert RAW_TRANSCRIPT_END in refinement_input
+    assert CUE_TRANSLATION_START in refinement_input
+    assert CUE_TRANSLATION_END in refinement_input
     assert raw in refinement_input
 
 
@@ -843,6 +788,28 @@ def test_assemble_srt_chunks_reassembles_through_parsed_blocks() -> None:
     )
 
 
+def test_render_translated_srt_block_preserves_original_cue_and_adds_one_persian_line() -> None:
+    block = parse_srt_blocks("7\n00:00:01,000 --> 00:00:02,000\nline one\nline two\n")[0]
+
+    assert render_translated_srt_block(block, " ترجمه اول\nترجمه دوم ") == (
+        "7\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "line one\n"
+        "line two\n"
+        '<font color="green">ترجمه اول ترجمه دوم</font>\n'
+    )
+
+
+def test_parse_srt_cue_translation_response_rejects_malformed_json() -> None:
+    with pytest.raises(TranscriptionError, match="valid JSON"):
+        parse_srt_cue_translation_response("not json")
+
+
+def test_parse_srt_cue_translation_response_rejects_missing_translation() -> None:
+    with pytest.raises(TranscriptionError, match="translation string"):
+        parse_srt_cue_translation_response('{"text": "سلام"}')
+
+
 def test_render_line_translated_transcript_from_srt_removes_srt_structure_and_font_markup() -> None:
     translated_srt = (
         "1\n"
@@ -868,7 +835,7 @@ def test_render_line_translated_transcript_from_srt_keeps_plain_translation_text
 
 def test_transcript_refiner_raises_when_refinement_has_no_text() -> None:
     class FakeResponses:
-        def create(self, *, model: str, instructions: str, input: str, temperature: int) -> object:
+        def create(self, **_: object) -> object:
             return SimpleNamespace()
 
     fake_client = SimpleNamespace(responses=FakeResponses())
