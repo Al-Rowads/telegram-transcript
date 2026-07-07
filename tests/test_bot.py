@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import warnings
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from telegram.constants import ChatType
+from telegram.error import RetryAfter
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
@@ -39,6 +42,7 @@ class FakeMessage:
         chat_id: int = 100,
         message_id: int = 42,
         message_thread_id: int | None = None,
+        status: "FakeStatus | None" = None,
     ) -> None:
         self.video = video
         self.audio = audio
@@ -53,11 +57,12 @@ class FakeMessage:
         self.status_replies: list[FakeStatus] = []
         self.document_replies: list[object] = []
         self.document_reply_kwargs: list[dict[str, object]] = []
+        self.status = status
 
     async def reply_text(self, text: str, **kwargs: object) -> object:
         self.text_replies.append(text)
         self.text_reply_kwargs.append(kwargs)
-        status = FakeStatus()
+        status = self.status or FakeStatus()
         self.status_replies.append(status)
         return status
 
@@ -67,10 +72,13 @@ class FakeMessage:
 
 
 class FakeStatus:
-    def __init__(self) -> None:
+    def __init__(self, edit_errors: list[BaseException] | None = None) -> None:
         self.edits: list[str] = []
+        self.edit_errors = edit_errors or []
 
     async def edit_text(self, text: str) -> None:
+        if self.edit_errors:
+            raise self.edit_errors.pop(0)
         self.edits.append(text)
 
 
@@ -576,7 +584,7 @@ async def test_process_video_message_reports_step_by_step_flow(
 
 
 @pytest.mark.asyncio
-async def test_process_video_message_reports_translation_cue_progress(
+async def test_process_video_message_throttles_rapid_translation_cue_progress(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
@@ -634,7 +642,66 @@ async def test_process_video_message_reports_translation_cue_progress(
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     assert "Step 5/6: translating subtitle cue 1/2..." in message.status_replies[0].edits
-    assert "Step 5/6: translating subtitle cue 2/2..." in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 2/2..." not in message.status_replies[0].edits
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_reports_translation_progress_after_throttle_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    current_time = [0.0]
+    monkeypatch.setattr(bot_module.time, "monotonic", lambda: current_time[0])
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = 5
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+            assert progress_callback is not None
+            current_time[0] = 0.0
+            await progress_callback(
+                "refining_transcript",
+                {"index": 1, "total": 3, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
+            )
+            current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS - 1
+            await progress_callback(
+                "refining_transcript",
+                {"index": 2, "total": 3, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
+            )
+            current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS
+            await progress_callback(
+                "refining_transcript",
+                {"index": 3, "total": 3, "raw_chars": 62, "raw_bytes": 62, "model": "gpt-5.4"},
+            )
+            return TranscriptionResult(raw_transcript="raw only")
+
+    def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
+    message = FakeMessage()
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(
+        bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
+    )
+
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+
+    edits = message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 1/3..." in edits
+    assert "Step 5/6: translating subtitle cue 2/3..." not in edits
+    assert "Step 5/6: translating subtitle cue 3/3..." in edits
 
 
 @pytest.mark.asyncio
@@ -675,6 +742,52 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
     assert message.text_replies == ["Video received. Starting transcription...", "raw only"]
     assert message.document_replies == []
     assert message.status_replies[0].edits[-1] == "Transcript ready. SRT unavailable for this provider/model."
+
+
+@pytest.mark.asyncio
+async def test_process_video_message_continues_when_status_edit_hits_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+    class FakeAttachment:
+        file_name = "clip.mp4"
+        file_size = 5
+
+    class FakeTranscriber:
+        async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+            return TranscriptionResult(raw_transcript="raw only")
+
+    def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
+    caplog.set_level("WARNING", logger="telegram_transcript.bot")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        retry_after = RetryAfter(timedelta(seconds=29))
+    message = FakeMessage(status=FakeStatus(edit_errors=[retry_after]))
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    context = SimpleNamespace(
+        bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
+    )
+
+    await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
+
+    assert message.text_replies == ["Video received. Starting transcription...", "raw only"]
+    assert message.status_replies[0].edits[-1] == "Transcript ready. SRT unavailable for this provider/model."
+    assert "skipped Telegram status edit after flood control" in caplog.text
+    assert "retry_after=29" in caplog.text
 
 
 @pytest.mark.asyncio

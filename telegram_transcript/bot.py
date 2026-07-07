@@ -11,6 +11,7 @@ from pathlib import Path
 
 from telegram import Audio, Document, InputFile, Message, Update, Video, Voice
 from telegram.constants import ChatType
+from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
@@ -52,6 +53,7 @@ AUDIO_SUFFIX_BY_MIME = {
 }
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 DEFAULT_TRANSCRIPTION_MODEL_KEY = "deepgram"
+STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -288,12 +290,12 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.exception("job %s media transcription failed", job_id)
             status = status_ref["message"]
             if status is not None:
-                await status.edit_text(f"Transcription failed: {exc}")
+                await edit_status_message(status, f"Transcription failed: {exc}", job_id=job_id)
         except Exception:
             logger.exception("job %s unexpected media transcription failure", job_id)
             status = status_ref["message"]
             if status is not None:
-                await status.edit_text("Transcription failed because of an unexpected error.")
+                await edit_status_message(status, "Transcription failed because of an unexpected error.", job_id=job_id)
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,7 +326,7 @@ async def process_media_message(
         status_ref["message"] = status
 
         step_started = time.monotonic()
-        await status.edit_text("Step 1/6: downloading media...")
+        await edit_status_message(status, "Step 1/6: downloading media...", job_id=job_id)
         logger.info(
             "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
             job_id,
@@ -346,10 +348,10 @@ async def process_media_message(
                 source_bytes,
                 settings.max_video_bytes,
             )
-            await status.edit_text("Media is larger than the configured upload limit.")
+            await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
             return
 
-        await status.edit_text(f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...")
+        await edit_status_message(status, f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
             "job %s step 2/6 extracting MP3 audio: source_bytes=%d audio_tempo=%g",
@@ -371,7 +373,7 @@ async def process_media_message(
             elapsed_ms(step_started),
         )
 
-        await status.edit_text("Step 3/6: preparing audio chunks...")
+        await edit_status_message(status, "Step 3/6: preparing audio chunks...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
             "job %s step 3/6 preparing 1300-second chunks: audio_bytes=%d",
@@ -393,13 +395,15 @@ async def process_media_message(
             max(chunk_sizes),
             elapsed_ms(step_started),
         )
+        last_translation_status_attempt_at: float | None = None
 
         async def report_progress(event: str, data: object) -> None:
+            nonlocal last_translation_status_attempt_at
             progress_data = data if isinstance(data, dict) else {}
             if event == "transcribing_chunk":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
-                await status.edit_text(f"Step 4/6: transcribing chunk {index}/{total}...")
+                await edit_status_message(status, f"Step 4/6: transcribing chunk {index}/{total}...", job_id=job_id)
                 logger.info(
                     "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
                     job_id,
@@ -421,9 +425,16 @@ async def process_media_message(
                 index = progress_data.get("index")
                 total = progress_data.get("total")
                 if isinstance(total, int) and total > 1:
-                    await status.edit_text(f"Step 5/6: translating subtitle cue {index}/{total}...")
+                    status_text = f"Step 5/6: translating subtitle cue {index}/{total}..."
                 else:
-                    await status.edit_text("Step 5/6: translating subtitles...")
+                    status_text = "Step 5/6: translating subtitles..."
+                now = time.monotonic()
+                if (
+                    last_translation_status_attempt_at is None
+                    or now - last_translation_status_attempt_at >= STATUS_PROGRESS_EDIT_INTERVAL_SECONDS
+                ):
+                    last_translation_status_attempt_at = now
+                    await edit_status_message(status, status_text, job_id=job_id)
                 logger.info(
                     "job %s step 5/6 translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
@@ -455,7 +466,7 @@ async def process_media_message(
         else None
     )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
-    await status.edit_text("Step 6/6: sending transcript...")
+    await edit_status_message(status, "Step 6/6: sending transcript...", job_id=job_id)
     logger.info(
         "job %s step 6/6 sending transcript: raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d raw_delivery=%s",
         job_id,
@@ -476,9 +487,9 @@ async def process_media_message(
             caption="Line-by-line translation",
         )
     if srt:
-        await status.edit_text("Transcript ready.")
+        await edit_status_message(status, "Transcript ready.", job_id=job_id)
     else:
-        await status.edit_text("Transcript ready. SRT unavailable for this provider/model.")
+        await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
     logger.info(
         "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
@@ -546,6 +557,34 @@ def normalize_transcription_result(result: object) -> TranscriptionResult:
 
 async def reply_to_source(message: Message, text: str) -> Message:
     return await message.reply_text(text, **source_reply_kwargs(message))
+
+
+async def edit_status_message(status: Message, text: str, *, job_id: str) -> bool:
+    try:
+        await status.edit_text(text)
+    except RetryAfter as exc:
+        logger.warning(
+            "job %s skipped Telegram status edit after flood control: retry_after=%s text=%r",
+            job_id,
+            format_retry_after(get_retry_after_value(exc)),
+            text,
+        )
+        return False
+    return True
+
+
+def get_retry_after_value(exc: RetryAfter) -> object:
+    retry_after = getattr(exc, "_retry_after", None)
+    if retry_after is not None:
+        return retry_after
+    return exc.retry_after
+
+
+def format_retry_after(retry_after: object) -> str:
+    total_seconds = getattr(retry_after, "total_seconds", None)
+    if callable(total_seconds):
+        return f"{total_seconds():g}"
+    return str(retry_after)
 
 
 def source_reply_kwargs(message: Message) -> dict[str, int | bool]:
