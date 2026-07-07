@@ -13,6 +13,8 @@ from telegram_transcript.models import AudioChunk, FileTranscriptionResult, Subt
 
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar"
+DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe-diarize"
+DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "gemini-3.5-flash"
 DEFAULT_REFINEMENT_MODEL = "gpt-5.4"
 MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
 RAW_TRANSCRIPT_START = "<srt_file>"
@@ -49,6 +51,19 @@ SRT_CUE_NUMBER_RE = re.compile(r"^\d+$")
 SRT_TIMESTAMP_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}(?:\s+.*)?$"
 )
+SRT_TIMESTAMP_CAPTURE_RE = re.compile(
+    r"^(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(?P<end>\d{2}:\d{2}:\d{2},\d{3})(?:\s+.*)?$"
+)
+SRT_RESPONSE_FENCE_RE = re.compile(r"^```(?:srt|text)?\s*\n(?P<body>.*)\n```$", re.IGNORECASE | re.DOTALL)
+
+SRT_TRANSCRIPTION_PROMPT = """Transcribe this audio as valid SRT subtitles.
+
+Rules:
+- Output only SRT content.
+- Include sequential cue numbers.
+- Use timestamps in HH:MM:SS,mmm --> HH:MM:SS,mmm format.
+- Put only spoken text in cue text lines.
+- Do not include Markdown fences, summaries, notes, or any text outside the SRT file."""
 
 
 class TranscriptionError(RuntimeError):
@@ -100,6 +115,63 @@ class DeepgramSpeechToTextProvider:
                 utterances=True,
             )
         return extract_deepgram_file_transcription_result(response)
+
+
+class OpenAISpeechToTextProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+        client: Any | None = None,
+    ) -> None:
+        self.provider_name = "openai"
+        self.model = model
+        self.client = client if client is not None else OpenAI(api_key=api_key)
+
+    def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
+
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+        del previous_transcript
+        with audio_path.open("rb") as audio_file:
+            response = self.client.audio.transcriptions.create(
+                file=audio_file,
+                model=self.model,
+                response_format="diarized_json",
+                chunking_strategy="auto",
+                temperature=0,
+            )
+        return extract_openai_diarized_file_transcription_result(response)
+
+
+class GeminiSpeechToTextProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        client: Any | None = None,
+        prompt: str = SRT_TRANSCRIPTION_PROMPT,
+    ) -> None:
+        self.provider_name = "gemini"
+        self.model = model
+        self.client = client if client is not None else create_gemini_client(api_key)
+        self.prompt = prompt
+
+    def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
+
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+        del previous_transcript
+        uploaded_file = self.client.files.upload(file=str(audio_path))
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=[self.prompt, uploaded_file],
+            config=create_gemini_generate_content_config(temperature=0),
+        )
+        srt = extract_response_text(response).strip()
+        return parse_srt_file_transcription_result(srt, provider_name="Gemini")
 
 
 class TranscriptRefiner:
@@ -272,6 +344,106 @@ def create_deepgram_client(api_key: str) -> Any:
     except ImportError as exc:
         raise TranscriptionError("deepgram-sdk is required for transcription.") from exc
     return DeepgramClient(api_key=api_key)
+
+
+def create_gemini_client(api_key: str) -> Any:
+    try:
+        from google import genai
+    except ImportError as exc:
+        raise TranscriptionError("google-genai is required for Gemini transcription.") from exc
+    return genai.Client(api_key=api_key)
+
+
+def create_gemini_generate_content_config(*, temperature: int) -> Any:
+    try:
+        from google.genai import types
+    except ImportError:
+        return {"temperature": temperature}
+    return types.GenerateContentConfig(temperature=temperature)
+
+
+def extract_openai_diarized_file_transcription_result(response: Any) -> FileTranscriptionResult:
+    segments = get_response_field(response, "segments")
+    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)) or not segments:
+        raise TranscriptionError("OpenAI diarized transcription response did not include segments.")
+
+    cues = []
+    for segment in segments:
+        cue = build_subtitle_cue(
+            start=get_response_field(segment, "start"),
+            end=get_response_field(segment, "end"),
+            text=format_diarized_segment_text(
+                speaker=get_response_field(segment, "speaker"),
+                text=get_response_field(segment, "text"),
+            ),
+        )
+        if cue is not None:
+            cues.append(cue)
+
+    if not cues:
+        raise TranscriptionError("OpenAI diarized transcription response did not include usable segments.")
+    srt = render_srt(cues)
+    return FileTranscriptionResult(
+        transcript=render_line_translated_transcript_from_srt(srt).strip(),
+        subtitle_cues=tuple(cues),
+    )
+
+
+def format_diarized_segment_text(*, speaker: Any, text: Any) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    stripped_text = text.strip()
+    if isinstance(speaker, str) and speaker.strip():
+        return f"{speaker.strip()}: {stripped_text}"
+    return stripped_text
+
+
+def parse_srt_file_transcription_result(srt: str, *, provider_name: str) -> FileTranscriptionResult:
+    cleaned_srt = clean_srt_response_text(srt)
+    blocks = parse_srt_blocks(cleaned_srt)
+    if not blocks:
+        raise TranscriptionError(f"{provider_name} transcription response did not include SRT cues.")
+
+    cues = []
+    for block in blocks:
+        cue = build_subtitle_cue_from_srt_block(block)
+        if cue is None:
+            raise TranscriptionError(f"{provider_name} transcription response included an invalid SRT cue.")
+        cues.append(cue)
+    return FileTranscriptionResult(
+        transcript=render_line_translated_transcript_from_srt(render_srt_blocks(blocks)).strip(),
+        subtitle_cues=tuple(cues),
+    )
+
+
+def clean_srt_response_text(srt: str) -> str:
+    cleaned = srt.strip()
+    match = SRT_RESPONSE_FENCE_RE.fullmatch(cleaned)
+    if match is not None:
+        return match.group("body").strip()
+    return cleaned
+
+
+def build_subtitle_cue_from_srt_block(block: SrtBlock) -> SubtitleCue | None:
+    match = SRT_TIMESTAMP_CAPTURE_RE.fullmatch(block.timestamp)
+    if match is None:
+        return None
+    return build_subtitle_cue(
+        start=parse_srt_timestamp(match.group("start")),
+        end=parse_srt_timestamp(match.group("end")),
+        text="\n".join(line.strip() for line in block.text_lines if line.strip()),
+    )
+
+
+def parse_srt_timestamp(timestamp: str) -> float:
+    hours, minutes, seconds_with_milliseconds = timestamp.split(":", 2)
+    seconds, milliseconds = seconds_with_milliseconds.split(",", 1)
+    return (
+        int(hours) * 60 * 60
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
 
 
 def extract_deepgram_transcript_text(response: Any) -> str:
@@ -505,6 +677,15 @@ def extract_response_text(response: Any) -> str:
     output_text = getattr(response, "output_text", None)
     if isinstance(output_text, str):
         return output_text
+
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        return text
+
+    if isinstance(response, dict):
+        text = response.get("text")
+        if isinstance(text, str):
+            return text
 
     raise TranscriptionError("OpenAI refinement response did not include text.")
 

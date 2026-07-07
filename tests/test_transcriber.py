@@ -9,8 +9,12 @@ import pytest
 from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
+    DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+    DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DeepgramSpeechToTextProvider,
+    GeminiSpeechToTextProvider,
+    OpenAISpeechToTextProvider,
     RAW_TRANSCRIPT_END,
     RAW_TRANSCRIPT_START,
     SRT_TRANSLATION_REQUEST,
@@ -138,6 +142,144 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             "utterances": True,
         }
     ]
+
+
+def test_openai_provider_uses_diarized_json_and_renders_srt_cues(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(
+            self,
+            *,
+            file: object,
+            model: str,
+            response_format: str,
+            chunking_strategy: str,
+            temperature: int,
+        ) -> object:
+            self.calls.append(
+                {
+                    "file_name": file.name,
+                    "model": model,
+                    "response_format": response_format,
+                    "chunking_strategy": chunking_strategy,
+                    "temperature": temperature,
+                }
+            )
+            return SimpleNamespace(
+                segments=[
+                    SimpleNamespace(start=0.0, end=1.25, speaker="speaker_0", text="هلا"),
+                    SimpleNamespace(start=1.25, end=2.0, speaker="speaker_1", text="شلونك"),
+                ],
+            )
+
+    fake_transcriptions = FakeTranscriptions()
+    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
+    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
+
+    result = provider.transcribe_file_result(audio)
+
+    assert result.transcript == "speaker_0: هلا\n\nspeaker_1: شلونك"
+    assert result.subtitle_cues == (
+        SubtitleCue(0.0, 1.25, "speaker_0: هلا"),
+        SubtitleCue(1.25, 2.0, "speaker_1: شلونك"),
+    )
+    assert fake_transcriptions.calls == [
+        {
+            "file_name": str(audio),
+            "model": DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+            "response_format": "diarized_json",
+            "chunking_strategy": "auto",
+            "temperature": 0,
+        }
+    ]
+
+
+def test_openai_provider_rejects_missing_diarized_segments(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def create(self, **_: object) -> object:
+            return SimpleNamespace(text="plain transcript")
+
+    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=FakeTranscriptions()))
+    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
+
+    with pytest.raises(TranscriptionError, match="OpenAI diarized"):
+        provider.transcribe_file_result(audio)
+
+
+def test_gemini_provider_requests_srt_and_parses_response(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeFiles:
+        def __init__(self) -> None:
+            self.uploads: list[str] = []
+
+        def upload(self, *, file: str) -> object:
+            self.uploads.append(file)
+            return SimpleNamespace(uri="uploaded-audio")
+
+    class FakeModels:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_content(self, *, model: str, contents: list[object], config: object) -> object:
+            self.calls.append({"model": model, "contents": contents, "config": config})
+            return SimpleNamespace(
+                text=(
+                    "```srt\n"
+                    "1\n"
+                    "00:00:00,000 --> 00:00:01,250\n"
+                    "هلا\n\n"
+                    "2\n"
+                    "00:00:01,250 --> 00:00:02,000\n"
+                    "شلونك\n"
+                    "```"
+                )
+            )
+
+    fake_files = FakeFiles()
+    fake_models = FakeModels()
+    fake_client = SimpleNamespace(files=fake_files, models=fake_models)
+    provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
+
+    result = provider.transcribe_file_result(audio)
+
+    assert result.transcript == "هلا\n\nشلونك"
+    assert result.subtitle_cues == (
+        SubtitleCue(0.0, 1.25, "هلا"),
+        SubtitleCue(1.25, 2.0, "شلونك"),
+    )
+    assert fake_files.uploads == [str(audio)]
+    assert fake_models.calls[0]["model"] == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+    assert "SRT" in fake_models.calls[0]["contents"][0]
+    assert fake_models.calls[0]["contents"][1].uri == "uploaded-audio"
+
+
+def test_gemini_provider_rejects_invalid_srt(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeFiles:
+        def upload(self, *, file: str) -> object:
+            return SimpleNamespace(uri=file)
+
+    class FakeModels:
+        def generate_content(self, **_: object) -> object:
+            return SimpleNamespace(text="plain transcript")
+
+    fake_client = SimpleNamespace(files=FakeFiles(), models=FakeModels())
+    provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
+
+    with pytest.raises(TranscriptionError, match="SRT"):
+        provider.transcribe_file_result(audio)
 
 
 @pytest.mark.asyncio

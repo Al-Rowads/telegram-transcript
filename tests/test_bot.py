@@ -12,6 +12,7 @@ from telegram_transcript.bot import (
     get_attachment_suffix,
     get_media_attachment,
     get_video_attachment,
+    handle_model_command,
     handle_non_video,
     handle_tempo_command,
     handle_video_upload,
@@ -289,6 +290,92 @@ async def test_handle_tempo_command_ignores_invalid_values(args: list[str]) -> N
 
     assert context.bot_data["audio_tempo"] == 1.0
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_lists_current_and_available_models() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                deepgram_api_key="deepgram-key",
+                openai_api_key="openai-key",
+            ),
+            "transcription_model": "deepgram",
+        },
+    )
+
+    await handle_model_command(update, context)
+
+    assert "Current transcription model: Deepgram nova-3" in message.text_replies[0]
+    assert "openai: OpenAI gpt-4o-transcribe-diarize (available)" in message.text_replies[0]
+    assert "gemini: Gemini gemini-3.5-flash (missing credentials)" in message.text_replies[0]
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 123,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 8,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        gemini_api_key="gemini-key",
+    )
+    context = SimpleNamespace(args=["gemini"], bot_data={"settings": settings})
+    fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini-3.5-flash")
+    calls: list[tuple[Settings, str]] = []
+
+    def fake_create_transcriber(settings_arg: Settings, model_key: str) -> object:
+        calls.append((settings_arg, model_key))
+        return fake_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+
+    await handle_model_command(update, context)
+
+    assert calls == [(settings, "gemini")]
+    assert context.bot_data["transcriber"] is fake_transcriber
+    assert context.bot_data["transcription_model"] == "gemini"
+    assert message.text_replies == ["Transcription model set to Gemini gemini-3.5-flash."]
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_rejects_missing_provider_credentials() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=["openai"],
+        bot_data={"settings": Settings(telegram_bot_token="token", deepgram_api_key="deepgram-key")},
+    )
+
+    await handle_model_command(update, context)
+
+    assert message.text_replies == ["OPENAI_API_KEY is required for OpenAI transcription."]
+    assert "transcription_model" not in context.bot_data
+
+
+@pytest.mark.asyncio
+async def test_handle_model_command_rejects_unknown_model() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=["unknown"],
+        bot_data={"settings": Settings(telegram_bot_token="token", deepgram_api_key="deepgram-key")},
+    )
+
+    await handle_model_command(update, context)
+
+    assert message.text_replies == ["Unknown transcription model. Available models: deepgram, openai, gemini."]
 
 
 @pytest.mark.asyncio

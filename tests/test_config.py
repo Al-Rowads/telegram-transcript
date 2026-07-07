@@ -30,6 +30,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.deepgram_language == "ar"
     assert settings.openai_api_key == ""
     assert settings.openai_refine_model == "gpt-5.4"
+    assert settings.gemini_api_key == ""
     assert settings.refine is False
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
@@ -42,6 +43,7 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENAI_API_KEY": "openai-key",
             "OPENAI_REFINE_MODEL": "custom-refine-model",
+            "GEMINI_API_KEY": "gemini-key",
             "REFINE": "true",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "MAX_VIDEO_MB": "25.5",
@@ -54,6 +56,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.deepgram_api_key == "deepgram-key"
     assert settings.openai_api_key == "openai-key"
     assert settings.openai_refine_model == "custom-refine-model"
+    assert settings.gemini_api_key == "gemini-key"
     assert settings.refine is True
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5

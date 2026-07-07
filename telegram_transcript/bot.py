@@ -5,6 +5,7 @@ import logging
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 
@@ -22,7 +23,12 @@ from telegram_transcript.telegram_utils import (
 )
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
 from telegram_transcript.transcriber import (
+    DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
+    DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+    DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DeepgramSpeechToTextProvider,
+    GeminiSpeechToTextProvider,
+    OpenAISpeechToTextProvider,
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
@@ -45,6 +51,44 @@ AUDIO_SUFFIX_BY_MIME = {
     "audio/x-wav": ".wav",
 }
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+DEFAULT_TRANSCRIPTION_MODEL_KEY = "deepgram"
+
+
+@dataclass(frozen=True)
+class TranscriptionModelOption:
+    key: str
+    provider: str
+    model: str
+    label: str
+
+
+TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
+    "deepgram": TranscriptionModelOption(
+        key="deepgram",
+        provider="deepgram",
+        model=DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
+        label=f"Deepgram {DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL}",
+    ),
+    "openai": TranscriptionModelOption(
+        key="openai",
+        provider="openai",
+        model=DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+        label=f"OpenAI {DEFAULT_OPENAI_TRANSCRIPTION_MODEL}",
+    ),
+    "gemini": TranscriptionModelOption(
+        key="gemini",
+        provider="gemini",
+        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        label=f"Gemini {DEFAULT_GEMINI_TRANSCRIPTION_MODEL}",
+    ),
+}
+TRANSCRIPTION_MODEL_ALIASES = {
+    option.key: option.key
+    for option in TRANSCRIPTION_MODEL_OPTIONS.values()
+} | {
+    option.model: option.key
+    for option in TRANSCRIPTION_MODEL_OPTIONS.values()
+}
 
 
 def create_application(settings: Settings | None = None) -> Application:
@@ -60,23 +104,24 @@ def create_application(settings: Settings | None = None) -> Application:
     )
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
+    app.bot_data["transcription_model"] = DEFAULT_TRANSCRIPTION_MODEL_KEY
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
     app.bot_data["audio_tempo"] = settings.audio_tempo
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
+    app.add_handler(CommandHandler("model", handle_model_command))
     app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_media))
     return app
 
 
-def create_transcriber(settings: Settings) -> SpeechTranscriber:
-    speech_to_text_provider = DeepgramSpeechToTextProvider(
-        api_key=settings.deepgram_api_key,
-        model=settings.deepgram_transcribe_model,
-        language=settings.deepgram_language,
-    )
+def create_transcriber(
+    settings: Settings,
+    model_key: str = DEFAULT_TRANSCRIPTION_MODEL_KEY,
+) -> SpeechTranscriber:
+    speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
 
     refiner = (
         TranscriptRefiner(
@@ -87,6 +132,29 @@ def create_transcriber(settings: Settings) -> SpeechTranscriber:
         else None
     )
     return SpeechTranscriber(speech_to_text_provider=speech_to_text_provider, refiner=refiner)
+
+
+def create_speech_to_text_provider(settings: Settings, model_key: str) -> object:
+    option = TRANSCRIPTION_MODEL_OPTIONS.get(model_key)
+    if option is None:
+        raise ConfigError(f"Unknown transcription model: {model_key}")
+
+    if option.provider == "deepgram":
+        return DeepgramSpeechToTextProvider(
+            api_key=settings.deepgram_api_key,
+            model=settings.deepgram_transcribe_model,
+            language=settings.deepgram_language,
+        )
+    if option.provider == "openai":
+        if not settings.openai_api_key:
+            raise ConfigError("OPENAI_API_KEY is required for OpenAI transcription.")
+        return OpenAISpeechToTextProvider(api_key=settings.openai_api_key, model=option.model)
+    if option.provider == "gemini":
+        if not settings.gemini_api_key:
+            raise ConfigError("GEMINI_API_KEY is required for Gemini transcription.")
+        return GeminiSpeechToTextProvider(api_key=settings.gemini_api_key, model=option.model)
+
+    raise ConfigError(f"Unsupported transcription provider: {option.provider}")
 
 
 async def start_media_downloader(application: Application) -> None:
@@ -139,6 +207,41 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
 
+async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+
+    args = getattr(context, "args", None)
+    if not isinstance(args, list) or not args:
+        await reply_to_source(message, format_model_settings_message(context, settings))
+        return
+    if len(args) != 1:
+        await reply_to_source(message, format_unknown_model_message())
+        return
+
+    model_key = parse_model_command_arg(args[0])
+    if model_key is None:
+        await reply_to_source(message, format_unknown_model_message())
+        return
+
+    try:
+        transcriber = create_transcriber(settings, model_key)
+    except ConfigError as exc:
+        await reply_to_source(message, str(exc))
+        return
+
+    context.bot_data["transcriber"] = transcriber
+    context.bot_data["transcription_model"] = model_key
+    await reply_to_source(message, f"Transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
+
+
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None:
@@ -161,6 +264,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     audio_tempo = get_runtime_audio_tempo(context, settings)
+    provider_name, model_name = get_runtime_transcriber_info(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
@@ -168,8 +272,8 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         get_media_attachment_suffix(attachment),
         file_size,
         audio_tempo,
-        "deepgram",
-        get_transcribe_model_name(settings),
+        provider_name,
+        model_name,
         settings.refine,
         settings.openai_refine_model,
     )
@@ -479,8 +583,56 @@ def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settin
         return settings.audio_tempo
 
 
-def get_transcribe_model_name(settings: Settings) -> str:
-    return settings.deepgram_transcribe_model
+def parse_model_command_arg(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return TRANSCRIPTION_MODEL_ALIASES.get(raw.strip().lower())
+
+
+def get_runtime_model_key(context: ContextTypes.DEFAULT_TYPE) -> str:
+    candidate = context.bot_data.get("transcription_model", DEFAULT_TRANSCRIPTION_MODEL_KEY)
+    if isinstance(candidate, str) and candidate in TRANSCRIPTION_MODEL_OPTIONS:
+        return candidate
+    return DEFAULT_TRANSCRIPTION_MODEL_KEY
+
+
+def get_runtime_transcriber_info(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> tuple[str, str]:
+    transcriber = context.bot_data.get("transcriber")
+    provider_name = getattr(transcriber, "provider_name", None)
+    model = getattr(transcriber, "model", None)
+    if isinstance(provider_name, str) and isinstance(model, str):
+        return provider_name, model
+    return "deepgram", settings.deepgram_transcribe_model
+
+
+def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
+    current_model_key = get_runtime_model_key(context)
+    lines = [
+        f"Current transcription model: {TRANSCRIPTION_MODEL_OPTIONS[current_model_key].label}",
+        "",
+        "Available models:",
+    ]
+    for option in TRANSCRIPTION_MODEL_OPTIONS.values():
+        availability = "available" if is_model_option_configured(option, settings) else "missing credentials"
+        lines.append(f"- {option.key}: {option.label} ({availability})")
+    lines.append("")
+    lines.append("Use /model deepgram, /model openai, or /model gemini.")
+    return "\n".join(lines)
+
+
+def format_unknown_model_message() -> str:
+    options = ", ".join(option.key for option in TRANSCRIPTION_MODEL_OPTIONS.values())
+    return f"Unknown transcription model. Available models: {options}."
+
+
+def is_model_option_configured(option: TranscriptionModelOption, settings: Settings) -> bool:
+    if option.provider == "deepgram":
+        return bool(settings.deepgram_api_key)
+    if option.provider == "openai":
+        return bool(settings.openai_api_key)
+    if option.provider == "gemini":
+        return bool(settings.gemini_api_key)
+    return False
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:
