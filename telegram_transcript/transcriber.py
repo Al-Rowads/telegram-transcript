@@ -24,10 +24,7 @@ ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
 SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
 
-You will receive one numbered SRT subtitle cue. Translate the text use Context from previous text lines, to have accurate translation with correct Persian meaning.
-Doesn't need to be line by line translation, translate with accuracy, and make correctness of translation in priority, NOT exactly word by word into Persian.
-you may include translation of pervious Arabic line in the next line to preserve translation cohesion.
-Make translation cohesion top priority.
+You will receive one numbered SRT subtitle cue. Translate only the spoken subtitle text into Persian.
 
 Rules:
 - Return exactly one JSON object with a single "translation" string.
