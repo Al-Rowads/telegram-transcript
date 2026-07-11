@@ -52,6 +52,7 @@ AUDIO_SUFFIX_BY_MIME = {
     "audio/x-wav": ".wav",
 }
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+DEFAULT_OUTPUT_BASENAME = "transcript"
 DEFAULT_TRANSCRIPTION_MODEL_KEY = "deepgram"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 
@@ -312,6 +313,7 @@ async def process_media_message(
     audio_tempo: float,
 ) -> None:
     transcriber: SpeechTranscriber = context.bot_data["transcriber"]
+    base_name = get_media_attachment_basename(attachment)
     job_started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
@@ -476,14 +478,19 @@ async def process_media_message(
         len(transcription_result.subtitle_cues),
         "text" if should_send_as_text(raw_transcript) else "document",
     )
-    await send_transcript(message, raw_transcript, caption="Transcription")
+    await send_transcript(
+        message,
+        raw_transcript,
+        filename=f"{base_name}.transcription.txt",
+        caption="Transcription",
+    )
     if srt:
-        await send_srt(message, srt)
+        await send_srt(message, srt, filename=f"{base_name}.srt")
     if line_translated_transcript:
         await send_transcript(
             message,
             line_translated_transcript,
-            filename="translated-transcript.txt",
+            filename=f"{base_name}.translation.txt",
             caption="Line-by-line translation",
         )
     if srt:
@@ -536,12 +543,12 @@ async def send_transcript(
     )
 
 
-async def send_srt(message: Message, srt: str) -> None:
+async def send_srt(message: Message, srt: str, *, filename: str = "transcript.srt") -> None:
     srt_file = BytesIO(srt.encode("utf-8"))
-    srt_file.name = "transcript.srt"
+    srt_file.name = filename
     srt_file.seek(0)
     await message.reply_document(
-        document=InputFile(srt_file, filename="transcript.srt"),
+        document=InputFile(srt_file, filename=filename),
         caption="SRT subtitles",
         **source_reply_kwargs(message),
     )
@@ -748,6 +755,17 @@ def get_media_attachment_suffix(attachment: Video | Audio | Voice | Document) ->
     if is_audio_attachment(attachment):
         return get_audio_attachment_suffix(attachment)
     return get_attachment_suffix(attachment)
+
+
+def get_media_attachment_basename(attachment: Video | Audio | Voice | Document) -> str:
+    # Name delivered outputs after the original upload; voice notes and some audio
+    # arrive without a file_name, so fall back to a stable default base.
+    file_name = getattr(attachment, "file_name", None)
+    if isinstance(file_name, str):
+        stem = Path(file_name).stem.strip()
+        if stem:
+            return stem
+    return DEFAULT_OUTPUT_BASENAME
 
 
 def get_audio_attachment_suffix(attachment: Audio | Voice | Document) -> str:

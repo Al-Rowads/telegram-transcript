@@ -14,6 +14,7 @@ from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
     get_attachment_suffix,
     get_media_attachment,
+    get_media_attachment_basename,
     get_video_attachment,
     handle_model_command,
     handle_non_video,
@@ -152,6 +153,18 @@ def test_get_video_attachment_prefers_video() -> None:
 
 def test_get_attachment_suffix_defaults_to_mp4() -> None:
     assert get_attachment_suffix(SimpleNamespace(file_name="clip.txt")) == ".mp4"
+
+
+def test_get_media_attachment_basename_uses_original_stem() -> None:
+    assert get_media_attachment_basename(SimpleNamespace(file_name="My Clip.mp4")) == "My Clip"
+
+
+def test_get_media_attachment_basename_falls_back_without_file_name() -> None:
+    assert get_media_attachment_basename(SimpleNamespace(mime_type="audio/ogg")) == "transcript"
+
+
+def test_get_media_attachment_basename_falls_back_for_blank_stem() -> None:
+    assert get_media_attachment_basename(SimpleNamespace(file_name="  .mp4")) == "transcript"
 
 
 @pytest.mark.asyncio
@@ -568,6 +581,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "هاي خام\nاین خام است",
     ]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
+    assert [document.filename for document, _ in message.document_replies] == ["clip.srt"]
     status = message.status_replies[0]
     assert status.edits == [
         "Step 1/6: downloading media...",
