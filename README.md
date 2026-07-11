@@ -11,8 +11,8 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Downloads bot media through Telethon, allowing media up to Telegram's 2 GiB file limit.
 - Converts media audio to slowed mono 16 kHz MP3 with `ffmpeg`.
 - Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to the selected provider.
-- Uses Deepgram Nova-3 Arabic for speech-to-text by default.
-- Supports runtime transcription model selection with `/model`: Deepgram Nova-3, OpenAI `gpt-4o-transcribe-diarize`, or Gemini `gemini-3.5-flash`.
+- Uses OpenRouter `google/gemini-3.5-flash` for speech-to-text by default.
+- Supports runtime transcription model selection with `/model`: OpenRouter Gemini 3.5 Flash, OpenRouter `openai/whisper-large-v3`, or direct Deepgram Nova-3 as a manual fallback.
 - Optionally translates each SRT cue to exactly one Persian line and derives a line-by-line Arabic/Persian transcript from the translated SRT.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
@@ -32,15 +32,14 @@ Required variables:
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
 - `TELEGRAM_API_ID`: Telegram API ID from https://my.telegram.org for Telethon downloads.
 - `TELEGRAM_API_HASH`: Telegram API hash from https://my.telegram.org for Telethon downloads.
-- `DEEPGRAM_API_KEY`: Deepgram API key for transcription.
-- `OPENAI_API_KEY`: OpenAI API key when `REFINE=true` or when selecting OpenAI transcription with `/model openai`.
+- `OPENROUTER_API_KEY`: one OpenRouter key for Gemini transcription, Whisper transcription, and optional Persian refinement.
+- `DEEPGRAM_API_KEY`: Deepgram API key used only for the manually selected Deepgram fallback.
 
 Optional variables:
 
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to `ar`.
-- `OPENAI_REFINE_MODEL`: text model used to add Persian translations to SRT subtitles. Defaults to `gpt-5.4`.
-- `GEMINI_API_KEY`: Gemini API key when selecting Gemini transcription with `/model gemini`.
+- `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.4`.
 - `REFINE`: set to `true` to run OpenAI SRT translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
@@ -80,15 +79,15 @@ Add the bot to a group or supergroup to transcribe videos posted there. The bot 
 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
-Use `/model` to show the active transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to switch transcription for future media. The selected model is runtime-only and resets to Deepgram after restart.
+Use `/model` to show the active transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to switch transcription for future media. The selected model is runtime-only and resets to Gemini 3.5 Flash after restart.
 
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 
 ## Subtitle Files
 
-When the selected transcription provider returns or can produce timestamps, the bot sends `transcript.srt` after the plain transcript. Deepgram timestamps come from Deepgram utterances or words. OpenAI `gpt-4o-transcribe-diarize` returns diarized JSON rather than direct SRT, so the bot renders those speaker/timestamp segments to SRT locally. Gemini is prompted to return valid SRT directly. The plain transcript message is derived by removing SRT cue numbers, timestamps, and green font markup when present.
+When the selected transcription provider returns or can produce timestamps, the bot sends `transcript.srt` after the plain transcript. Deepgram timestamps come from Deepgram utterances or words. OpenRouter Whisper currently returns plain transcription text without speaker diarization or SRT cues. Gemini is prompted to return valid SRT directly. The plain transcript message is derived by removing SRT cue numbers, timestamps, and green font markup when present.
 
-With `REFINE=true`, each rendered SRT cue is sent to OpenAI separately for Persian translation. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one normalized Persian line per cue, and rejects empty or malformed translation responses.
+With `REFINE=true`, each rendered SRT cue is sent through OpenRouter separately for Persian translation. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one normalized Persian line per cue, and rejects empty or malformed translation responses.
 
 ## Tests
 

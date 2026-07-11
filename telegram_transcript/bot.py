@@ -53,7 +53,7 @@ AUDIO_SUFFIX_BY_MIME = {
 }
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 DEFAULT_OUTPUT_BASENAME = "transcript"
-DEFAULT_TRANSCRIPTION_MODEL_KEY = "deepgram"
+DEFAULT_TRANSCRIPTION_MODEL_KEY = "gemini"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 
 
@@ -76,13 +76,13 @@ TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
         key="openai",
         provider="openai",
         model=DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
-        label=f"OpenAI {DEFAULT_OPENAI_TRANSCRIPTION_MODEL}",
+        label="OpenRouter Whisper large v3",
     ),
     "gemini": TranscriptionModelOption(
         key="gemini",
         provider="gemini",
         model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
-        label=f"Gemini {DEFAULT_GEMINI_TRANSCRIPTION_MODEL}",
+        label="OpenRouter Gemini 3.5 Flash",
     ),
 }
 TRANSCRIPTION_MODEL_ALIASES = {
@@ -128,8 +128,8 @@ def create_transcriber(
 
     refiner = (
         TranscriptRefiner(
-            api_key=settings.openai_api_key,
-            model=settings.openai_refine_model,
+            api_key=settings.openrouter_api_key,
+            model=settings.openrouter_refine_model,
         )
         if settings.refine
         else None
@@ -143,19 +143,21 @@ def create_speech_to_text_provider(settings: Settings, model_key: str) -> object
         raise ConfigError(f"Unknown transcription model: {model_key}")
 
     if option.provider == "deepgram":
+        if not settings.deepgram_api_key:
+            raise ConfigError("DEEPGRAM_API_KEY is required for Deepgram transcription.")
         return DeepgramSpeechToTextProvider(
             api_key=settings.deepgram_api_key,
             model=settings.deepgram_transcribe_model,
             language=settings.deepgram_language,
         )
     if option.provider == "openai":
-        if not settings.openai_api_key:
-            raise ConfigError("OPENAI_API_KEY is required for OpenAI transcription.")
-        return OpenAISpeechToTextProvider(api_key=settings.openai_api_key, model=option.model)
+        if not settings.openrouter_api_key:
+            raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter transcription.")
+        return OpenAISpeechToTextProvider(api_key=settings.openrouter_api_key, model=option.model)
     if option.provider == "gemini":
-        if not settings.gemini_api_key:
-            raise ConfigError("GEMINI_API_KEY is required for Gemini transcription.")
-        return GeminiSpeechToTextProvider(api_key=settings.gemini_api_key, model=option.model)
+        if not settings.openrouter_api_key:
+            raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter transcription.")
+        return GeminiSpeechToTextProvider(api_key=settings.openrouter_api_key, model=option.model)
 
     raise ConfigError(f"Unsupported transcription provider: {option.provider}")
 
@@ -278,7 +280,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         provider_name,
         model_name,
         settings.refine,
-        settings.openai_refine_model,
+        settings.openrouter_refine_model,
     )
 
     semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
@@ -648,7 +650,8 @@ def get_runtime_transcriber_info(context: ContextTypes.DEFAULT_TYPE, settings: S
     model = getattr(transcriber, "model", None)
     if isinstance(provider_name, str) and isinstance(model, str):
         return provider_name, model
-    return "deepgram", settings.deepgram_transcribe_model
+    option = TRANSCRIPTION_MODEL_OPTIONS[DEFAULT_TRANSCRIPTION_MODEL_KEY]
+    return option.provider, option.model
 
 
 def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
@@ -675,9 +678,9 @@ def is_model_option_configured(option: TranscriptionModelOption, settings: Setti
     if option.provider == "deepgram":
         return bool(settings.deepgram_api_key)
     if option.provider == "openai":
-        return bool(settings.openai_api_key)
+        return bool(settings.openrouter_api_key)
     if option.provider == "gemini":
-        return bool(settings.gemini_api_key)
+        return bool(settings.openrouter_api_key)
     return False
 
 

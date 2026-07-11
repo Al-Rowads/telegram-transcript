@@ -28,9 +28,8 @@ class Settings:
     deepgram_api_key: str = ""
     deepgram_transcribe_model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
     deepgram_language: str = DEFAULT_DEEPGRAM_LANGUAGE
-    openai_api_key: str = ""
-    openai_refine_model: str = DEFAULT_REFINEMENT_MODEL
-    gemini_api_key: str = ""
+    openrouter_api_key: str = ""
+    openrouter_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = False
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = MAX_TELEGRAM_MEDIA_MB
@@ -65,11 +64,11 @@ def load_settings(
     )
     deepgram_language = source.get("DEEPGRAM_LANGUAGE", DEFAULT_DEEPGRAM_LANGUAGE).strip() or DEFAULT_DEEPGRAM_LANGUAGE
 
-    openai_api_key = source.get("OPENAI_API_KEY", "").strip()
-    if refine and not openai_api_key:
-        raise ConfigError("OPENAI_API_KEY is required when REFINE=true.")
-    refine_model = source.get("OPENAI_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip() or DEFAULT_REFINEMENT_MODEL
-    gemini_api_key = source.get("GEMINI_API_KEY", "").strip()
+    openrouter_api_key = require_value(source, "OPENROUTER_API_KEY")
+    refine_model = (
+        source.get("OPENROUTER_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip()
+        or DEFAULT_REFINEMENT_MODEL
+    )
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", MAX_TELEGRAM_MEDIA_MB)
     if max_video_mb > MAX_TELEGRAM_MEDIA_MB:
         raise ConfigError("MAX_VIDEO_MB must be less than or equal to Telegram's 2048 MB file limit.")
@@ -82,9 +81,8 @@ def load_settings(
         deepgram_api_key=deepgram_api_key,
         deepgram_transcribe_model=deepgram_model,
         deepgram_language=deepgram_language,
-        openai_api_key=openai_api_key,
-        openai_refine_model=refine_model,
-        gemini_api_key=gemini_api_key,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_refine_model=refine_model,
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,

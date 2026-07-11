@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -8,15 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+import requests
 from openai import OpenAI
 
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptionResult
 
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar"
-DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "gpt-4o-transcribe-diarize"
-DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "gemini-3.5-flash"
-DEFAULT_REFINEMENT_MODEL = "gpt-5.4"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
+DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "google/gemini-3.5-flash"
+DEFAULT_REFINEMENT_MODEL = "openai/gpt-5.4"
 MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
 CUE_TRANSLATION_START = "<srt_cue>"
 CUE_TRANSLATION_END = "</srt_cue>"
@@ -37,9 +40,9 @@ SRT_TRANSLATION_REQUEST = (
     "Translate the subtitle text in this single SRT cue into exactly one Persian line. "
     'Return only JSON matching {"translation": "..."}.'
 )
-SRT_CUE_TRANSLATION_TEXT_FORMAT: dict[str, object] = {
-    "format": {
-        "type": "json_schema",
+SRT_CUE_TRANSLATION_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
         "name": "srt_cue_translation",
         "strict": True,
         "schema": {
@@ -53,7 +56,7 @@ SRT_CUE_TRANSLATION_TEXT_FORMAT: dict[str, object] = {
             "required": ["translation"],
             "additionalProperties": False,
         },
-    }
+    },
 }
 
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = SRT_TRANSLATION_SYSTEM_PROMPT
@@ -139,22 +142,35 @@ class OpenAISpeechToTextProvider:
     ) -> None:
         self.provider_name = "openai"
         self.model = model
-        self.client = client if client is not None else OpenAI(api_key=api_key)
+        self.client = client if client is not None else requests.Session()
+        self.api_key = api_key
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
         del previous_transcript
-        with audio_path.open("rb") as audio_file:
-            response = self.client.audio.transcriptions.create(
-                file=audio_file,
-                model=self.model,
-                response_format="diarized_json",
-                chunking_strategy="auto",
-                temperature=0,
+        try:
+            response = self.client.post(
+                f"{OPENROUTER_BASE_URL}/audio/transcriptions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "input_audio": {
+                        "data": encode_audio_file(audio_path),
+                        "format": audio_path.suffix.lstrip(".").lower(),
+                    },
+                    "model": self.model,
+                    "temperature": 0,
+                },
+                timeout=300,
             )
-        return extract_openai_diarized_file_transcription_result(response)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise TranscriptionError("OpenRouter transcription request failed.") from exc
+        return extract_openrouter_transcription_result(response.json())
 
 
 class GeminiSpeechToTextProvider:
@@ -168,7 +184,7 @@ class GeminiSpeechToTextProvider:
     ) -> None:
         self.provider_name = "gemini"
         self.model = model
-        self.client = client if client is not None else create_gemini_client(api_key)
+        self.client = client if client is not None else create_openrouter_client(api_key)
         self.prompt = prompt
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
@@ -176,13 +192,26 @@ class GeminiSpeechToTextProvider:
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
         del previous_transcript
-        uploaded_file = self.client.files.upload(file=str(audio_path))
-        response = self.client.models.generate_content(
+        response = self.client.chat.completions.create(
             model=self.model,
-            contents=[self.prompt, uploaded_file],
-            config=create_gemini_generate_content_config(temperature=0),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self.prompt},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": encode_audio_file(audio_path),
+                                "format": audio_path.suffix.lstrip(".").lower(),
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
         )
-        srt = extract_response_text(response).strip()
+        srt = extract_chat_completion_text(response).strip()
         return parse_srt_file_transcription_result(srt, provider_name="Gemini")
 
 
@@ -197,31 +226,29 @@ class TranscriptRefiner:
     ) -> None:
         self.model = model
         self.system_prompt = system_prompt
-        self.client = client if client is not None else OpenAI(api_key=api_key)
+        self.client = client if client is not None else create_openrouter_client(api_key)
 
     def refine_transcript(self, transcript: str) -> str:
         blocks = parse_srt_blocks(transcript)
         if len(blocks) != 1:
             raise TranscriptionError("OpenAI cue translation requires exactly one SRT cue.")
-        response = self.client.responses.create(
+        response = self.client.chat.completions.create(
             model=self.model,
-            instructions=self.system_prompt,
-            input=build_refinement_input(render_srt_blocks(blocks)),
+            messages=build_refinement_messages(self.system_prompt, render_srt_blocks(blocks)),
             temperature=0,
-            text=SRT_CUE_TRANSLATION_TEXT_FORMAT,
+            response_format=SRT_CUE_TRANSLATION_RESPONSE_FORMAT,
         )
-        translation = parse_srt_cue_translation_response(extract_response_text(response))
+        translation = parse_srt_cue_translation_response(extract_chat_completion_text(response))
         return render_translated_srt_block(blocks[0], translation)
 
     def translate_srt_block(self, block: SrtBlock) -> str:
-        response = self.client.responses.create(
+        response = self.client.chat.completions.create(
             model=self.model,
-            instructions=self.system_prompt,
-            input=build_refinement_input(render_srt_blocks((block,))),
+            messages=build_refinement_messages(self.system_prompt, render_srt_blocks((block,))),
             temperature=0,
-            text=SRT_CUE_TRANSLATION_TEXT_FORMAT,
+            response_format=SRT_CUE_TRANSLATION_RESPONSE_FORMAT,
         )
-        return parse_srt_cue_translation_response(extract_response_text(response))
+        return parse_srt_cue_translation_response(extract_chat_completion_text(response))
 
 
 class SpeechTranscriber:
@@ -372,56 +399,19 @@ def create_deepgram_client(api_key: str) -> Any:
     return DeepgramClient(api_key=api_key)
 
 
-def create_gemini_client(api_key: str) -> Any:
-    try:
-        from google import genai
-    except ImportError as exc:
-        raise TranscriptionError("google-genai is required for Gemini transcription.") from exc
-    return genai.Client(api_key=api_key)
+def create_openrouter_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
 
 
-def create_gemini_generate_content_config(*, temperature: int) -> Any:
-    try:
-        from google.genai import types
-    except ImportError:
-        return {"temperature": temperature}
-    return types.GenerateContentConfig(temperature=temperature)
+def encode_audio_file(audio_path: Path) -> str:
+    return base64.b64encode(audio_path.read_bytes()).decode("ascii")
 
 
-def extract_openai_diarized_file_transcription_result(response: Any) -> FileTranscriptionResult:
-    segments = get_response_field(response, "segments")
-    if not isinstance(segments, Sequence) or isinstance(segments, (str, bytes)) or not segments:
-        raise TranscriptionError("OpenAI diarized transcription response did not include segments.")
-
-    cues = []
-    for segment in segments:
-        cue = build_subtitle_cue(
-            start=get_response_field(segment, "start"),
-            end=get_response_field(segment, "end"),
-            text=format_diarized_segment_text(
-                speaker=get_response_field(segment, "speaker"),
-                text=get_response_field(segment, "text"),
-            ),
-        )
-        if cue is not None:
-            cues.append(cue)
-
-    if not cues:
-        raise TranscriptionError("OpenAI diarized transcription response did not include usable segments.")
-    srt = render_srt(cues)
-    return FileTranscriptionResult(
-        transcript=render_line_translated_transcript_from_srt(srt).strip(),
-        subtitle_cues=tuple(cues),
-    )
-
-
-def format_diarized_segment_text(*, speaker: Any, text: Any) -> str:
+def extract_openrouter_transcription_result(response: Any) -> FileTranscriptionResult:
+    text = get_response_field(response, "text")
     if not isinstance(text, str) or not text.strip():
-        return ""
-    stripped_text = text.strip()
-    if isinstance(speaker, str) and speaker.strip():
-        return f"{speaker.strip()}: {stripped_text}"
-    return stripped_text
+        raise TranscriptionError("OpenRouter transcription response did not include text.")
+    return FileTranscriptionResult(transcript=text.strip())
 
 
 def parse_srt_file_transcription_result(srt: str, *, provider_name: str) -> FileTranscriptionResult:
@@ -710,28 +700,15 @@ def render_line_translated_transcript_from_srt(translated_srt: str) -> str:
     return "\n".join(text_lines) + ("\n" if text_lines else "")
 
 
-def extract_response_text(response: Any) -> str:
-    if isinstance(response, str):
-        return response
-    if isinstance(response, dict):
-        output_text = response.get("output_text")
-        if isinstance(output_text, str):
-            return output_text
-
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str):
-        return output_text
-
-    text = getattr(response, "text", None)
-    if isinstance(text, str):
-        return text
-
-    if isinstance(response, dict):
-        text = response.get("text")
-        if isinstance(text, str):
-            return text
-
-    raise TranscriptionError("OpenAI refinement response did not include text.")
+def extract_chat_completion_text(response: Any) -> str:
+    choices = get_response_field(response, "choices")
+    if not isinstance(choices, Sequence) or isinstance(choices, (str, bytes)) or not choices:
+        raise TranscriptionError("OpenRouter response did not include a completion choice.")
+    message = get_response_field(choices[0], "message")
+    content = get_response_field(message, "content")
+    if not isinstance(content, str) or not content.strip():
+        raise TranscriptionError("OpenRouter response did not include text.")
+    return content
 
 
 def parse_srt_cue_translation_response(response_text: str) -> str:
@@ -758,3 +735,10 @@ def normalize_persian_translation_line(translation: str) -> str:
 
 def build_refinement_input(transcript: str) -> str:
     return f"{SRT_TRANSLATION_REQUEST}\n\n{CUE_TRANSLATION_START}\n{transcript}\n{CUE_TRANSLATION_END}"
+
+
+def build_refinement_messages(system_prompt: str, transcript: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": build_refinement_input(transcript)},
+    ]

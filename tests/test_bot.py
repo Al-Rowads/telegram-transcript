@@ -94,8 +94,21 @@ class FakeMediaDownloader:
         return target_path
 
 
+def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openrouter_api_key="openrouter-key",
+        )
+    )
+
+    assert transcriber.provider_name == "gemini"
+    assert transcriber.model == "google/gemini-3.5-flash"
+
+
 def test_is_authorized_allows_everyone_without_allowlist() -> None:
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
 
     assert is_authorized(settings, user_id=123)
 
@@ -103,7 +116,7 @@ def test_is_authorized_allows_everyone_without_allowlist() -> None:
 def test_is_authorized_checks_allowlist() -> None:
     settings = Settings(
         telegram_bot_token="token",
-        openai_api_key="key",
+        openrouter_api_key="key",
         allowed_telegram_user_ids=frozenset({123}),
     )
 
@@ -259,7 +272,7 @@ async def test_handle_tempo_command_updates_runtime_tempo_in_group() -> None:
             "audio_tempo": 1.0,
             "settings": Settings(
                 telegram_bot_token="token",
-                openai_api_key="key",
+                openrouter_api_key="key",
                 allowed_telegram_user_ids=frozenset({123}),
             ),
         },
@@ -323,7 +336,7 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
             "settings": Settings(
                 telegram_bot_token="token",
                 deepgram_api_key="deepgram-key",
-                openai_api_key="openai-key",
+                openrouter_api_key="openrouter-key",
             ),
             "transcription_model": "deepgram",
         },
@@ -332,8 +345,8 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
     await handle_model_command(update, context)
 
     assert "Current transcription model: Deepgram nova-3" in message.text_replies[0]
-    assert "openai: OpenAI gpt-4o-transcribe-diarize (available)" in message.text_replies[0]
-    assert "gemini: Gemini gemini-3.5-flash (missing credentials)" in message.text_replies[0]
+    assert "openai: OpenRouter Whisper large v3 (available)" in message.text_replies[0]
+    assert "gemini: OpenRouter Gemini 3.5 Flash (available)" in message.text_replies[0]
     assert message.text_reply_kwargs == [
         {
             "reply_to_message_id": 123,
@@ -350,7 +363,7 @@ async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: py
     settings = Settings(
         telegram_bot_token="token",
         deepgram_api_key="deepgram-key",
-        gemini_api_key="gemini-key",
+        openrouter_api_key="openrouter-key",
     )
     context = SimpleNamespace(args=["gemini"], bot_data={"settings": settings})
     fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini-3.5-flash")
@@ -367,7 +380,7 @@ async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: py
     assert calls == [(settings, "gemini")]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["transcription_model"] == "gemini"
-    assert message.text_replies == ["Transcription model set to Gemini gemini-3.5-flash."]
+    assert message.text_replies == ["Transcription model set to OpenRouter Gemini 3.5 Flash."]
 
 
 @pytest.mark.asyncio
@@ -381,7 +394,7 @@ async def test_handle_model_command_rejects_missing_provider_credentials() -> No
 
     await handle_model_command(update, context)
 
-    assert message.text_replies == ["OPENAI_API_KEY is required for OpenAI transcription."]
+    assert message.text_replies == ["OPENROUTER_API_KEY is required for OpenRouter transcription."]
     assert "transcription_model" not in context.bot_data
 
 
@@ -407,7 +420,7 @@ async def test_handle_video_upload_rejects_unauthorized_user() -> None:
         bot_data={
             "settings": Settings(
                 telegram_bot_token="token",
-                openai_api_key="key",
+                openrouter_api_key="key",
                 allowed_telegram_user_ids=frozenset({123}),
             )
         }
@@ -423,7 +436,7 @@ async def test_handle_video_upload_rejects_unauthorized_user() -> None:
 async def test_handle_video_upload_ignores_private_non_video_document() -> None:
     message = FakeMessage(document=SimpleNamespace(mime_type="text/plain", file_name="notes.txt"))
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
+    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openrouter_api_key="key")})
 
     await handle_video_upload(update, context)
 
@@ -437,7 +450,7 @@ async def test_handle_video_upload_ignores_group_non_video_document() -> None:
         chat_type=ChatType.GROUP,
     )
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openai_api_key="key")})
+    context = SimpleNamespace(bot_data={"settings": Settings(telegram_bot_token="token", openrouter_api_key="key")})
 
     await handle_video_upload(update, context)
 
@@ -452,7 +465,7 @@ async def test_handle_video_upload_ignores_oversized_video() -> None:
         bot_data={
             "settings": Settings(
                 telegram_bot_token="token",
-                openai_api_key="key",
+                openrouter_api_key="key",
                 max_video_mb=10 / 1024 / 1024,
             )
         }
@@ -467,7 +480,7 @@ async def test_handle_video_upload_ignores_oversized_video() -> None:
 async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings(
         telegram_bot_token="token",
-        openai_api_key="key",
+        openrouter_api_key="key",
         max_video_mb=10 / 1024 / 1024,
     )
     attachment = SimpleNamespace(file_size=10)
@@ -568,7 +581,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     caplog.set_level("INFO", logger="telegram_transcript.bot")
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     downloader = FakeMediaDownloader()
     context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber(), "media_downloader": downloader})
 
@@ -648,7 +661,7 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -705,7 +718,7 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -746,7 +759,7 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -791,7 +804,7 @@ async def test_process_video_message_continues_when_status_edit_hits_retry_after
         retry_after = RetryAfter(timedelta(seconds=29))
     message = FakeMessage(status=FakeStatus(edit_errors=[retry_after]))
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -830,7 +843,7 @@ async def test_process_media_message_accepts_voice_note(
     voice = SimpleNamespace(file_size=5, mime_type="audio/ogg")
     message = FakeMessage(voice=voice)
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openai_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader(b"voice")}
     )
@@ -856,7 +869,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     status_ref: dict[str, object] = {"message": None}
     settings = Settings(
         telegram_bot_token="token",
-        openai_api_key="key",
+        openrouter_api_key="key",
         max_video_mb=10 / 1024 / 1024,
     )
     context = SimpleNamespace(

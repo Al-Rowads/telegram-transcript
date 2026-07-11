@@ -145,73 +145,56 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
     ]
 
 
-def test_openai_provider_uses_diarized_json_and_renders_srt_cues(tmp_path: Path) -> None:
+def test_openai_provider_uses_openrouter_transcription_endpoint(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeTranscriptions:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return
+
+        def json(self) -> dict[str, str]:
+            return {"text": "هلا شلونك"}
+
+    class FakeSession:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def create(
-            self,
-            *,
-            file: object,
-            model: str,
-            response_format: str,
-            chunking_strategy: str,
-            temperature: int,
-        ) -> object:
-            self.calls.append(
-                {
-                    "file_name": file.name,
-                    "model": model,
-                    "response_format": response_format,
-                    "chunking_strategy": chunking_strategy,
-                    "temperature": temperature,
-                }
-            )
-            return SimpleNamespace(
-                segments=[
-                    SimpleNamespace(start=0.0, end=1.25, speaker="speaker_0", text="هلا"),
-                    SimpleNamespace(start=1.25, end=2.0, speaker="speaker_1", text="شلونك"),
-                ],
-            )
+        def post(self, url: str, **kwargs: object) -> FakeResponse:
+            self.calls.append({"url": url, **kwargs})
+            return FakeResponse()
 
-    fake_transcriptions = FakeTranscriptions()
-    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
-    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
+    fake_session = FakeSession()
+    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_session)
 
     result = provider.transcribe_file_result(audio)
 
-    assert result.transcript == "speaker_0: هلا\n\nspeaker_1: شلونك"
-    assert result.subtitle_cues == (
-        SubtitleCue(0.0, 1.25, "speaker_0: هلا"),
-        SubtitleCue(1.25, 2.0, "speaker_1: شلونك"),
-    )
-    assert fake_transcriptions.calls == [
-        {
-            "file_name": str(audio),
-            "model": DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
-            "response_format": "diarized_json",
-            "chunking_strategy": "auto",
-            "temperature": 0,
-        }
-    ]
+    assert result.transcript == "هلا شلونك"
+    assert result.subtitle_cues == ()
+    assert fake_session.calls[0]["url"].endswith("/audio/transcriptions")
+    assert fake_session.calls[0]["headers"]["Authorization"] == "Bearer key"
+    assert fake_session.calls[0]["json"] == {
+        "input_audio": {"data": "YXVkaW8=", "format": "mp3"},
+        "model": DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+        "temperature": 0,
+    }
 
 
-def test_openai_provider_rejects_missing_diarized_segments(tmp_path: Path) -> None:
+def test_openai_provider_rejects_missing_text(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeTranscriptions:
-        def create(self, **_: object) -> object:
-            return SimpleNamespace(text="plain transcript")
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return
 
-    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=FakeTranscriptions()))
+        def json(self) -> dict[str, str]:
+            return {"text": ""}
+
+    fake_client = SimpleNamespace(post=lambda *args, **kwargs: FakeResponse())
     provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
 
-    with pytest.raises(TranscriptionError, match="OpenAI diarized"):
+    with pytest.raises(TranscriptionError, match="OpenRouter transcription"):
         provider.transcribe_file_result(audio)
 
 
@@ -219,22 +202,14 @@ def test_gemini_provider_requests_srt_and_parses_response(tmp_path: Path) -> Non
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeFiles:
-        def __init__(self) -> None:
-            self.uploads: list[str] = []
-
-        def upload(self, *, file: str) -> object:
-            self.uploads.append(file)
-            return SimpleNamespace(uri="uploaded-audio")
-
-    class FakeModels:
+    class FakeCompletions:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def generate_content(self, *, model: str, contents: list[object], config: object) -> object:
-            self.calls.append({"model": model, "contents": contents, "config": config})
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
             return SimpleNamespace(
-                text=(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
                     "```srt\n"
                     "1\n"
                     "00:00:00,000 --> 00:00:01,250\n"
@@ -243,12 +218,11 @@ def test_gemini_provider_requests_srt_and_parses_response(tmp_path: Path) -> Non
                     "00:00:01,250 --> 00:00:02,000\n"
                     "شلونك\n"
                     "```"
-                )
+                )))]
             )
 
-    fake_files = FakeFiles()
-    fake_models = FakeModels()
-    fake_client = SimpleNamespace(files=fake_files, models=fake_models)
+    fake_completions = FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
     provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
 
     result = provider.transcribe_file_result(audio)
@@ -258,25 +232,21 @@ def test_gemini_provider_requests_srt_and_parses_response(tmp_path: Path) -> Non
         SubtitleCue(0.0, 1.25, "هلا"),
         SubtitleCue(1.25, 2.0, "شلونك"),
     )
-    assert fake_files.uploads == [str(audio)]
-    assert fake_models.calls[0]["model"] == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
-    assert "SRT" in fake_models.calls[0]["contents"][0]
-    assert fake_models.calls[0]["contents"][1].uri == "uploaded-audio"
+    assert fake_completions.calls[0]["model"] == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+    content = fake_completions.calls[0]["messages"][0]["content"]
+    assert "SRT" in content[0]["text"]
+    assert content[1]["input_audio"] == {"data": "YXVkaW8=", "format": "mp3"}
 
 
 def test_gemini_provider_rejects_invalid_srt(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeFiles:
-        def upload(self, *, file: str) -> object:
-            return SimpleNamespace(uri=file)
+    class FakeCompletions:
+        def create(self, **_: object) -> object:
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="plain transcript"))])
 
-    class FakeModels:
-        def generate_content(self, **_: object) -> object:
-            return SimpleNamespace(text="plain transcript")
-
-    fake_client = SimpleNamespace(files=FakeFiles(), models=FakeModels())
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
 
     with pytest.raises(TranscriptionError, match="SRT"):
@@ -520,32 +490,18 @@ async def test_transcribe_chunks_async_collapses_multiline_persian_translation(
 
 
 def test_transcript_refiner_uses_structured_one_cue_translation_request() -> None:
-    class FakeResponses:
+    class FakeCompletions:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def create(
-            self,
-            *,
-            model: str,
-            instructions: str,
-            input: str,
-            temperature: int,
-            text: object,
-        ) -> object:
-            self.calls.append(
-                {
-                    "model": model,
-                    "instructions": instructions,
-                    "input": input,
-                    "temperature": temperature,
-                    "text": text,
-                }
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": "سلام"}'))]
             )
-            return SimpleNamespace(output_text='{"translation": "سلام"}')
 
-    fake_responses = FakeResponses()
-    fake_client = SimpleNamespace(responses=fake_responses)
+    fake_completions = FakeCompletions()
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=fake_completions))
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
 
     assert refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n") == (
@@ -554,20 +510,25 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
         "هاي\n"
         '<font color="green">سلام</font>\n'
     )
-    assert fake_responses.calls[0]["model"] == DEFAULT_REFINEMENT_MODEL
-    assert fake_responses.calls[0]["instructions"] == SRT_TRANSLATION_SYSTEM_PROMPT
-    assert fake_responses.calls[0]["input"] == build_refinement_input("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
-    assert fake_responses.calls[0]["temperature"] == 0
-    assert fake_responses.calls[0]["text"]["format"]["type"] == "json_schema"
-    assert fake_responses.calls[0]["text"]["format"]["strict"] is True
+    call = fake_completions.calls[0]
+    assert call["model"] == DEFAULT_REFINEMENT_MODEL
+    assert call["messages"][0] == {"role": "system", "content": SRT_TRANSLATION_SYSTEM_PROMPT}
+    assert call["messages"][1]["content"] == build_refinement_input(
+        "1\n00:00:00,000 --> 00:00:01,000\nهاي\n"
+    )
+    assert call["temperature"] == 0
+    assert call["response_format"]["type"] == "json_schema"
+    assert call["response_format"]["json_schema"]["strict"] is True
 
 
 def test_transcript_refiner_rejects_empty_translation() -> None:
-    class FakeResponses:
+    class FakeCompletions:
         def create(self, **_: object) -> object:
-            return SimpleNamespace(output_text='{"translation": " "}')
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": " "}'))]
+            )
 
-    fake_client = SimpleNamespace(responses=FakeResponses())
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
 
     with pytest.raises(TranscriptionError, match="empty"):
@@ -834,11 +795,11 @@ def test_render_line_translated_transcript_from_srt_keeps_plain_translation_text
 
 
 def test_transcript_refiner_raises_when_refinement_has_no_text() -> None:
-    class FakeResponses:
+    class FakeCompletions:
         def create(self, **_: object) -> object:
             return SimpleNamespace()
 
-    fake_client = SimpleNamespace(responses=FakeResponses())
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
-    with pytest.raises(TranscriptionError, match="refinement response"):
+    with pytest.raises(TranscriptionError, match="completion choice"):
         refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
