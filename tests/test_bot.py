@@ -17,6 +17,7 @@ from telegram_transcript.bot import (
     get_media_attachment_basename,
     get_video_attachment,
     handle_model_command,
+    handle_translation_model_command,
     handle_non_video,
     handle_tempo_command,
     handle_video_upload,
@@ -105,6 +106,28 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
 
     assert transcriber.provider_name == "gemini"
     assert transcriber.model == "google/gemini-3.5-flash"
+
+
+@pytest.mark.parametrize(
+    "translation_model",
+    [
+        "google/gemini-3.5-flash",
+        "openai/gpt-5.5",
+        "anthropic/claude-sonnet-4.6",
+    ],
+)
+def test_create_transcriber_uses_selected_translation_model(translation_model: str) -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openrouter_api_key="openrouter-key",
+            refine=True,
+        ),
+        translation_model=translation_model,
+    )
+
+    assert transcriber.refinement_model == translation_model
 
 
 def test_is_authorized_allows_everyone_without_allowlist() -> None:
@@ -365,19 +388,29 @@ async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: py
         deepgram_api_key="deepgram-key",
         openrouter_api_key="openrouter-key",
     )
-    context = SimpleNamespace(args=["gemini"], bot_data={"settings": settings})
+    context = SimpleNamespace(
+        args=["gemini"],
+        bot_data={
+            "settings": settings,
+            "translation_model": "anthropic/claude-sonnet-4.6",
+        },
+    )
     fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini-3.5-flash")
-    calls: list[tuple[Settings, str]] = []
+    calls: list[tuple[Settings, str, str | None]] = []
 
-    def fake_create_transcriber(settings_arg: Settings, model_key: str) -> object:
-        calls.append((settings_arg, model_key))
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+    ) -> object:
+        calls.append((settings_arg, model_key, translation_model))
         return fake_transcriber
 
     monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
 
     await handle_model_command(update, context)
 
-    assert calls == [(settings, "gemini")]
+    assert calls == [(settings, "gemini", "anthropic/claude-sonnet-4.6")]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["transcription_model"] == "gemini"
     assert message.text_replies == ["Transcription model set to OpenRouter Gemini 3.5 Flash."]
@@ -410,6 +443,148 @@ async def test_handle_model_command_rejects_unknown_model() -> None:
     await handle_model_command(update, context)
 
     assert message.text_replies == ["Unknown transcription model. Available models: deepgram, openai, gemini."]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_model_command_lists_current_models_and_refine_status() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openrouter_api_key="openrouter-key",
+                refine=True,
+            ),
+            "translation_model": "google/gemini-3.5-flash",
+        },
+    )
+
+    await handle_translation_model_command(update, context)
+
+    reply = message.text_replies[0]
+    assert "Current translation model: OpenRouter Gemini 3.5 Flash" in reply
+    assert "Translation: enabled" in reply
+    assert "gpt: OpenRouter GPT-5.5" in reply
+    assert "claude: OpenRouter Claude Sonnet 4.6" in reply
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 123,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 8,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_model_command_reports_when_refine_is_disabled() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": Settings(telegram_bot_token="token", openrouter_api_key="openrouter-key"),
+        },
+    )
+
+    await handle_translation_model_command(update, context)
+
+    assert "Translation: disabled (REFINE=false)" in message.text_replies[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("argument", "expected_model", "expected_label"),
+    [
+        ("gemini", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
+        ("openai/gpt-5.5", "openai/gpt-5.5", "OpenRouter GPT-5.5"),
+        ("claude", "anthropic/claude-sonnet-4.6", "OpenRouter Claude Sonnet 4.6"),
+    ],
+)
+async def test_handle_translation_model_command_switches_model_and_preserves_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+    argument: str,
+    expected_model: str,
+    expected_label: str,
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openrouter_api_key="openrouter-key",
+        refine=True,
+    )
+    context = SimpleNamespace(
+        args=[argument],
+        bot_data={"settings": settings, "transcription_model": "deepgram"},
+    )
+    fake_transcriber = SimpleNamespace(provider_name="deepgram", model="nova-3")
+    calls: list[tuple[Settings, str, str | None]] = []
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+    ) -> object:
+        calls.append((settings_arg, model_key, translation_model))
+        return fake_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+
+    await handle_translation_model_command(update, context)
+
+    assert calls == [(settings, "deepgram", expected_model)]
+    assert context.bot_data["transcriber"] is fake_transcriber
+    assert context.bot_data["translation_model"] == expected_model
+    assert message.text_replies == [f"Translation model set to {expected_label}."]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_model_command_rejects_unknown_model() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=["unknown"],
+        bot_data={"settings": Settings(telegram_bot_token="token", openrouter_api_key="key")},
+    )
+
+    await handle_translation_model_command(update, context)
+
+    assert message.text_replies == ["Unknown translation model. Available models: gemini, gpt, claude."]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_model_command_rejects_unauthorized_user() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
+    context = SimpleNamespace(
+        args=["gpt"],
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openrouter_api_key="key",
+                allowed_telegram_user_ids=frozenset({123}),
+            )
+        },
+    )
+
+    await handle_translation_model_command(update, context)
+
+    assert message.text_replies == ["Sorry, this bot is not enabled for your Telegram account."]
+    assert "translation_model" not in context.bot_data
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_model_command_ignores_channels() -> None:
+    message = FakeMessage(chat_type=ChatType.CHANNEL)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(args=["gpt"], bot_data={})
+
+    await handle_translation_model_command(update, context)
+
+    assert message.text_replies == []
 
 
 @pytest.mark.asyncio

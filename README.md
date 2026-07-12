@@ -13,6 +13,7 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to the selected provider.
 - Uses OpenRouter `google/gemini-3.5-flash` for speech-to-text by default.
 - Supports runtime transcription model selection with `/model`: OpenRouter Gemini 3.5 Flash, OpenRouter `openai/whisper-large-v3`, or direct Deepgram Nova-3 as a manual fallback.
+- Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
 - Optionally translates each SRT cue to exactly one Persian line and derives a line-by-line Arabic/Persian transcript from the translated SRT.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
@@ -39,7 +40,7 @@ Optional variables:
 
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to `ar`.
-- `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.4`.
+- `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.5`.
 - `REFINE`: set to `true` to run OpenAI SRT translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
@@ -80,6 +81,8 @@ Add the bot to a group or supergroup to transcribe videos posted there. The bot 
 Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
 
 Use `/model` to show the active transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to switch transcription for future media. The selected model is runtime-only and resets to Gemini 3.5 Flash after restart.
+
+Use `/tmodel` to show the active translation model and whether translation is enabled. Use `/tmodel gemini`, `/tmodel gpt`, or `/tmodel claude` to switch translation for future media. The selected model is shared by the bot process and resets to `OPENROUTER_REFINE_MODEL` after restart. Selecting a model does not enable translation when `REFINE=false`.
 
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 

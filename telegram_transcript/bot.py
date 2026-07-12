@@ -24,9 +24,11 @@ from telegram_transcript.telegram_utils import (
 )
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
 from telegram_transcript.transcriber import (
+    CLAUDE_SONNET_TRANSLATION_MODEL,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+    DEFAULT_REFINEMENT_MODEL,
     DeepgramSpeechToTextProvider,
     GeminiSpeechToTextProvider,
     OpenAISpeechToTextProvider,
@@ -65,6 +67,13 @@ class TranscriptionModelOption:
     label: str
 
 
+@dataclass(frozen=True)
+class TranslationModelOption:
+    key: str
+    model: str
+    label: str
+
+
 TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
     "deepgram": TranscriptionModelOption(
         key="deepgram",
@@ -93,10 +102,35 @@ TRANSCRIPTION_MODEL_ALIASES = {
     for option in TRANSCRIPTION_MODEL_OPTIONS.values()
 }
 
+TRANSLATION_MODEL_OPTIONS: dict[str, TranslationModelOption] = {
+    "gemini": TranslationModelOption(
+        key="gemini",
+        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        label="OpenRouter Gemini 3.5 Flash",
+    ),
+    "gpt": TranslationModelOption(
+        key="gpt",
+        model=DEFAULT_REFINEMENT_MODEL,
+        label="OpenRouter GPT-5.5",
+    ),
+    "claude": TranslationModelOption(
+        key="claude",
+        model=CLAUDE_SONNET_TRANSLATION_MODEL,
+        label="OpenRouter Claude Sonnet 4.6",
+    ),
+}
+TRANSLATION_MODEL_ALIASES = {
+    option.key: option.key
+    for option in TRANSLATION_MODEL_OPTIONS.values()
+} | {
+    option.model: option.key
+    for option in TRANSLATION_MODEL_OPTIONS.values()
+}
+
 
 def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
-    transcriber = create_transcriber(settings)
+    transcriber = create_transcriber(settings, translation_model=settings.openrouter_refine_model)
 
     app = (
         Application.builder()
@@ -108,6 +142,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
     app.bot_data["transcription_model"] = DEFAULT_TRANSCRIPTION_MODEL_KEY
+    app.bot_data["translation_model"] = settings.openrouter_refine_model
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
     app.bot_data["audio_tempo"] = settings.audio_tempo
 
@@ -115,6 +150,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(CommandHandler("model", handle_model_command))
+    app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
     app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_media))
     return app
@@ -123,13 +159,14 @@ def create_application(settings: Settings | None = None) -> Application:
 def create_transcriber(
     settings: Settings,
     model_key: str = DEFAULT_TRANSCRIPTION_MODEL_KEY,
+    translation_model: str | None = None,
 ) -> SpeechTranscriber:
     speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
 
     refiner = (
         TranscriptRefiner(
             api_key=settings.openrouter_api_key,
-            model=settings.openrouter_refine_model,
+            model=translation_model or settings.openrouter_refine_model,
         )
         if settings.refine
         else None
@@ -237,7 +274,11 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        transcriber = create_transcriber(settings, model_key)
+        transcriber = create_transcriber(
+            settings,
+            model_key,
+            translation_model=get_runtime_translation_model(context, settings),
+        )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
         return
@@ -245,6 +286,46 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
     context.bot_data["transcriber"] = transcriber
     context.bot_data["transcription_model"] = model_key
     await reply_to_source(message, f"Transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
+
+
+async def handle_translation_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+
+    args = getattr(context, "args", None)
+    if not isinstance(args, list) or not args:
+        await reply_to_source(message, format_translation_model_settings_message(context, settings))
+        return
+    if len(args) != 1:
+        await reply_to_source(message, format_unknown_translation_model_message())
+        return
+
+    model_key = parse_translation_model_command_arg(args[0])
+    if model_key is None:
+        await reply_to_source(message, format_unknown_translation_model_message())
+        return
+
+    option = TRANSLATION_MODEL_OPTIONS[model_key]
+    try:
+        transcriber = create_transcriber(
+            settings,
+            get_runtime_model_key(context),
+            translation_model=option.model,
+        )
+    except ConfigError as exc:
+        await reply_to_source(message, str(exc))
+        return
+
+    context.bot_data["transcriber"] = transcriber
+    context.bot_data["translation_model"] = option.model
+    await reply_to_source(message, f"Translation model set to {option.label}.")
 
 
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,6 +351,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     audio_tempo = get_runtime_audio_tempo(context, settings)
     provider_name, model_name = get_runtime_transcriber_info(context, settings)
+    translation_model = get_runtime_translation_model(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
@@ -280,7 +362,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         provider_name,
         model_name,
         settings.refine,
-        settings.openrouter_refine_model,
+        translation_model,
     )
 
     semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
@@ -637,11 +719,24 @@ def parse_model_command_arg(raw: object) -> str | None:
     return TRANSCRIPTION_MODEL_ALIASES.get(raw.strip().lower())
 
 
+def parse_translation_model_command_arg(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return TRANSLATION_MODEL_ALIASES.get(raw.strip().lower())
+
+
 def get_runtime_model_key(context: ContextTypes.DEFAULT_TYPE) -> str:
     candidate = context.bot_data.get("transcription_model", DEFAULT_TRANSCRIPTION_MODEL_KEY)
     if isinstance(candidate, str) and candidate in TRANSCRIPTION_MODEL_OPTIONS:
         return candidate
     return DEFAULT_TRANSCRIPTION_MODEL_KEY
+
+
+def get_runtime_translation_model(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
+    candidate = context.bot_data.get("translation_model", settings.openrouter_refine_model)
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return settings.openrouter_refine_model
 
 
 def get_runtime_transcriber_info(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> tuple[str, str]:
@@ -672,6 +767,30 @@ def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: 
 def format_unknown_model_message() -> str:
     options = ", ".join(option.key for option in TRANSCRIPTION_MODEL_OPTIONS.values())
     return f"Unknown transcription model. Available models: {options}."
+
+
+def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
+    current_model = get_runtime_translation_model(context, settings)
+    current_label = next(
+        (option.label for option in TRANSLATION_MODEL_OPTIONS.values() if option.model == current_model),
+        current_model,
+    )
+    lines = [
+        f"Current translation model: {current_label}",
+        f"Translation: {'enabled' if settings.refine else 'disabled (REFINE=false)'}",
+        "",
+        "Available models:",
+    ]
+    for option in TRANSLATION_MODEL_OPTIONS.values():
+        lines.append(f"- {option.key}: {option.label}")
+    lines.append("")
+    lines.append("Use /tmodel gemini, /tmodel gpt, or /tmodel claude.")
+    return "\n".join(lines)
+
+
+def format_unknown_translation_model_message() -> str:
+    options = ", ".join(option.key for option in TRANSLATION_MODEL_OPTIONS.values())
+    return f"Unknown translation model. Available models: {options}."
 
 
 def is_model_option_configured(option: TranscriptionModelOption, settings: Settings) -> bool:
