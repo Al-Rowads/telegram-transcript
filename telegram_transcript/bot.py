@@ -11,7 +11,7 @@ from pathlib import Path
 
 from telegram import Audio, Document, InputFile, Message, Update, Video, Voice
 from telegram.constants import ChatType
-from telegram.error import RetryAfter
+from telegram.error import RetryAfter, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
@@ -60,6 +60,16 @@ GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 DEFAULT_OUTPUT_BASENAME = "transcript"
 DEFAULT_TRANSCRIPTION_MODEL_KEY = "gemini"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
+HELP_MESSAGE_DELETE_DELAY_SECONDS = 20.0
+HELP_MESSAGE = """Available commands:
+/help - Show this help message (deleted after 20 seconds).
+/start - Start the bot (currently no additional setup is required).
+/tempo <0.5-2.0> - Set audio tempo for future media (groups only).
+/model [deepgram|openai|gemini] - Show or select the transcription model.
+/tmodel [gemini|gpt|claude] - Show or select the translation model.
+/translation [normal|v2] - Show or select the translation prompt.
+
+Send a video, audio file, or voice note to create a transcript."""
 
 
 @dataclass(frozen=True)
@@ -259,7 +269,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    return
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    help_message = await reply_to_source(message, HELP_MESSAGE)
+    context.application.create_task(
+        delete_message_after_delay(help_message, HELP_MESSAGE_DELETE_DELAY_SECONDS),
+        update=update,
+        name="delete-help-message",
+    )
+
+
+async def delete_message_after_delay(message: Message, delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+    try:
+        await message.delete()
+    except TelegramError as exc:
+        logger.warning("Unable to delete help message: %s", exc)
 
 
 async def handle_non_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

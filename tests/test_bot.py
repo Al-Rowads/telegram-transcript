@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from telegram.constants import ChatType
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
@@ -16,6 +16,7 @@ from telegram_transcript.bot import (
     get_media_attachment,
     get_media_attachment_basename,
     get_video_attachment,
+    help_command,
     handle_model_command,
     handle_translation_model_command,
     handle_translation_prompt_command,
@@ -78,11 +79,15 @@ class FakeStatus:
     def __init__(self, edit_errors: list[BaseException] | None = None) -> None:
         self.edits: list[str] = []
         self.edit_errors = edit_errors or []
+        self.delete_calls = 0
 
     async def edit_text(self, text: str) -> None:
         if self.edit_errors:
             raise self.edit_errors.pop(0)
         self.edits.append(text)
+
+    async def delete(self) -> None:
+        self.delete_calls += 1
 
 
 class FakeMediaDownloader:
@@ -202,6 +207,61 @@ def test_get_media_attachment_basename_falls_back_without_file_name() -> None:
 
 def test_get_media_attachment_basename_falls_back_for_blank_stem() -> None:
     assert get_media_attachment_basename(SimpleNamespace(file_name="  .mp4")) == "transcript"
+
+
+@pytest.mark.asyncio
+async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message)
+    scheduled: list[tuple[object, object, str]] = []
+
+    async def skip_sleep(delay_seconds: float) -> None:
+        assert delay_seconds == bot_module.HELP_MESSAGE_DELETE_DELAY_SECONDS
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+
+    def create_task(coroutine: object, *, update: object, name: str) -> None:
+        scheduled.append((coroutine, update, name))
+
+    context = SimpleNamespace(application=SimpleNamespace(create_task=create_task))
+
+    await help_command(update, context)
+
+    reply = message.text_replies[0]
+    assert "/help - Show this help message" in reply
+    assert "/tempo <0.5-2.0>" in reply
+    assert "/model [deepgram|openai|gemini]" in reply
+    assert "/tmodel [gemini|gpt|claude]" in reply
+    assert "/translation [normal|v2]" in reply
+    assert message.text_reply_kwargs == [
+        {
+            "reply_to_message_id": 123,
+            "allow_sending_without_reply": True,
+            "message_thread_id": 8,
+        }
+    ]
+    assert scheduled[0][1:] == (update, "delete-help-message")
+
+    await scheduled[0][0]
+    assert message.status_replies[0].delete_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_message_after_delay_ignores_telegram_deletion_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def skip_sleep(delay_seconds: float) -> None:
+        assert delay_seconds == bot_module.HELP_MESSAGE_DELETE_DELAY_SECONDS
+
+    class UndeletableMessage:
+        async def delete(self) -> None:
+            raise BadRequest("message already deleted")
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+
+    await bot_module.delete_message_after_delay(
+        UndeletableMessage(), bot_module.HELP_MESSAGE_DELETE_DELAY_SECONDS
+    )
 
 
 @pytest.mark.asyncio
