@@ -19,6 +19,7 @@ from telegram_transcript.transcriber import (
     CUE_TRANSLATION_START,
     SRT_TRANSLATION_REQUEST,
     SRT_TRANSLATION_SYSTEM_PROMPT,
+    SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
     SpeechTranscriber,
     TranscriptRefiner,
     TranscriptionError,
@@ -295,7 +296,7 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         def __init__(self) -> None:
             self.calls: list[object] = []
 
-        def translate_srt_block(self, block: object) -> str:
+        def translate_srt_block(self, block: object, previous_context: object = ()) -> str:
             self.calls.append(block)
             return "اول" if getattr(block, "index") == "1" else "دوم"
 
@@ -392,7 +393,7 @@ async def test_transcribe_chunks_async_translates_each_srt_cue(
         def __init__(self) -> None:
             self.calls: list[object] = []
 
-        def translate_srt_block(self, block: object) -> str:
+        def translate_srt_block(self, block: object, previous_context: object = ()) -> str:
             self.calls.append(block)
             return f"ترجمه {getattr(block, 'index')}"
 
@@ -465,7 +466,7 @@ async def test_transcribe_chunks_async_collapses_multiline_persian_translation(
     class FakeRefiner:
         model = DEFAULT_REFINEMENT_MODEL
 
-        def translate_srt_block(self, block: object) -> str:
+        def translate_srt_block(self, block: object, previous_context: object = ()) -> str:
             return "ترجمه خط اول\nترجمه   خط دوم"
 
     transcriber = SpeechTranscriber(
@@ -519,6 +520,44 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
     assert call["temperature"] == 0
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["strict"] is True
+
+
+def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": "هفتم"}'))]
+            )
+
+    completions = FakeCompletions()
+    refiner = TranscriptRefiner(
+        api_key="key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+        system_prompt=SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
+        prompt_key="v2",
+    )
+    blocks = tuple(
+        parse_srt_blocks(f"{index}\n00:00:0{index},000 --> 00:00:0{index},500\nArabic {index}\n")[0]
+        for index in range(1, 8)
+    )
+
+    refiner.translate_srt_block(
+        blocks[-1],
+        tuple((block, f"Persian {block.index}") for block in blocks[1:6]),
+    )
+
+    messages = completions.calls[0]["messages"]
+    assert messages[0]["content"] == SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT
+    user_content = messages[1]["content"]
+    assert "Arabic 1" not in user_content
+    for index in range(2, 7):
+        assert f"Arabic {index}" in user_content
+        assert f"Persian {index}" in user_content
+    assert "Arabic 7" in user_content
 
 
 def test_transcript_refiner_rejects_empty_translation() -> None:

@@ -22,6 +22,7 @@ DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "google/gemini-3.5-flash"
 DEFAULT_REFINEMENT_MODEL = "openai/gpt-5.5"
 CLAUDE_SONNET_TRANSLATION_MODEL = "anthropic/claude-sonnet-4.6"
 MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
+MAX_TRANSLATION_CONTEXT_CUES = 5
 CUE_TRANSLATION_START = "<srt_cue>"
 CUE_TRANSLATION_END = "</srt_cue>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
@@ -36,6 +37,26 @@ Rules:
 - Do not return cue numbers, timestamps, source text, XML, HTML, Markdown, notes, or extra keys.
 - Keep names, numbers, brands, and technical terms accurate.
 - Preserve meaning naturally in Persian."""
+
+SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
+
+You will receive one numbered SRT subtitle cue. Translate the text use Context from previous text lines, to have accurate translation with correct Persian meaning.
+Doesn't need to be line by line translation, translate with accuracy, and make correctness of translation in priority, NOT exactly word by word into Persian.
+you may include translation of pervious Arabic line in the next line to preserve translation cohesion.
+Make translation cohesion top priority.
+
+Rules:
+- Return exactly one JSON object with a single "translation" string.
+- The translation string must be one Persian line with no newline characters.
+- Do not return cue numbers, timestamps, source text, XML, HTML, Markdown, notes, or extra keys.
+- Keep names, numbers, brands, and technical terms accurate.
+- Preserve meaning naturally in Persian."""
+
+TRANSLATION_PROMPT_OPTIONS = {
+    "normal": SRT_TRANSLATION_SYSTEM_PROMPT,
+    "v2": SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
+}
+DEFAULT_TRANSLATION_PROMPT_KEY = "normal"
 
 SRT_TRANSLATION_REQUEST = (
     "Translate the subtitle text in this single SRT cue into exactly one Persian line. "
@@ -223,10 +244,12 @@ class TranscriptRefiner:
         api_key: str,
         model: str = DEFAULT_REFINEMENT_MODEL,
         system_prompt: str = SRT_TRANSLATION_SYSTEM_PROMPT,
+        prompt_key: str = DEFAULT_TRANSLATION_PROMPT_KEY,
         client: Any | None = None,
     ) -> None:
         self.model = model
         self.system_prompt = system_prompt
+        self.prompt_key = prompt_key
         self.client = client if client is not None else create_openrouter_client(api_key)
 
     def refine_transcript(self, transcript: str) -> str:
@@ -242,10 +265,18 @@ class TranscriptRefiner:
         translation = parse_srt_cue_translation_response(extract_chat_completion_text(response))
         return render_translated_srt_block(blocks[0], translation)
 
-    def translate_srt_block(self, block: SrtBlock) -> str:
+    def translate_srt_block(
+        self,
+        block: SrtBlock,
+        previous_context: Sequence[tuple[SrtBlock, str]] = (),
+    ) -> str:
         response = self.client.chat.completions.create(
             model=self.model,
-            messages=build_refinement_messages(self.system_prompt, render_srt_blocks((block,))),
+            messages=build_refinement_messages(
+                self.system_prompt,
+                render_srt_blocks((block,)),
+                previous_context=previous_context if self.prompt_key == "v2" else (),
+            ),
             temperature=0,
             response_format=SRT_CUE_TRANSLATION_RESPONSE_FORMAT,
         )
@@ -360,6 +391,7 @@ class SpeechTranscriber:
 
         raw_srt_blocks = parse_srt_blocks(render_srt(subtitle_cues))
         translated_blocks = []
+        translation_context: list[tuple[SrtBlock, str]] = []
         for index, raw_srt_block in enumerate(raw_srt_blocks, start=1):
             if progress_callback is not None:
                 await progress_callback(
@@ -372,8 +404,13 @@ class SpeechTranscriber:
                         "model": self.refiner.model,
                     },
                 )
-            translation = await asyncio.to_thread(self.refiner.translate_srt_block, raw_srt_block)
+            translation = await asyncio.to_thread(
+                self.refiner.translate_srt_block,
+                raw_srt_block,
+                tuple(translation_context[-MAX_TRANSLATION_CONTEXT_CUES:]),
+            )
             translated_blocks.append(render_translated_srt_block(raw_srt_block, translation))
+            translation_context.append((raw_srt_block, translation))
         translated_srt = join_translated_srt_chunks(translated_blocks)
         line_translated_transcript = render_line_translated_transcript_from_srt(translated_srt)
         if progress_callback is not None:
@@ -734,12 +771,32 @@ def normalize_persian_translation_line(translation: str) -> str:
     return " ".join(translation.strip().split())
 
 
-def build_refinement_input(transcript: str) -> str:
-    return f"{SRT_TRANSLATION_REQUEST}\n\n{CUE_TRANSLATION_START}\n{transcript}\n{CUE_TRANSLATION_END}"
+def build_refinement_input(
+    transcript: str,
+    *,
+    previous_context: Sequence[tuple[SrtBlock, str]] = (),
+) -> str:
+    context = ""
+    if previous_context:
+        rendered_context = []
+        for block, translation in previous_context:
+            rendered_context.append(
+                f"Arabic cue:\n{render_srt_blocks((block,)).strip()}\nPersian translation: {translation}"
+            )
+        context = "<previous_context>\n" + "\n\n".join(rendered_context) + "\n</previous_context>\n\n"
+    return (
+        f"{SRT_TRANSLATION_REQUEST}\n\n{context}"
+        f"{CUE_TRANSLATION_START}\n{transcript}\n{CUE_TRANSLATION_END}"
+    )
 
 
-def build_refinement_messages(system_prompt: str, transcript: str) -> list[dict[str, str]]:
+def build_refinement_messages(
+    system_prompt: str,
+    transcript: str,
+    *,
+    previous_context: Sequence[tuple[SrtBlock, str]] = (),
+) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": build_refinement_input(transcript)},
+        {"role": "user", "content": build_refinement_input(transcript, previous_context=previous_context)},
     ]

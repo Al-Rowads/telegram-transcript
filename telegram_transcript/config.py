@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -35,6 +36,7 @@ class Settings:
     max_video_mb: float = MAX_TELEGRAM_MEDIA_MB
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
+    runtime_state_path: Path = Path("data/runtime-settings.json")
 
     @property
     def max_video_bytes(self) -> int:
@@ -92,6 +94,10 @@ def load_settings(
             "MAX_CONCURRENT_JOBS",
             1,
         ),
+        runtime_state_path=Path(
+            source.get("RUNTIME_STATE_PATH", "data/runtime-settings.json").strip()
+            or "data/runtime-settings.json"
+        ).expanduser(),
     )
 
 

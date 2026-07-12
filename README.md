@@ -14,6 +14,8 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Uses OpenRouter `google/gemini-3.5-flash` for speech-to-text by default.
 - Supports runtime transcription model selection with `/model`: OpenRouter Gemini 3.5 Flash, OpenRouter `openai/whisper-large-v3`, or direct Deepgram Nova-3 as a manual fallback.
 - Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
+- Supports `/translation normal` and `/translation v2` to select literal or context-aware translation behavior.
+- Persists successful command selections across bot and container restarts.
 - Optionally translates each SRT cue to exactly one Persian line and derives a line-by-line Arabic/Persian transcript from the translated SRT.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
@@ -46,6 +48,7 @@ Optional variables:
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
 - `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
+- `RUNTIME_STATE_PATH`: JSON file used for durable bot-wide command settings. Defaults to `data/runtime-settings.json`.
 
 ## Run Locally
 
@@ -78,11 +81,15 @@ No ports are exposed because the bot uses long polling.
 
 Add the bot to a group or supergroup to transcribe videos posted there. The bot replies to the original video message so the sender and thread stay clear.
 
-Use `/tempo 1.2` in a group or supergroup to change the runtime audio tempo for future videos. Valid values are from `0.5` to `2.0`; the value resets to `AUDIO_TEMPO` after restart.
+Use `/tempo 1.2` in a group or supergroup to change the audio tempo for future videos. Valid values are from `0.5` to `2.0`.
 
-Use `/model` to show the active transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to switch transcription for future media. The selected model is runtime-only and resets to Gemini 3.5 Flash after restart.
+Use `/model` to show the active transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to switch transcription for future media.
 
-Use `/tmodel` to show the active translation model and whether translation is enabled. Use `/tmodel gemini`, `/tmodel gpt`, or `/tmodel claude` to switch translation for future media. The selected model is shared by the bot process and resets to `OPENROUTER_REFINE_MODEL` after restart. Selecting a model does not enable translation when `REFINE=false`.
+Use `/tmodel` to show the active translation model and whether translation is enabled. Use `/tmodel gemini`, `/tmodel gpt`, or `/tmodel claude` to switch translation for future media. Selecting a model does not enable translation when `REFINE=false`.
+
+Use `/translation` to show the active translation prompt. Use `/translation normal` for isolated, faithful cue translation or `/translation v2` for cohesive translation using the five preceding Arabic cues and their completed Persian translations.
+
+Successful `/tempo`, `/model`, `/tmodel`, and `/translation` changes are bot-wide and written atomically to `RUNTIME_STATE_PATH`. Docker Compose mounts `/app/data` as a named volume so selections survive container recreation.
 
 If the bot should process ordinary group video messages without being mentioned or replied to, disable privacy mode for the bot in BotFather.
 

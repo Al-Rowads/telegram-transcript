@@ -12,6 +12,9 @@ WORKDIR /app
 
 RUN useradd --create-home --shell /usr/sbin/nologin appuser
 
+RUN mkdir -p /app/data \
+    && chown appuser:appuser /app/data
+
 COPY pyproject.toml README.md ./
 COPY telegram_transcript ./telegram_transcript
 

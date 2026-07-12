@@ -18,6 +18,7 @@ from telegram_transcript.bot import (
     get_video_attachment,
     handle_model_command,
     handle_translation_model_command,
+    handle_translation_prompt_command,
     handle_non_video,
     handle_tempo_command,
     handle_video_upload,
@@ -286,7 +287,7 @@ async def test_handle_non_video_ignores_private_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_handle_tempo_command_updates_runtime_tempo_in_group() -> None:
+async def test_handle_tempo_command_updates_runtime_tempo_in_group(tmp_path: Path) -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
     context = SimpleNamespace(
@@ -297,13 +298,18 @@ async def test_handle_tempo_command_updates_runtime_tempo_in_group() -> None:
                 telegram_bot_token="token",
                 openrouter_api_key="key",
                 allowed_telegram_user_ids=frozenset({123}),
+                runtime_state_path=tmp_path / "runtime.json",
             ),
         },
+    )
+    context.bot_data["runtime_preferences_store"] = bot_module.create_runtime_preferences_store(
+        context.bot_data["settings"]
     )
 
     await handle_tempo_command(update, context)
 
     assert context.bot_data["audio_tempo"] == 1.2
+    assert context.bot_data["runtime_preferences_store"].load().audio_tempo == 1.2
     assert message.text_replies == ["Tempo set to 1.2x."]
     assert message.text_reply_kwargs == [
         {
@@ -350,6 +356,37 @@ async def test_handle_tempo_command_ignores_invalid_values(args: list[str]) -> N
 
 
 @pytest.mark.asyncio
+async def test_handle_tempo_command_keeps_memory_unchanged_when_persistence_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    message = FakeMessage(chat_type=ChatType.GROUP)
+    update = SimpleNamespace(effective_message=message)
+    settings = Settings(
+        telegram_bot_token="token",
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    store = bot_module.create_runtime_preferences_store(settings)
+
+    def fail_save(preferences: object) -> None:
+        raise bot_module.RuntimeStateError("Unable to save runtime settings.")
+
+    monkeypatch.setattr(store, "save", fail_save)
+    context = SimpleNamespace(
+        args=["1.2"],
+        bot_data={
+            "audio_tempo": 1.0,
+            "settings": settings,
+            "runtime_preferences_store": store,
+        },
+    )
+
+    await handle_tempo_command(update, context)
+
+    assert context.bot_data["audio_tempo"] == 1.0
+    assert message.text_replies == ["Unable to save runtime settings."]
+
+
+@pytest.mark.asyncio
 async def test_handle_model_command_lists_current_and_available_models() -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
@@ -380,19 +417,23 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
 
 
 @pytest.mark.asyncio
-async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_handle_model_command_switches_runtime_transcriber(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     settings = Settings(
         telegram_bot_token="token",
         deepgram_api_key="deepgram-key",
         openrouter_api_key="openrouter-key",
+        runtime_state_path=tmp_path / "runtime.json",
     )
     context = SimpleNamespace(
         args=["gemini"],
         bot_data={
             "settings": settings,
             "translation_model": "anthropic/claude-sonnet-4.6",
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
     fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini-3.5-flash")
@@ -402,6 +443,7 @@ async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: py
         settings_arg: Settings,
         model_key: str,
         translation_model: str | None = None,
+        translation_prompt: str = "normal",
     ) -> object:
         calls.append((settings_arg, model_key, translation_model))
         return fake_transcriber
@@ -413,6 +455,7 @@ async def test_handle_model_command_switches_runtime_transcriber(monkeypatch: py
     assert calls == [(settings, "gemini", "anthropic/claude-sonnet-4.6")]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["transcription_model"] == "gemini"
+    assert context.bot_data["runtime_preferences_store"].load().transcription_model == "gemini"
     assert message.text_replies == ["Transcription model set to OpenRouter Gemini 3.5 Flash."]
 
 
@@ -504,6 +547,7 @@ async def test_handle_translation_model_command_reports_when_refine_is_disabled(
 )
 async def test_handle_translation_model_command_switches_model_and_preserves_transcription(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     argument: str,
     expected_model: str,
     expected_label: str,
@@ -515,10 +559,15 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
         deepgram_api_key="deepgram-key",
         openrouter_api_key="openrouter-key",
         refine=True,
+        runtime_state_path=tmp_path / "runtime.json",
     )
     context = SimpleNamespace(
         args=[argument],
-        bot_data={"settings": settings, "transcription_model": "deepgram"},
+        bot_data={
+            "settings": settings,
+            "transcription_model": "deepgram",
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
+        },
     )
     fake_transcriber = SimpleNamespace(provider_name="deepgram", model="nova-3")
     calls: list[tuple[Settings, str, str | None]] = []
@@ -527,6 +576,7 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
         settings_arg: Settings,
         model_key: str,
         translation_model: str | None = None,
+        translation_prompt: str = "normal",
     ) -> object:
         calls.append((settings_arg, model_key, translation_model))
         return fake_transcriber
@@ -538,6 +588,7 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
     assert calls == [(settings, "deepgram", expected_model)]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["translation_model"] == expected_model
+    assert context.bot_data["runtime_preferences_store"].load().translation_model == expected_model
     assert message.text_replies == [f"Translation model set to {expected_label}."]
 
 
@@ -585,6 +636,84 @@ async def test_handle_translation_model_command_ignores_channels() -> None:
     await handle_translation_model_command(update, context)
 
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_prompt_command_lists_and_switches_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openrouter_api_key="openrouter-key",
+        refine=True,
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    store = bot_module.create_runtime_preferences_store(settings)
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": settings,
+            "translation_prompt": "normal",
+            "runtime_preferences_store": store,
+        },
+    )
+
+    await handle_translation_prompt_command(update, context)
+    assert "Current translation prompt: normal" in message.text_replies[-1]
+
+    fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+    calls: list[tuple[str, str, str]] = []
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+        translation_prompt: str = "normal",
+    ) -> object:
+        calls.append((model_key, translation_model or "", translation_prompt))
+        return fake_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+    context.args = ["v2"]
+    await handle_translation_prompt_command(update, context)
+
+    assert calls == [("gemini", "openai/gpt-5.5", "v2")]
+    assert context.bot_data["translation_prompt"] == "v2"
+    assert context.bot_data["transcriber"] is fake_transcriber
+    assert store.load().translation_prompt == "v2"
+    assert message.text_replies[-1] == "Translation prompt set to v2."
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_prompt_command_rejects_invalid_and_unauthorized(tmp_path: Path) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
+    settings = Settings(
+        telegram_bot_token="token",
+        openrouter_api_key="key",
+        allowed_telegram_user_ids=frozenset({123}),
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    context = SimpleNamespace(
+        args=["v2"],
+        bot_data={
+            "settings": settings,
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
+        },
+    )
+
+    await handle_translation_prompt_command(update, context)
+    assert message.text_replies == ["Sorry, this bot is not enabled for your Telegram account."]
+    assert not settings.runtime_state_path.exists()
+
+    update.effective_user.id = 123
+    context.args = ["unknown"]
+    await handle_translation_prompt_command(update, context)
+    assert message.text_replies[-1] == "Unknown translation prompt. Available prompts: normal, v2."
+    assert not settings.runtime_state_path.exists()
 
 
 @pytest.mark.asyncio

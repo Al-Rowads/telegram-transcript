@@ -17,6 +17,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
+from telegram_transcript.runtime_state import RuntimePreferences, RuntimePreferencesStore, RuntimeStateError
 from telegram_transcript.telegram_utils import (
     format_transcript_for_delivery,
     should_send_as_text,
@@ -29,6 +30,8 @@ from telegram_transcript.transcriber import (
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
+    DEFAULT_TRANSLATION_PROMPT_KEY,
+    TRANSLATION_PROMPT_OPTIONS,
     DeepgramSpeechToTextProvider,
     GeminiSpeechToTextProvider,
     OpenAISpeechToTextProvider,
@@ -128,9 +131,34 @@ TRANSLATION_MODEL_ALIASES = {
 }
 
 
+def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesStore:
+    defaults = RuntimePreferences(
+        audio_tempo=settings.audio_tempo,
+        transcription_model=DEFAULT_TRANSCRIPTION_MODEL_KEY,
+        translation_model=settings.openrouter_refine_model,
+        translation_prompt=DEFAULT_TRANSLATION_PROMPT_KEY,
+    )
+    return RuntimePreferencesStore(
+        settings.runtime_state_path,
+        defaults=defaults,
+        transcription_models=frozenset(TRANSCRIPTION_MODEL_OPTIONS),
+        translation_models=frozenset(
+            {settings.openrouter_refine_model, *(option.model for option in TRANSLATION_MODEL_OPTIONS.values())}
+        ),
+        translation_prompts=frozenset(TRANSLATION_PROMPT_OPTIONS),
+    )
+
+
 def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
-    transcriber = create_transcriber(settings, translation_model=settings.openrouter_refine_model)
+    runtime_store = create_runtime_preferences_store(settings)
+    runtime_preferences = runtime_store.load()
+    transcriber = create_transcriber(
+        settings,
+        runtime_preferences.transcription_model,
+        translation_model=runtime_preferences.translation_model,
+        translation_prompt=runtime_preferences.translation_prompt,
+    )
 
     app = (
         Application.builder()
@@ -141,16 +169,19 @@ def create_application(settings: Settings | None = None) -> Application:
     )
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
-    app.bot_data["transcription_model"] = DEFAULT_TRANSCRIPTION_MODEL_KEY
-    app.bot_data["translation_model"] = settings.openrouter_refine_model
+    app.bot_data["transcription_model"] = runtime_preferences.transcription_model
+    app.bot_data["translation_model"] = runtime_preferences.translation_model
+    app.bot_data["translation_prompt"] = runtime_preferences.translation_prompt
+    app.bot_data["runtime_preferences_store"] = runtime_store
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
-    app.bot_data["audio_tempo"] = settings.audio_tempo
+    app.bot_data["audio_tempo"] = runtime_preferences.audio_tempo
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(CommandHandler("model", handle_model_command))
     app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
+    app.add_handler(CommandHandler("translation", handle_translation_prompt_command))
     app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_media))
     return app
@@ -160,6 +191,7 @@ def create_transcriber(
     settings: Settings,
     model_key: str = DEFAULT_TRANSCRIPTION_MODEL_KEY,
     translation_model: str | None = None,
+    translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
 ) -> SpeechTranscriber:
     speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
 
@@ -167,6 +199,8 @@ def create_transcriber(
         TranscriptRefiner(
             api_key=settings.openrouter_api_key,
             model=translation_model or settings.openrouter_refine_model,
+            system_prompt=TRANSLATION_PROMPT_OPTIONS[translation_prompt],
+            prompt_key=translation_prompt,
         )
         if settings.refine
         else None
@@ -245,6 +279,11 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if audio_tempo is None:
         return
 
+    try:
+        persist_runtime_preferences(context, audio_tempo=audio_tempo)
+    except RuntimeStateError as exc:
+        await reply_to_source(message, str(exc))
+        return
     context.bot_data["audio_tempo"] = audio_tempo
     await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
@@ -278,11 +317,17 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
             settings,
             model_key,
             translation_model=get_runtime_translation_model(context, settings),
+            translation_prompt=get_runtime_translation_prompt(context),
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
         return
 
+    try:
+        persist_runtime_preferences(context, transcription_model=model_key)
+    except RuntimeStateError as exc:
+        await reply_to_source(message, str(exc))
+        return
     context.bot_data["transcriber"] = transcriber
     context.bot_data["transcription_model"] = model_key
     await reply_to_source(message, f"Transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
@@ -318,14 +363,60 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
             settings,
             get_runtime_model_key(context),
             translation_model=option.model,
+            translation_prompt=get_runtime_translation_prompt(context),
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
         return
 
+    try:
+        persist_runtime_preferences(context, translation_model=option.model)
+    except RuntimeStateError as exc:
+        await reply_to_source(message, str(exc))
+        return
     context.bot_data["transcriber"] = transcriber
     context.bot_data["translation_model"] = option.model
     await reply_to_source(message, f"Translation model set to {option.label}.")
+
+
+async def handle_translation_prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+
+    args = getattr(context, "args", None)
+    if not isinstance(args, list) or not args:
+        await reply_to_source(message, format_translation_prompt_settings_message(context))
+        return
+    if len(args) != 1:
+        await reply_to_source(message, format_unknown_translation_prompt_message())
+        return
+
+    prompt_key = args[0].strip().lower()
+    if prompt_key not in TRANSLATION_PROMPT_OPTIONS:
+        await reply_to_source(message, format_unknown_translation_prompt_message())
+        return
+    try:
+        transcriber = create_transcriber(
+            settings,
+            get_runtime_model_key(context),
+            translation_model=get_runtime_translation_model(context, settings),
+            translation_prompt=prompt_key,
+        )
+        persist_runtime_preferences(context, translation_prompt=prompt_key)
+    except (ConfigError, RuntimeStateError) as exc:
+        await reply_to_source(message, str(exc))
+        return
+
+    context.bot_data["transcriber"] = transcriber
+    context.bot_data["translation_prompt"] = prompt_key
+    await reply_to_source(message, f"Translation prompt set to {prompt_key}.")
 
 
 async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -739,6 +830,35 @@ def get_runtime_translation_model(context: ContextTypes.DEFAULT_TYPE, settings: 
     return settings.openrouter_refine_model
 
 
+def get_runtime_translation_prompt(context: ContextTypes.DEFAULT_TYPE) -> str:
+    candidate = context.bot_data.get("translation_prompt", DEFAULT_TRANSLATION_PROMPT_KEY)
+    if isinstance(candidate, str) and candidate in TRANSLATION_PROMPT_OPTIONS:
+        return candidate
+    return DEFAULT_TRANSLATION_PROMPT_KEY
+
+
+def persist_runtime_preferences(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    audio_tempo: float | None = None,
+    transcription_model: str | None = None,
+    translation_model: str | None = None,
+    translation_prompt: str | None = None,
+) -> None:
+    settings: Settings = context.bot_data["settings"]
+    store = context.bot_data.get("runtime_preferences_store")
+    if not isinstance(store, RuntimePreferencesStore):
+        raise RuntimeStateError("Runtime preferences store is unavailable.")
+    store.save(
+        RuntimePreferences(
+            audio_tempo=audio_tempo if audio_tempo is not None else get_runtime_audio_tempo(context, settings),
+            transcription_model=transcription_model or get_runtime_model_key(context),
+            translation_model=translation_model or get_runtime_translation_model(context, settings),
+            translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
+        )
+    )
+
+
 def get_runtime_transcriber_info(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> tuple[str, str]:
     transcriber = context.bot_data.get("transcriber")
     provider_name = getattr(transcriber, "provider_name", None)
@@ -791,6 +911,19 @@ def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE
 def format_unknown_translation_model_message() -> str:
     options = ", ".join(option.key for option in TRANSLATION_MODEL_OPTIONS.values())
     return f"Unknown translation model. Available models: {options}."
+
+
+def format_translation_prompt_settings_message(context: ContextTypes.DEFAULT_TYPE) -> str:
+    current_prompt = get_runtime_translation_prompt(context)
+    return (
+        f"Current translation prompt: {current_prompt}\n\n"
+        "Available prompts:\n- normal\n- v2\n\n"
+        "Use /translation normal or /translation v2."
+    )
+
+
+def format_unknown_translation_prompt_message() -> str:
+    return "Unknown translation prompt. Available prompts: normal, v2."
 
 
 def is_model_option_configured(option: TranscriptionModelOption, settings: Settings) -> bool:

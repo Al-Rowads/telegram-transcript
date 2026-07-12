@@ -4,4 +4,9 @@ services:
     env_file:
       - path: .env
         required: false
+    volumes:
+      - runtime-data:/app/data
     restart: unless-stopped
+
+volumes:
+  runtime-data:

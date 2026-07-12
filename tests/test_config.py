@@ -35,6 +35,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
+    assert settings.runtime_state_path.as_posix() == "data/runtime-settings.json"
 
 
 def test_load_settings_parses_optional_values() -> None:
@@ -48,6 +49,7 @@ def test_load_settings_parses_optional_values() -> None:
             "MAX_VIDEO_MB": "25.5",
             "AUDIO_TEMPO": "1",
             "MAX_CONCURRENT_JOBS": "3",
+            "RUNTIME_STATE_PATH": "~/telegram-state.json",
         },
         load_dotenv_file=False,
     )
@@ -60,6 +62,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.max_video_mb == 25.5
     assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
+    assert settings.runtime_state_path.name == "telegram-state.json"
 
 
 def test_load_settings_requires_credentials() -> None:
