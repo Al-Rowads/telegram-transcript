@@ -1047,7 +1047,7 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
     assert call["messages"][1]["content"] == build_refinement_input(
         "1\n00:00:00,000 --> 00:00:01,000\nهاي\n"
     )
-    assert call["temperature"] == 0
+    assert "temperature" not in call
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["strict"] is True
     assert call["extra_body"] == {"provider": {"require_parameters": True}}

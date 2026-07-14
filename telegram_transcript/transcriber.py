@@ -632,7 +632,6 @@ class TranscriptRefiner:
                 previous_context=previous_context if use_context else (),
                 following_context=following_context if use_context else (),
             ),
-            temperature=0,
             response_format=SRT_BATCH_TRANSLATION_RESPONSE_FORMAT,
             extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
         )
