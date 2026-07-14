@@ -10,20 +10,21 @@ from telegram_transcript import ffmpeg
 
 
 def test_build_extract_audio_command() -> None:
-    command = ffmpeg.build_extract_audio_command(Path("input.mp4"), Path("output.mp3"))
+    command = ffmpeg.build_extract_audio_command(Path("input.mp4"), Path("output.flac"))
 
     assert command[:5] == ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     assert "-vn" in command
     assert ["-ac", "1"] == command[command.index("-ac") : command.index("-ac") + 2]
     assert ["-ar", "16000"] == command[command.index("-ar") : command.index("-ar") + 2]
     assert ["-filter:a", "atempo=1"] == command[command.index("-filter:a") : command.index("-filter:a") + 2]
-    assert command[-1] == "output.mp3"
+    assert ["-codec:a", "flac"] == command[command.index("-codec:a") : command.index("-codec:a") + 2]
+    assert command[-1] == "output.flac"
 
 
 def test_build_extract_audio_command_accepts_custom_tempo() -> None:
     command = ffmpeg.build_extract_audio_command(
         Path("input.mp4"),
-        Path("output.mp3"),
+        Path("output.flac"),
         audio_tempo=1.0,
     )
 
@@ -70,27 +71,32 @@ def test_split_audio_to_timed_chunks_returns_original_audio_when_under_1300_seco
     assert chunks == [ffmpeg.AudioChunk(path=audio_path)]
 
 
-def test_split_audio_to_timed_chunks_uses_1300_second_segment_offsets(
+def test_split_audio_to_timed_chunks_uses_silence_boundaries_and_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    audio_path = tmp_path / "audio.mp3"
+    audio_path = tmp_path / "audio.flac"
     audio_path.write_bytes(b"x" * 2000)
     chunks_dir = tmp_path / "chunks"
 
     def fake_run_command(command: list[str]) -> None:
         chunks_dir.mkdir(exist_ok=True)
-        (chunks_dir / "chunk_000.mp3").write_bytes(b"x" * 500)
-        (chunks_dir / "chunk_001.mp3").write_bytes(b"x" * 500)
-        assert command[command.index("-segment_time") + 1] == "1300"
+        Path(command[-1]).write_bytes(b"x" * 500)
 
-    monkeypatch.setattr(ffmpeg, "probe_audio_duration_seconds", lambda *_, **__: 1300.1)
+    monkeypatch.setattr(ffmpeg, "probe_audio_duration_seconds", lambda *_, **__: 2600)
+    monkeypatch.setattr(ffmpeg, "run_combined_capture_command", lambda _: "silence_end: 1290.0")
     monkeypatch.setattr(ffmpeg, "run_command", fake_run_command)
 
     chunks = ffmpeg.split_audio_to_timed_chunks(audio_path, chunks_dir)
 
-    assert [chunk.path.name for chunk in chunks] == ["chunk_000.mp3", "chunk_001.mp3"]
-    assert [chunk.start_seconds for chunk in chunks] == [0, 1300]
+    assert [chunk.path.name for chunk in chunks] == ["chunk_000.flac", "chunk_001.flac"]
+    assert [chunk.start_seconds for chunk in chunks] == [0, 1288.5]
+
+
+def test_chunk_ranges_avoid_a_tiny_tail_just_above_the_limit() -> None:
+    ranges = ffmpeg.choose_silence_aware_chunk_ranges(1300.1, ())
+
+    assert ranges == ((0.0, 651.55), (648.55, 1300.1))
 
 
 def test_prepare_audio_chunks_returns_single_audio_when_under_1300_seconds(
@@ -109,13 +115,13 @@ def test_prepare_audio_chunks_returns_single_audio_when_under_1300_seconds(
 
     chunks = ffmpeg.prepare_audio_chunks(video_path, tmp_path)
 
-    assert chunks == [ffmpeg.AudioChunk(path=tmp_path / "audio.mp3")]
+    assert chunks == [ffmpeg.AudioChunk(path=tmp_path / "audio.flac")]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
 def test_ffmpeg_extracts_audio_from_generated_video(tmp_path: Path) -> None:
     video_path = tmp_path / "sample.mp4"
-    audio_path = tmp_path / "audio.mp3"
+    audio_path = tmp_path / "audio.flac"
 
     subprocess.run(
         [

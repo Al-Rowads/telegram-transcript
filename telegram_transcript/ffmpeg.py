@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 from telegram_transcript.models import AudioChunk
@@ -11,6 +13,11 @@ from telegram_transcript.models import AudioChunk
 DEFAULT_AUDIO_BITRATE_KBPS = 64
 DEFAULT_AUDIO_TEMPO = 1.0
 DEEPGRAM_CHUNK_SECONDS = 1300
+CHUNK_OVERLAP_SECONDS = 1.5
+SILENCE_SEARCH_SECONDS = 30.0
+SILENCE_NOISE_DB = -35
+SILENCE_MIN_DURATION_SECONDS = 0.4
+SILENCE_END_RE = re.compile(r"silence_end:\s*(?P<seconds>\d+(?:\.\d+)?)")
 
 
 class FfmpegError(RuntimeError):
@@ -38,6 +45,7 @@ def build_extract_audio_command(
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
 ) -> list[str]:
+    del audio_bitrate_kbps
     return [
         executable,
         "-hide_banner",
@@ -54,9 +62,7 @@ def build_extract_audio_command(
         "-filter:a",
         f"atempo={audio_tempo:g}",
         "-codec:a",
-        "libmp3lame",
-        "-b:a",
-        f"{audio_bitrate_kbps}k",
+        "flac",
         str(output_path),
     ]
 
@@ -85,6 +91,57 @@ def build_split_audio_command(
         "-c",
         "copy",
         str(output_pattern),
+    ]
+
+
+def build_detect_silence_command(
+    audio_path: Path,
+    *,
+    executable: str = "ffmpeg",
+) -> list[str]:
+    return [
+        executable,
+        "-hide_banner",
+        "-i",
+        str(audio_path),
+        "-af",
+        f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DURATION_SECONDS:g}",
+        "-f",
+        "null",
+        "-",
+    ]
+
+
+def build_extract_audio_window_command(
+    audio_path: Path,
+    output_path: Path,
+    *,
+    start_seconds: float,
+    end_seconds: float,
+    executable: str = "ffmpeg",
+) -> list[str]:
+    if start_seconds < 0 or end_seconds <= start_seconds:
+        raise ValueError("Audio window must have a non-negative start before its end.")
+    return [
+        executable,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(audio_path),
+        "-ss",
+        f"{start_seconds:.3f}",
+        "-t",
+        f"{end_seconds - start_seconds:.3f}",
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-codec:a",
+        "flac",
+        str(output_path),
     ]
 
 
@@ -118,6 +175,14 @@ def run_capture_command(command: list[str]) -> str:
         detail = completed.stderr.strip() or completed.stdout.strip() or "unknown ffprobe error"
         raise FfmpegError(detail)
     return completed.stdout.strip()
+
+
+def run_combined_capture_command(command: list[str]) -> str:
+    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "unknown ffmpeg error"
+        raise FfmpegError(detail)
+    return "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
 
 
 def extract_audio(
@@ -166,7 +231,7 @@ def prepare_audio_chunks(
     audio_bitrate_kbps: int = DEFAULT_AUDIO_BITRATE_KBPS,
     audio_tempo: float = DEFAULT_AUDIO_TEMPO,
 ) -> list[AudioChunk]:
-    audio_path = work_dir / "audio.mp3"
+    audio_path = work_dir / "audio.flac"
     extract_audio(
         video_path,
         audio_path,
@@ -209,6 +274,7 @@ def split_audio_to_timed_chunks(
     executable: str = "ffmpeg",
     probe_executable: str = "ffprobe",
     chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
+    overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
 ) -> list[AudioChunk]:
     duration_seconds = probe_audio_duration_seconds(audio_path, executable=probe_executable)
     if duration_seconds <= chunk_seconds:
@@ -216,24 +282,92 @@ def split_audio_to_timed_chunks(
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
     clear_chunk_dir(chunks_dir)
+    silence_output = run_combined_capture_command(
+        build_detect_silence_command(audio_path, executable=executable)
+    )
+    ranges = choose_silence_aware_chunk_ranges(
+        duration_seconds,
+        parse_silence_end_seconds(silence_output),
+        chunk_seconds=chunk_seconds,
+        overlap_seconds=overlap_seconds,
+    )
+    chunks = []
+    for index, (start_seconds, end_seconds) in enumerate(ranges):
+        chunk_path = chunks_dir / f"chunk_{index:03d}.flac"
+        run_command(
+            build_extract_audio_window_command(
+                audio_path,
+                chunk_path,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                executable=executable,
+            )
+        )
+        if not chunk_path.exists() or chunk_path.stat().st_size == 0:
+            raise FfmpegError(f"Unable to create audio chunk {index + 1}.")
+        chunks.append(AudioChunk(path=chunk_path, start_seconds=start_seconds))
+    return chunks
+
+
+def parse_silence_end_seconds(output: str) -> tuple[float, ...]:
+    return tuple(float(match.group("seconds")) for match in SILENCE_END_RE.finditer(output))
+
+
+def choose_silence_aware_chunk_ranges(
+    duration_seconds: float,
+    silence_ends: Sequence[float],
+    *,
+    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
+    overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
+) -> tuple[tuple[float, float], ...]:
+    if duration_seconds <= 0 or chunk_seconds <= 0 or overlap_seconds < 0:
+        raise ValueError("Audio duration and chunk size must be positive and overlap cannot be negative.")
+
+    boundaries = [0.0]
+    while duration_seconds - boundaries[-1] > chunk_seconds + SILENCE_SEARCH_SECONDS:
+        target = boundaries[-1] + chunk_seconds
+        candidates = [
+            value
+            for value in silence_ends
+            if boundaries[-1] + 1.0 < value < duration_seconds
+            and abs(value - target) <= SILENCE_SEARCH_SECONDS
+        ]
+        boundary = min(candidates, key=lambda value: abs(value - target)) if candidates else target
+        boundaries.append(boundary)
+    if len(boundaries) == 1 and duration_seconds > chunk_seconds:
+        boundaries.append(duration_seconds / 2)
+    boundaries.append(duration_seconds)
+
+    ranges = []
+    for index, (boundary_start, boundary_end) in enumerate(zip(boundaries, boundaries[1:])):
+        start = boundary_start if index == 0 else max(0.0, boundary_start - overlap_seconds)
+        end = boundary_end if index == len(boundaries) - 2 else min(duration_seconds, boundary_end + overlap_seconds)
+        ranges.append((start, end))
+    return tuple(ranges)
+
+
+def extract_audio_window(
+    audio_path: Path,
+    output_path: Path,
+    *,
+    start_seconds: float,
+    end_seconds: float,
+    executable: str = "ffmpeg",
+) -> Path:
     run_command(
-        build_split_audio_command(
+        build_extract_audio_window_command(
             audio_path,
-            chunks_dir / "chunk_%03d.mp3",
-            chunk_seconds,
+            output_path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
             executable=executable,
         )
     )
-    chunks = sorted(chunks_dir.glob("chunk_*.mp3"))
-    if not chunks:
-        raise FfmpegError(f"Unable to split audio into {chunk_seconds}-second chunks.")
-
-    return [
-        AudioChunk(path=chunk, start_seconds=index * chunk_seconds)
-        for index, chunk in enumerate(chunks)
-    ]
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise FfmpegError("ffmpeg did not produce an audio window.")
+    return output_path
 
 
 def clear_chunk_dir(chunks_dir: Path) -> None:
-    for chunk in chunks_dir.glob("chunk_*.mp3"):
+    for chunk in chunks_dir.glob("chunk_*"):
         chunk.unlink()

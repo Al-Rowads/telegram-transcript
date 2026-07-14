@@ -28,7 +28,8 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.telegram_api_hash == "telegram-api-hash"
     assert settings.deepgram_api_key == "deepgram-key"
     assert settings.deepgram_transcribe_model == "nova-3"
-    assert settings.deepgram_language == "ar"
+    assert settings.deepgram_language == "ar-IQ"
+    assert settings.deepgram_keyterms == ()
     assert settings.openrouter_api_key == "openrouter-key"
     assert settings.openrouter_refine_model == "openai/gpt-5.5"
     assert settings.refine is False
@@ -44,6 +45,7 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENROUTER_API_KEY": "custom-openrouter-key",
             "OPENROUTER_REFINE_MODEL": "custom-refine-model",
+            "DEEPGRAM_KEYTERMS": "اسم, مصطلح, اسم",
             "REFINE": "true",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
             "MAX_VIDEO_MB": "25.5",
@@ -57,12 +59,21 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.deepgram_api_key == "deepgram-key"
     assert settings.openrouter_api_key == "custom-openrouter-key"
     assert settings.openrouter_refine_model == "custom-refine-model"
+    assert settings.deepgram_keyterms == ("اسم", "مصطلح")
     assert settings.refine is True
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})
     assert settings.max_video_mb == 25.5
     assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
     assert settings.runtime_state_path.name == "telegram-state.json"
+
+
+def test_load_settings_rejects_more_than_one_hundred_deepgram_keyterms() -> None:
+    with pytest.raises(ConfigError, match="at most 100"):
+        load_settings(
+            {**BASE_ENV, "DEEPGRAM_KEYTERMS": ",".join(f"term-{index}" for index in range(101))},
+            load_dotenv_file=False,
+        )
 
 
 def test_load_settings_requires_credentials() -> None:

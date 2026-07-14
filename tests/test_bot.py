@@ -232,7 +232,7 @@ async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: p
     assert "/tempo <0.5-2.0>" in reply
     assert "/model [deepgram|openai|gemini]" in reply
     assert "/tmodel [gemini|gpt|claude]" in reply
-    assert "/translation [normal|v2]" in reply
+    assert "/translation [natural|literal]" in reply
     assert message.text_reply_kwargs == [
         {
             "reply_to_message_id": 123,
@@ -722,7 +722,7 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     )
 
     await handle_translation_prompt_command(update, context)
-    assert "Current translation prompt: normal" in message.text_replies[-1]
+    assert "Current translation prompt: literal" in message.text_replies[-1]
 
     fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
     calls: list[tuple[str, str, str]] = []
@@ -740,11 +740,11 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     context.args = ["v2"]
     await handle_translation_prompt_command(update, context)
 
-    assert calls == [("gemini", "openai/gpt-5.5", "v2")]
-    assert context.bot_data["translation_prompt"] == "v2"
+    assert calls == [("gemini", "openai/gpt-5.5", "natural")]
+    assert context.bot_data["translation_prompt"] == "natural"
     assert context.bot_data["transcriber"] is fake_transcriber
-    assert store.load().translation_prompt == "v2"
-    assert message.text_replies[-1] == "Translation prompt set to v2."
+    assert store.load().translation_prompt == "natural"
+    assert message.text_replies[-1] == "Translation prompt set to natural."
 
 
 @pytest.mark.asyncio
@@ -772,7 +772,7 @@ async def test_handle_translation_prompt_command_rejects_invalid_and_unauthorize
     update.effective_user.id = 123
     context.args = ["unknown"]
     await handle_translation_prompt_command(update, context)
-    assert message.text_replies[-1] == "Unknown translation prompt. Available prompts: normal, v2."
+    assert message.text_replies[-1] == "Unknown translation prompt. Available prompts: natural, literal."
     assert not settings.runtime_state_path.exists()
 
 
@@ -936,7 +936,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         return audio_path
 
     def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
-        assert audio_path.name == "audio.mp3"
+        assert audio_path.name == "audio.flac"
         assert chunks_dir.name == "chunks"
         return [AudioChunk(path=audio_path)]
 
@@ -962,7 +962,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     status = message.status_replies[0]
     assert status.edits == [
         "Step 1/6: downloading media...",
-        "Step 2/6: extracting MP3 audio at 1.4x...",
+        "Step 2/6: extracting lossless FLAC audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
         "Step 5/6: translating subtitles...",

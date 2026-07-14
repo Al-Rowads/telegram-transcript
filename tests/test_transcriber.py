@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import telegram_transcript.transcriber as transcriber_module
 from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
@@ -13,6 +14,7 @@ from telegram_transcript.transcriber import (
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DeepgramSpeechToTextProvider,
+    LowConfidenceTranscriptCorrector,
     GeminiSpeechToTextProvider,
     OpenAISpeechToTextProvider,
     CUE_TRANSLATION_END,
@@ -27,6 +29,9 @@ from telegram_transcript.transcriber import (
     build_refinement_input,
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
+    extract_deepgram_transcript_words,
+    merge_overlapping_subtitle_cues,
+    parse_srt_batch_translation_response,
     parse_srt_cue_translation_response,
     parse_srt_blocks,
     render_line_translated_transcript_from_srt,
@@ -34,7 +39,7 @@ from telegram_transcript.transcriber import (
     render_translated_srt_block,
     split_srt_by_byte_limit,
 )
-from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue
+from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptWord
 
 
 def test_extract_deepgram_transcript_text_from_dict() -> None:
@@ -82,6 +87,20 @@ def test_extract_deepgram_transcript_text_prefers_paragraphs() -> None:
 def test_extract_deepgram_transcript_text_rejects_missing_transcript() -> None:
     with pytest.raises(TranscriptionError, match="Deepgram"):
         extract_deepgram_transcript_text({"results": {"channels": []}})
+
+
+def test_extract_deepgram_transcript_words_preserves_timing_and_confidence() -> None:
+    response = {
+        "results": {
+            "channels": [{"alternatives": [{"words": [
+                {"word": "شلونك", "punctuated_word": "شلونك؟", "start": 1.0, "end": 1.5, "confidence": 0.61}
+            ]}]}]
+        }
+    }
+
+    assert extract_deepgram_transcript_words(response) == (
+        TranscriptWord(1.0, 1.5, "شلونك؟", 0.61),
+    )
 
 
 def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
@@ -146,6 +165,28 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
     ]
 
 
+def test_deepgram_provider_passes_deduplicated_keyterms(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    calls: list[dict[str, object]] = []
+
+    class FakeMedia:
+        def transcribe_file(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return {"results": {"channels": [{"alternatives": [{"transcript": "نص"}]}]}}
+
+    provider = DeepgramSpeechToTextProvider(
+        api_key="key",
+        keyterms=("اسم", "مصطلح", "اسم"),
+        client=SimpleNamespace(listen=SimpleNamespace(v1=SimpleNamespace(media=FakeMedia()))),
+    )
+
+    provider.transcribe_file(audio)
+
+    assert calls[0]["language"] == "ar-IQ"
+    assert calls[0]["keyterm"] == ("اسم", "مصطلح")
+
+
 def test_openai_provider_uses_openrouter_transcription_endpoint(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
@@ -177,6 +218,7 @@ def test_openai_provider_uses_openrouter_transcription_endpoint(tmp_path: Path) 
     assert fake_session.calls[0]["json"] == {
         "input_audio": {"data": "YXVkaW8=", "format": "mp3"},
         "model": DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
+        "language": "ar",
         "temperature": 0,
     }
 
@@ -498,7 +540,9 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
         def create(self, **kwargs: object) -> object:
             self.calls.append(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": "سلام"}'))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"translations":[{"index":"1","translation":"سلام"}]}'
+                )))]
             )
 
     fake_completions = FakeCompletions()
@@ -520,6 +564,7 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
     assert call["temperature"] == 0
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["strict"] is True
+    assert call["provider"] == {"require_parameters": True}
 
 
 def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
@@ -530,7 +575,9 @@ def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
         def create(self, **kwargs: object) -> object:
             self.calls.append(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": "هفتم"}'))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"translations":[{"index":"7","translation":"هفتم"}]}'
+                )))]
             )
 
     completions = FakeCompletions()
@@ -564,7 +611,9 @@ def test_transcript_refiner_rejects_empty_translation() -> None:
     class FakeCompletions:
         def create(self, **_: object) -> object:
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content='{"translation": " "}'))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"translations":[{"index":"1","translation":" "}]}'
+                )))]
             )
 
     fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
@@ -580,9 +629,9 @@ def test_refinement_input_uses_delimited_raw_transcript() -> None:
     refinement_input = build_refinement_input(raw)
 
     assert SRT_TRANSLATION_REQUEST in refinement_input
-    assert CUE_TRANSLATION_START in refinement_input
-    assert CUE_TRANSLATION_END in refinement_input
-    assert raw in refinement_input
+    assert "<target_cues>" in refinement_input
+    assert "</target_cues>" in refinement_input
+    assert raw.strip() in refinement_input
 
 
 def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path) -> None:
@@ -842,3 +891,175 @@ def test_transcript_refiner_raises_when_refinement_has_no_text() -> None:
     refiner = TranscriptRefiner(api_key="key", client=fake_client)
     with pytest.raises(TranscriptionError, match="completion choice"):
         refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
+
+
+def test_low_confidence_corrector_rechecks_only_flagged_cues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audio_path = tmp_path / "audio.flac"
+    audio_path.write_bytes(b"audio")
+    extracted_windows: list[tuple[float, float]] = []
+
+    def fake_extract_window(
+        source: Path,
+        target: Path,
+        *,
+        start_seconds: float,
+        end_seconds: float,
+    ) -> Path:
+        assert source == audio_path
+        extracted_windows.append((start_seconds, end_seconds))
+        target.write_bytes(b"window")
+        return target
+
+    class FakeSecondary:
+        def transcribe_candidate(self, audio: Path, **kwargs: str) -> str:
+            assert audio.suffix == ".flac"
+            assert kwargs["primary_text"] == "غلط"
+            return "صحيح"
+
+    class FakeResolver:
+        def resolve(self, **kwargs: str) -> str:
+            assert kwargs["primary_text"] == "غلط"
+            assert kwargs["secondary_text"] == "صحيح"
+            return kwargs["secondary_text"]
+
+    monkeypatch.setattr(transcriber_module, "extract_audio_window", fake_extract_window)
+    corrector = LowConfidenceTranscriptCorrector(
+        secondary_provider=FakeSecondary(),
+        resolver=FakeResolver(),
+    )
+    result = FileTranscriptionResult(
+        transcript="غلط\n\nثابت",
+        subtitle_cues=(
+            SubtitleCue(2.0, 3.0, "غلط"),
+            SubtitleCue(4.0, 5.0, "ثابت"),
+        ),
+        words=(
+            TranscriptWord(2.1, 2.8, "غلط", 0.4),
+            TranscriptWord(4.1, 4.8, "ثابت", 0.99),
+        ),
+    )
+
+    corrected = corrector.correct_file_result(audio_path, result)
+
+    assert extracted_windows == [(0.5, 4.5)]
+    assert tuple(cue.text for cue in corrected.subtitle_cues) == ("صحيح", "ثابت")
+    assert corrected.transcript == "صحيح\n\nثابت"
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ('{"translations":[]}', "omitted"),
+        (
+            '{"translations":[{"index":"1","translation":"الف"},'
+            '{"index":"1","translation":"ب"}]}',
+            "duplicate",
+        ),
+        ('{"translations":[{"index":"9","translation":"الف"}]}', "unknown"),
+        ('{"translations":[{"index":"1","translation":"الف\\nب"}]}', "multiline"),
+    ],
+)
+def test_parse_srt_batch_translation_response_rejects_invalid_results(response: str, message: str) -> None:
+    with pytest.raises(TranscriptionError, match=message):
+        parse_srt_batch_translation_response(response, expected_indexes=("1",))
+
+
+def test_batch_translation_retries_then_bisects_malformed_response() -> None:
+    responses = iter(
+        [
+            "not json",
+            "not json",
+            '{"translations":[{"index":"1","translation":"اول"}]}',
+            '{"translations":[{"index":"2","translation":"دوم"}]}',
+        ]
+    )
+
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=next(responses)))]
+            )
+
+    completions = FakeCompletions()
+    refiner = TranscriptRefiner(
+        api_key="key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+    blocks = parse_srt_blocks(
+        "1\n00:00:00,000 --> 00:00:01,000\nاول\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nدوم\n"
+    )
+
+    assert refiner.translate_srt_blocks(blocks) == ("اول", "دوم")
+    assert len(completions.calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_translates_twelve_cue_batches_with_bidirectional_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    audio_path = tmp_path / "audio.flac"
+    audio_path.write_bytes(b"audio")
+
+    class FakeProvider:
+        provider_name = "deepgram"
+        model = "nova-3"
+
+        def transcribe_file_result(self, audio: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            cues = tuple(SubtitleCue(float(index), float(index + 1), f"Arabic {index + 1}") for index in range(13))
+            return FileTranscriptionResult(transcript="raw", subtitle_cues=cues)
+
+    class FakeRefiner:
+        model = "translation-model"
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = []
+
+        def translate_srt_blocks(
+            self,
+            blocks: object,
+            *,
+            previous_context: object = (),
+            following_context: object = (),
+        ) -> tuple[str, ...]:
+            target = tuple(block.index for block in blocks)
+            previous = tuple(block.index for block, _ in previous_context)
+            following = tuple(block.index for block in following_context)
+            self.calls.append((target, previous, following))
+            return tuple(f"Persian {index}" for index in target)
+
+    refiner = FakeRefiner()
+    result = await SpeechTranscriber(
+        speech_to_text_provider=FakeProvider(),
+        refiner=refiner,
+    ).transcribe_chunks_async((audio_path,))
+
+    assert refiner.calls[0] == (tuple(str(index) for index in range(1, 13)), (), ("13",))
+    assert refiner.calls[1] == (("13",), ("8", "9", "10", "11", "12"), ())
+    assert result.subtitle_cues[0].start_seconds == 0.0
+    assert result.subtitle_cues[-1].end_seconds == 13.0
+
+
+def test_merge_overlapping_subtitle_cues_deduplicates_chunk_overlap() -> None:
+    existing = (SubtitleCue(9.0, 10.5, "نفس الكلام"),)
+    incoming = (
+        SubtitleCue(9.5, 10.8, "نفس الكلام"),
+        SubtitleCue(10.8, 11.5, "كلام جديد"),
+    )
+
+    assert merge_overlapping_subtitle_cues(existing, incoming) == (
+        existing[0],
+        incoming[1],
+    )

@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
+import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,10 +14,19 @@ from typing import Any, Protocol
 import requests
 from openai import OpenAI
 
-from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptionResult
+from telegram_transcript.ffmpeg import extract_audio_window
+from telegram_transcript.models import (
+    AudioChunk,
+    FileTranscriptionResult,
+    SubtitleCue,
+    TranscriptWord,
+    TranscriptionResult,
+)
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
-DEFAULT_DEEPGRAM_LANGUAGE = "ar"
+DEFAULT_DEEPGRAM_LANGUAGE = "ar-IQ"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
 DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "google/gemini-3.5-flash"
@@ -23,45 +34,47 @@ DEFAULT_REFINEMENT_MODEL = "openai/gpt-5.5"
 CLAUDE_SONNET_TRANSLATION_MODEL = "anthropic/claude-sonnet-4.6"
 MAX_SRT_TRANSLATION_CHUNK_BYTES = 8 * 1024
 MAX_TRANSLATION_CONTEXT_CUES = 5
+TRANSLATION_BATCH_CUES = 12
+LOW_CONFIDENCE_WORD_THRESHOLD = 0.65
+CORRECTION_WINDOW_PADDING_SECONDS = 1.5
 CUE_TRANSLATION_START = "<srt_cue>"
 CUE_TRANSLATION_END = "</srt_cue>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
 
-SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
+SRT_TRANSLATION_SYSTEM_PROMPT = """You are an expert Iraqi Arabic-to-Persian subtitle translator.
 
-You will receive one numbered SRT subtitle cue. Translate only the spoken subtitle text into Persian.
-
-Rules:
-- Return exactly one JSON object with a single "translation" string.
-- The translation string must be one Persian line with no newline characters.
-- Do not return cue numbers, timestamps, source text, XML, HTML, Markdown, notes, or extra keys.
-- Keep names, numbers, brands, and technical terms accurate.
-- Preserve meaning naturally in Persian."""
-
-SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT = """You are an expert Arabic-to-Persian subtitle translator.
-
-You will receive one numbered SRT subtitle cue. Translate the text use Context from previous text lines, to have accurate translation with correct Persian meaning.
-Doesn't need to be line by line translation, translate with accuracy, and make correctness of translation in priority, NOT exactly word by word into Persian.
-you may include translation of pervious Arabic line in the next line to preserve translation cohesion.
-Make translation cohesion top priority.
+Translate the target cues faithfully into clear standard Persian. Keep each translation concise and aligned with its cue.
 
 Rules:
-- Return exactly one JSON object with a single "translation" string.
-- The translation string must be one Persian line with no newline characters.
-- Do not return cue numbers, timestamps, source text, XML, HTML, Markdown, notes, or extra keys.
-- Keep names, numbers, brands, and technical terms accurate.
-- Preserve meaning naturally in Persian."""
+- Return exactly one translation for every target cue ID and no other cue IDs.
+- Each translation must be one non-empty Persian line with no newline characters.
+- Preserve meaning, negation, names, numbers, brands, and technical terms.
+- Do not return timestamps, source text, XML, HTML, Markdown, notes, or extra keys."""
+
+SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT = """You are an expert Iraqi and Baghdadi Arabic-to-Persian subtitle translator.
+
+Translate the target cues into natural conversational Persian. Understand Iraqi idioms and the complete sentence across adjacent cues; do not copy Arabic word order or produce Arabic-shaped Persian. You may redistribute wording between adjacent target cues when necessary, but cover every meaning exactly once and keep one translation for every cue.
+
+Rules:
+- Return exactly one translation for every target cue ID and no other cue IDs.
+- Each translation must be one non-empty Persian line with no newline characters.
+- Preserve meaning, negation, names, numbers, brands, and technical terms.
+- Use previous and following context only to understand the target; never translate context cues again.
+- Do not return timestamps, source text, XML, HTML, Markdown, notes, or extra keys."""
 
 TRANSLATION_PROMPT_OPTIONS = {
-    "normal": SRT_TRANSLATION_SYSTEM_PROMPT,
-    "v2": SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
+    "literal": SRT_TRANSLATION_SYSTEM_PROMPT,
+    "natural": SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
 }
-DEFAULT_TRANSLATION_PROMPT_KEY = "normal"
+TRANSLATION_PROMPT_ALIASES = {
+    "normal": "literal",
+    "v2": "natural",
+    "literal": "literal",
+    "natural": "natural",
+}
+DEFAULT_TRANSLATION_PROMPT_KEY = "natural"
 
-SRT_TRANSLATION_REQUEST = (
-    "Translate the subtitle text in this single SRT cue into exactly one Persian line. "
-    'Return only JSON matching {"translation": "..."}.'
-)
+SRT_TRANSLATION_REQUEST = "Translate every cue inside <target_cues> and return only the required JSON object."
 SRT_CUE_TRANSLATION_RESPONSE_FORMAT: dict[str, object] = {
     "type": "json_schema",
     "json_schema": {
@@ -81,6 +94,61 @@ SRT_CUE_TRANSLATION_RESPONSE_FORMAT: dict[str, object] = {
     },
 }
 
+SRT_BATCH_TRANSLATION_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "srt_batch_translation",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "translations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {"type": "string", "minLength": 1},
+                            "translation": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["index", "translation"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["translations"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+CORRECTION_TRANSCRIPTION_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "iraqi_audio_correction_candidate",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"transcription": {"type": "string", "minLength": 1}},
+            "required": ["transcription"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+CORRECTION_RESOLUTION_RESPONSE_FORMAT: dict[str, object] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "iraqi_transcription_candidate_resolution",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {"choice": {"type": "string", "enum": ["primary", "secondary"]}},
+            "required": ["choice"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 BAGHDADI_ARABIC_REFINEMENT_SYSTEM_PROMPT = SRT_TRANSLATION_SYSTEM_PROMPT
 BAGHDADI_ARABIC_REFINEMENT_REQUEST = SRT_TRANSLATION_REQUEST
 GREEN_FONT_RE = re.compile(r'^<font\s+color=["\']?green["\']?>\s*(.*?)\s*</font>$', re.IGNORECASE)
@@ -93,13 +161,14 @@ SRT_TIMESTAMP_CAPTURE_RE = re.compile(
 )
 SRT_RESPONSE_FENCE_RE = re.compile(r"^```(?:srt|text)?\s*\n(?P<body>.*)\n```$", re.IGNORECASE | re.DOTALL)
 
-SRT_TRANSCRIPTION_PROMPT = """Transcribe this audio as valid SRT subtitles.
+SRT_TRANSCRIPTION_PROMPT = """Transcribe this predominantly Iraqi/Baghdadi Arabic audio as valid SRT subtitles.
 
 Rules:
 - Output only SRT content.
 - Include sequential cue numbers.
 - Use timestamps in HH:MM:SS,mmm --> HH:MM:SS,mmm format.
 - Put only spoken text in cue text lines.
+- Preserve Iraqi dialect words as spoken; do not convert them into Modern Standard Arabic.
 - Do not include Markdown fences, summaries, notes, or any text outside the SRT file."""
 
 
@@ -129,11 +198,13 @@ class DeepgramSpeechToTextProvider:
         api_key: str,
         model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
         language: str = DEFAULT_DEEPGRAM_LANGUAGE,
+        keyterms: Sequence[str] = (),
         client: Any | None = None,
     ) -> None:
         self.provider_name = "deepgram"
         self.model = model
         self.language = language
+        self.keyterms = tuple(dict.fromkeys(term.strip() for term in keyterms if term.strip()))
         self.client = client if client is not None else create_deepgram_client(api_key)
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
@@ -142,15 +213,18 @@ class DeepgramSpeechToTextProvider:
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
         del previous_transcript
         with audio_path.open("rb") as audio_file:
-            response = self.client.listen.v1.media.transcribe_file(
-                request=audio_file.read(),
-                model=self.model,
-                language=self.language,
-                smart_format=True,
-                punctuate=True,
-                paragraphs=True,
-                utterances=True,
-            )
+            options: dict[str, object] = {
+                "request": audio_file.read(),
+                "model": self.model,
+                "language": self.language,
+                "smart_format": True,
+                "punctuate": True,
+                "paragraphs": True,
+                "utterances": True,
+            }
+            if self.keyterms:
+                options["keyterm"] = self.keyterms
+            response = self.client.listen.v1.media.transcribe_file(**options)
         return extract_deepgram_file_transcription_result(response)
 
 
@@ -171,7 +245,26 @@ class OpenAISpeechToTextProvider:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        del previous_transcript
+        payload: dict[str, object] = {
+            "input_audio": {
+                "data": encode_audio_file(audio_path),
+                "format": audio_path.suffix.lstrip(".").lower(),
+            },
+            "model": self.model,
+            "language": "ar",
+            "temperature": 0,
+        }
+        if previous_transcript.strip():
+            payload["provider"] = {
+                "options": {
+                    "groq": {
+                        "prompt": (
+                            "The audio is Iraqi Arabic. The immediately preceding transcript was: "
+                            + previous_transcript.strip()[-1000:]
+                        )
+                    }
+                }
+            }
         try:
             response = self.client.post(
                 f"{OPENROUTER_BASE_URL}/audio/transcriptions",
@@ -179,14 +272,7 @@ class OpenAISpeechToTextProvider:
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json",
                 },
-                json={
-                    "input_audio": {
-                        "data": encode_audio_file(audio_path),
-                        "format": audio_path.suffix.lstrip(".").lower(),
-                    },
-                    "model": self.model,
-                    "temperature": 0,
-                },
+                json=payload,
                 timeout=300,
             )
             response.raise_for_status()
@@ -213,14 +299,19 @@ class GeminiSpeechToTextProvider:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        del previous_transcript
+        prompt = self.prompt
+        if previous_transcript.strip():
+            prompt += (
+                "\n\nThe previous audio chunk ended with this transcript. Use it only for continuity and do not repeat it:\n"
+                + previous_transcript.strip()[-1000:]
+            )
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": self.prompt},
+                        {"type": "text", "text": prompt},
                         {
                             "type": "input_audio",
                             "input_audio": {
@@ -237,6 +328,193 @@ class GeminiSpeechToTextProvider:
         return parse_srt_file_transcription_result(srt, provider_name="Gemini")
 
 
+class GeminiAudioCorrectionProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        client: Any | None = None,
+    ) -> None:
+        self.model = model
+        self.client = client if client is not None else create_openrouter_client(api_key)
+
+    def transcribe_candidate(
+        self,
+        audio_path: Path,
+        *,
+        primary_text: str,
+        previous_text: str,
+        following_text: str,
+    ) -> str:
+        prompt = (
+            "Transcribe only the central Iraqi/Baghdadi Arabic utterance in this short audio window. "
+            "The window includes about 1.5 seconds of context before and after the target. Preserve dialect words "
+            "as spoken and do not translate or normalize them to Modern Standard Arabic.\n\n"
+            f"Previous cue: {previous_text or '(none)'}\n"
+            f"Primary candidate for the target: {primary_text}\n"
+            f"Following cue: {following_text or '(none)'}\n\n"
+            'Return only JSON matching {"transcription": "..."}.'
+        )
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": encode_audio_file(audio_path),
+                                "format": audio_path.suffix.lstrip(".").lower(),
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0,
+            response_format=CORRECTION_TRANSCRIPTION_RESPONSE_FORMAT,
+            provider={"require_parameters": True},
+        )
+        return parse_single_string_json_response(
+            extract_chat_completion_text(response),
+            key="transcription",
+            response_label="Gemini correction transcription",
+        )
+
+
+class TranscriptCandidateResolver:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_REFINEMENT_MODEL,
+        client: Any | None = None,
+    ) -> None:
+        self.model = model
+        self.client = client if client is not None else create_openrouter_client(api_key)
+
+    def resolve(
+        self,
+        *,
+        primary_text: str,
+        secondary_text: str,
+        previous_text: str,
+        following_text: str,
+    ) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Choose which of two Iraqi Arabic transcription candidates best fits the neighboring cues. "
+                        "You may only choose primary or secondary; never rewrite either candidate."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Previous cue: {previous_text or '(none)'}\n"
+                        f"Primary: {primary_text}\n"
+                        f"Secondary: {secondary_text}\n"
+                        f"Following cue: {following_text or '(none)'}"
+                    ),
+                },
+            ],
+            temperature=0,
+            response_format=CORRECTION_RESOLUTION_RESPONSE_FORMAT,
+            provider={"require_parameters": True},
+        )
+        choice = parse_single_string_json_response(
+            extract_chat_completion_text(response),
+            key="choice",
+            response_label="transcription candidate resolver",
+        )
+        if choice not in {"primary", "secondary"}:
+            raise TranscriptionError("Transcription candidate resolver returned an unknown choice.")
+        return primary_text if choice == "primary" else secondary_text
+
+
+class LowConfidenceTranscriptCorrector:
+    def __init__(
+        self,
+        *,
+        secondary_provider: GeminiAudioCorrectionProvider,
+        resolver: TranscriptCandidateResolver,
+        confidence_threshold: float = LOW_CONFIDENCE_WORD_THRESHOLD,
+        window_padding_seconds: float = CORRECTION_WINDOW_PADDING_SECONDS,
+    ) -> None:
+        self.secondary_provider = secondary_provider
+        self.resolver = resolver
+        self.confidence_threshold = confidence_threshold
+        self.window_padding_seconds = window_padding_seconds
+
+    def correct_file_result(self, audio_path: Path, result: FileTranscriptionResult) -> FileTranscriptionResult:
+        if not result.subtitle_cues or not result.words:
+            return result
+
+        corrected_cues = list(result.subtitle_cues)
+        changed = False
+        with tempfile.TemporaryDirectory(prefix="telegram-transcript-correction-") as temporary_dir:
+            for index, cue in enumerate(result.subtitle_cues):
+                cue_words = words_overlapping_cue(result.words, cue)
+                if not any(
+                    word.confidence is not None and word.confidence < self.confidence_threshold
+                    for word in cue_words
+                ):
+                    continue
+
+                logger.info(
+                    "Rechecking low-confidence Iraqi Arabic cue %d at %.3f-%.3f seconds.",
+                    index + 1,
+                    cue.start_seconds,
+                    cue.end_seconds,
+                )
+
+                window_path = Path(temporary_dir) / f"cue_{index:04d}.flac"
+                extract_audio_window(
+                    audio_path,
+                    window_path,
+                    start_seconds=max(0.0, cue.start_seconds - self.window_padding_seconds),
+                    end_seconds=cue.end_seconds + self.window_padding_seconds,
+                )
+                previous_text = result.subtitle_cues[index - 1].text if index else ""
+                following_text = result.subtitle_cues[index + 1].text if index + 1 < len(result.subtitle_cues) else ""
+                secondary_text = self.secondary_provider.transcribe_candidate(
+                    window_path,
+                    primary_text=cue.text,
+                    previous_text=previous_text,
+                    following_text=following_text,
+                )
+                if normalize_transcript_for_comparison(secondary_text) == normalize_transcript_for_comparison(cue.text):
+                    logger.info("Low-confidence cue %d produced an equivalent secondary candidate.", index + 1)
+                    continue
+                resolved_text = self.resolver.resolve(
+                    primary_text=cue.text,
+                    secondary_text=secondary_text,
+                    previous_text=previous_text,
+                    following_text=following_text,
+                )
+                if resolved_text not in {cue.text, secondary_text}:
+                    raise TranscriptionError("Transcription resolver attempted to invent a third candidate.")
+                if resolved_text != cue.text:
+                    corrected_cues[index] = SubtitleCue(cue.start_seconds, cue.end_seconds, resolved_text)
+                    changed = True
+                    logger.info("Low-confidence cue %d selected the secondary candidate.", index + 1)
+                else:
+                    logger.info("Low-confidence cue %d retained the primary candidate.", index + 1)
+
+        if not changed:
+            return result
+        return FileTranscriptionResult(
+            transcript="\n\n".join(cue.text for cue in corrected_cues),
+            subtitle_cues=tuple(corrected_cues),
+            words=result.words,
+        )
+
+
 class TranscriptRefiner:
     def __init__(
         self,
@@ -249,20 +527,14 @@ class TranscriptRefiner:
     ) -> None:
         self.model = model
         self.system_prompt = system_prompt
-        self.prompt_key = prompt_key
+        self.prompt_key = canonicalize_translation_prompt_key(prompt_key)
         self.client = client if client is not None else create_openrouter_client(api_key)
 
     def refine_transcript(self, transcript: str) -> str:
         blocks = parse_srt_blocks(transcript)
         if len(blocks) != 1:
             raise TranscriptionError("OpenAI cue translation requires exactly one SRT cue.")
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=build_refinement_messages(self.system_prompt, render_srt_blocks(blocks)),
-            temperature=0,
-            response_format=SRT_CUE_TRANSLATION_RESPONSE_FORMAT,
-        )
-        translation = parse_srt_cue_translation_response(extract_chat_completion_text(response))
+        translation = self.translate_srt_blocks(blocks)[0]
         return render_translated_srt_block(blocks[0], translation)
 
     def translate_srt_block(
@@ -270,17 +542,73 @@ class TranscriptRefiner:
         block: SrtBlock,
         previous_context: Sequence[tuple[SrtBlock, str]] = (),
     ) -> str:
+        return self.translate_srt_blocks((block,), previous_context=previous_context)[0]
+
+    def translate_srt_blocks(
+        self,
+        blocks: Sequence[SrtBlock],
+        *,
+        previous_context: Sequence[tuple[SrtBlock, str]] = (),
+        following_context: Sequence[SrtBlock] = (),
+    ) -> tuple[str, ...]:
+        if not blocks:
+            return ()
+        error: TranscriptionError | None = None
+        for _ in range(2):
+            try:
+                return self._request_srt_batch_translation(
+                    blocks,
+                    previous_context=previous_context,
+                    following_context=following_context,
+                )
+            except TranscriptionError as exc:
+                error = exc
+
+        if len(blocks) == 1:
+            assert error is not None
+            raise error
+
+        midpoint = len(blocks) // 2
+        left_blocks = tuple(blocks[:midpoint])
+        right_blocks = tuple(blocks[midpoint:])
+        left_translations = self.translate_srt_blocks(
+            left_blocks,
+            previous_context=previous_context,
+            following_context=(*right_blocks, *following_context)[:MAX_TRANSLATION_CONTEXT_CUES],
+        )
+        left_context = tuple(zip(left_blocks, left_translations, strict=True))
+        right_translations = self.translate_srt_blocks(
+            right_blocks,
+            previous_context=(*previous_context, *left_context)[-MAX_TRANSLATION_CONTEXT_CUES:],
+            following_context=following_context,
+        )
+        return (*left_translations, *right_translations)
+
+    def _request_srt_batch_translation(
+        self,
+        blocks: Sequence[SrtBlock],
+        *,
+        previous_context: Sequence[tuple[SrtBlock, str]],
+        following_context: Sequence[SrtBlock],
+    ) -> tuple[str, ...]:
+        use_context = self.prompt_key == "natural"
         response = self.client.chat.completions.create(
             model=self.model,
             messages=build_refinement_messages(
                 self.system_prompt,
-                render_srt_blocks((block,)),
-                previous_context=previous_context if self.prompt_key == "v2" else (),
+                render_srt_blocks(blocks),
+                previous_context=previous_context if use_context else (),
+                following_context=following_context if use_context else (),
             ),
             temperature=0,
-            response_format=SRT_CUE_TRANSLATION_RESPONSE_FORMAT,
+            response_format=SRT_BATCH_TRANSLATION_RESPONSE_FORMAT,
+            provider={"require_parameters": True},
         )
-        return parse_srt_cue_translation_response(extract_chat_completion_text(response))
+        translations = parse_srt_batch_translation_response(
+            extract_chat_completion_text(response),
+            expected_indexes=tuple(block.index for block in blocks),
+        )
+        return tuple(translations[block.index] for block in blocks)
 
 
 class SpeechTranscriber:
@@ -289,9 +617,11 @@ class SpeechTranscriber:
         *,
         speech_to_text_provider: SpeechToTextProvider,
         refiner: TranscriptRefiner | None = None,
+        corrector: LowConfidenceTranscriptCorrector | None = None,
     ) -> None:
         self.speech_to_text_provider = speech_to_text_provider
         self.refiner = refiner
+        self.corrector = corrector
 
     @property
     def provider_name(self) -> str:
@@ -349,6 +679,7 @@ class SpeechTranscriber:
         total = len(chunks)
         transcripts = []
         subtitle_cues: list[SubtitleCue] = []
+        transcript_words: list[TranscriptWord] = []
         previous_transcript = ""
         for index, chunk in enumerate(chunks, start=1):
             audio_chunk = normalize_audio_chunk(chunk)
@@ -370,11 +701,22 @@ class SpeechTranscriber:
                     previous_transcript=previous_transcript,
                 )
             )
+            if self.corrector is not None:
+                file_result = await asyncio.to_thread(
+                    self.corrector.correct_file_result,
+                    audio_chunk.path,
+                    file_result,
+                )
             text = file_result.transcript.strip()
             if text:
-                transcripts.append(text)
+                non_overlapping_text = merge_transcript_chunk_text(transcripts[-1], text) if transcripts else text
+                if non_overlapping_text:
+                    transcripts.append(non_overlapping_text)
                 previous_transcript = text
-            subtitle_cues.extend(cue.shifted(audio_chunk.start_seconds) for cue in file_result.subtitle_cues)
+            shifted_cues = tuple(cue.shifted(audio_chunk.start_seconds) for cue in file_result.subtitle_cues)
+            subtitle_cues = list(merge_overlapping_subtitle_cues(subtitle_cues, shifted_cues))
+            shifted_words = tuple(word.shifted(audio_chunk.start_seconds) for word in file_result.words)
+            transcript_words = list(merge_overlapping_transcript_words(transcript_words, shifted_words))
             if progress_callback is not None:
                 await progress_callback(
                     "chunk_transcribed",
@@ -386,31 +728,45 @@ class SpeechTranscriber:
                 )
 
         transcript = "\n\n".join(transcripts)
+        if subtitle_cues:
+            transcript = "\n\n".join(cue.text for cue in subtitle_cues)
         if not transcript.strip() or self.refiner is None or not subtitle_cues:
-            return TranscriptionResult(raw_transcript=transcript, subtitle_cues=tuple(subtitle_cues))
+            return TranscriptionResult(
+                raw_transcript=transcript,
+                subtitle_cues=tuple(subtitle_cues),
+                words=tuple(transcript_words),
+            )
 
         raw_srt_blocks = parse_srt_blocks(render_srt(subtitle_cues))
         translated_blocks = []
         translation_context: list[tuple[SrtBlock, str]] = []
-        for index, raw_srt_block in enumerate(raw_srt_blocks, start=1):
-            if progress_callback is not None:
-                await progress_callback(
-                    "refining_transcript",
-                    {
-                        "index": index,
-                        "total": len(raw_srt_blocks),
-                        "raw_chars": len(render_srt_blocks((raw_srt_block,))),
-                        "raw_bytes": len(render_srt_blocks((raw_srt_block,)).encode("utf-8")),
-                        "model": self.refiner.model,
-                    },
-                )
-            translation = await asyncio.to_thread(
-                self.refiner.translate_srt_block,
-                raw_srt_block,
+        for batch_start in range(0, len(raw_srt_blocks), TRANSLATION_BATCH_CUES):
+            target_blocks = raw_srt_blocks[batch_start : batch_start + TRANSLATION_BATCH_CUES]
+            following_blocks = raw_srt_blocks[
+                batch_start + len(target_blocks) : batch_start + len(target_blocks) + MAX_TRANSLATION_CONTEXT_CUES
+            ]
+            for offset, raw_srt_block in enumerate(target_blocks, start=batch_start + 1):
+                if progress_callback is not None:
+                    await progress_callback(
+                        "refining_transcript",
+                        {
+                            "index": offset,
+                            "total": len(raw_srt_blocks),
+                            "raw_chars": len(render_srt_blocks((raw_srt_block,))),
+                            "raw_bytes": len(render_srt_blocks((raw_srt_block,)).encode("utf-8")),
+                            "model": self.refiner.model,
+                        },
+                    )
+            translations = await asyncio.to_thread(
+                translate_blocks_with_refiner,
+                self.refiner,
+                target_blocks,
                 tuple(translation_context[-MAX_TRANSLATION_CONTEXT_CUES:]),
+                following_blocks,
             )
-            translated_blocks.append(render_translated_srt_block(raw_srt_block, translation))
-            translation_context.append((raw_srt_block, translation))
+            for raw_srt_block, translation in zip(target_blocks, translations, strict=True):
+                translated_blocks.append(render_translated_srt_block(raw_srt_block, translation))
+                translation_context.append((raw_srt_block, translation))
         translated_srt = join_translated_srt_chunks(translated_blocks)
         line_translated_transcript = render_line_translated_transcript_from_srt(translated_srt)
         if progress_callback is not None:
@@ -426,6 +782,7 @@ class SpeechTranscriber:
             subtitle_cues=tuple(subtitle_cues),
             translated_srt=translated_srt,
             line_translated_transcript=line_translated_transcript,
+            words=tuple(transcript_words),
         )
 
 
@@ -527,7 +884,38 @@ def extract_deepgram_file_transcription_result(response: Any) -> FileTranscripti
     return FileTranscriptionResult(
         transcript=extract_deepgram_transcript_text(response),
         subtitle_cues=extract_deepgram_subtitle_cues(response),
+        words=extract_deepgram_transcript_words(response),
     )
+
+
+def extract_deepgram_transcript_words(response: Any) -> tuple[TranscriptWord, ...]:
+    words = get_nested_response_value(response, ("results", "channels", 0, "alternatives", 0, "words"))
+    if not isinstance(words, Sequence) or isinstance(words, (str, bytes)):
+        return ()
+
+    transcript_words = []
+    for word in words:
+        text = get_response_field(word, "punctuated_word") or get_response_field(word, "word")
+        start = get_response_field(word, "start")
+        end = get_response_field(word, "end")
+        confidence = get_response_field(word, "confidence")
+        if (
+            not isinstance(text, str)
+            or not text.strip()
+            or not isinstance(start, (int, float))
+            or not isinstance(end, (int, float))
+            or end <= start
+        ):
+            continue
+        transcript_words.append(
+            TranscriptWord(
+                start_seconds=float(start),
+                end_seconds=float(end),
+                text=text.strip(),
+                confidence=float(confidence) if isinstance(confidence, (int, float)) else None,
+            )
+        )
+    return tuple(transcript_words)
 
 
 def extract_deepgram_subtitle_cues(response: Any) -> tuple[SubtitleCue, ...]:
@@ -613,6 +1001,102 @@ def normalize_audio_chunk(chunk: Path | AudioChunk) -> AudioChunk:
     if isinstance(chunk, AudioChunk):
         return chunk
     return AudioChunk(path=chunk)
+
+
+def canonicalize_translation_prompt_key(prompt_key: str) -> str:
+    canonical = TRANSLATION_PROMPT_ALIASES.get(prompt_key.strip().lower())
+    if canonical is None:
+        raise TranscriptionError(f"Unknown translation prompt: {prompt_key}")
+    return canonical
+
+
+def words_overlapping_cue(
+    words: Sequence[TranscriptWord],
+    cue: SubtitleCue,
+) -> tuple[TranscriptWord, ...]:
+    return tuple(
+        word
+        for word in words
+        if word.start_seconds < cue.end_seconds and word.end_seconds > cue.start_seconds
+    )
+
+
+def normalize_transcript_for_comparison(text: str) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
+
+
+def merge_transcript_chunk_text(previous_text: str, current_text: str) -> str:
+    previous_tokens = previous_text.split()
+    current_tokens = current_text.split()
+    comparable_previous = [normalize_transcript_for_comparison(token) for token in previous_tokens]
+    comparable_current = [normalize_transcript_for_comparison(token) for token in current_tokens]
+    maximum_overlap = min(50, len(comparable_previous), len(comparable_current))
+    for size in range(maximum_overlap, 0, -1):
+        if comparable_previous[-size:] == comparable_current[:size]:
+            return " ".join(current_tokens[size:])
+    return current_text
+
+
+def merge_overlapping_subtitle_cues(
+    existing: Sequence[SubtitleCue],
+    incoming: Sequence[SubtitleCue],
+) -> tuple[SubtitleCue, ...]:
+    merged = list(existing)
+    for cue in incoming:
+        duplicate = any(
+            normalize_transcript_for_comparison(candidate.text) == normalize_transcript_for_comparison(cue.text)
+            and candidate.start_seconds < cue.end_seconds
+            and candidate.end_seconds > cue.start_seconds
+            for candidate in merged
+        )
+        if not duplicate:
+            merged.append(cue)
+    return tuple(sorted(merged, key=lambda item: (item.start_seconds, item.end_seconds)))
+
+
+def merge_overlapping_transcript_words(
+    existing: Sequence[TranscriptWord],
+    incoming: Sequence[TranscriptWord],
+) -> tuple[TranscriptWord, ...]:
+    merged = list(existing)
+    for word in incoming:
+        duplicate = any(
+            normalize_transcript_for_comparison(candidate.text) == normalize_transcript_for_comparison(word.text)
+            and candidate.start_seconds < word.end_seconds
+            and candidate.end_seconds > word.start_seconds
+            for candidate in merged[-20:]
+        )
+        if not duplicate:
+            merged.append(word)
+    return tuple(sorted(merged, key=lambda item: (item.start_seconds, item.end_seconds)))
+
+
+def translate_blocks_with_refiner(
+    refiner: Any,
+    blocks: Sequence[SrtBlock],
+    previous_context: Sequence[tuple[SrtBlock, str]],
+    following_context: Sequence[SrtBlock],
+) -> tuple[str, ...]:
+    translate_srt_blocks = getattr(refiner, "translate_srt_blocks", None)
+    if callable(translate_srt_blocks):
+        return tuple(
+            translate_srt_blocks(
+                blocks,
+                previous_context=previous_context,
+                following_context=following_context,
+            )
+        )
+
+    translations = []
+    rolling_context = list(previous_context)
+    for block in blocks:
+        translation = refiner.translate_srt_block(
+            block,
+            tuple(rolling_context[-MAX_TRANSLATION_CONTEXT_CUES:]),
+        )
+        translations.append(translation)
+        rolling_context.append((block, translation))
+    return tuple(translations)
 
 
 def format_srt_timestamp(seconds: float) -> str:
@@ -767,6 +1251,59 @@ def parse_srt_cue_translation_response(response_text: str) -> str:
     return normalized
 
 
+def parse_single_string_json_response(response_text: str, *, key: str, response_label: str) -> str:
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise TranscriptionError(f"{response_label} response was not valid JSON.") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {key}:
+        raise TranscriptionError(f"{response_label} response had an invalid object shape.")
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise TranscriptionError(f"{response_label} response did not include a non-empty {key} string.")
+    return " ".join(value.strip().split())
+
+
+def parse_srt_batch_translation_response(
+    response_text: str,
+    *,
+    expected_indexes: Sequence[str],
+) -> dict[str, str]:
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError as exc:
+        raise TranscriptionError("SRT batch translation response was not valid JSON.") from exc
+    if not isinstance(payload, Mapping) or set(payload) != {"translations"}:
+        raise TranscriptionError("SRT batch translation response had an invalid object shape.")
+    items = payload.get("translations")
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise TranscriptionError("SRT batch translation response did not include a translations array.")
+
+    expected = tuple(expected_indexes)
+    expected_set = set(expected)
+    if len(expected_set) != len(expected):
+        raise TranscriptionError("Target SRT cue IDs are not unique.")
+    translations: dict[str, str] = {}
+    for item in items:
+        if not isinstance(item, Mapping) or set(item) != {"index", "translation"}:
+            raise TranscriptionError("SRT batch translation item had an invalid object shape.")
+        index = item.get("index")
+        translation = item.get("translation")
+        if not isinstance(index, str) or index not in expected_set:
+            raise TranscriptionError("SRT batch translation returned an unknown cue ID.")
+        if index in translations:
+            raise TranscriptionError("SRT batch translation returned a duplicate cue ID.")
+        if not isinstance(translation, str) or not translation.strip():
+            raise TranscriptionError("SRT batch translation returned an empty translation.")
+        if "\n" in translation or "\r" in translation:
+            raise TranscriptionError("SRT batch translation returned a multiline translation.")
+        translations[index] = normalize_persian_translation_line(translation)
+
+    if set(translations) != expected_set:
+        raise TranscriptionError("SRT batch translation response omitted a target cue ID.")
+    return translations
+
+
 def normalize_persian_translation_line(translation: str) -> str:
     return " ".join(translation.strip().split())
 
@@ -775,18 +1312,27 @@ def build_refinement_input(
     transcript: str,
     *,
     previous_context: Sequence[tuple[SrtBlock, str]] = (),
+    following_context: Sequence[SrtBlock] = (),
 ) -> str:
-    context = ""
+    previous = ""
     if previous_context:
         rendered_context = []
         for block, translation in previous_context:
             rendered_context.append(
                 f"Arabic cue:\n{render_srt_blocks((block,)).strip()}\nPersian translation: {translation}"
             )
-        context = "<previous_context>\n" + "\n\n".join(rendered_context) + "\n</previous_context>\n\n"
+        previous = "<previous_context>\n" + "\n\n".join(rendered_context) + "\n</previous_context>\n\n"
+    following = ""
+    if following_context:
+        following = (
+            "<following_arabic_context>\n"
+            + render_srt_blocks(following_context).strip()
+            + "\n</following_arabic_context>\n\n"
+        )
     return (
-        f"{SRT_TRANSLATION_REQUEST}\n\n{context}"
-        f"{CUE_TRANSLATION_START}\n{transcript}\n{CUE_TRANSLATION_END}"
+        f"{SRT_TRANSLATION_REQUEST}\n\n{previous}"
+        f"<target_cues>\n{transcript.strip()}\n</target_cues>\n\n{following}"
+        'Return JSON as {"translations":[{"index":"<cue ID>","translation":"<one Persian line>"}]}.'
     )
 
 
@@ -795,8 +1341,16 @@ def build_refinement_messages(
     transcript: str,
     *,
     previous_context: Sequence[tuple[SrtBlock, str]] = (),
+    following_context: Sequence[SrtBlock] = (),
 ) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": build_refinement_input(transcript, previous_context=previous_context)},
+        {
+            "role": "user",
+            "content": build_refinement_input(
+                transcript,
+                previous_context=previous_context,
+                following_context=following_context,
+            ),
+        },
     ]

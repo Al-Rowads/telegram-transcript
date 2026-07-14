@@ -31,13 +31,18 @@ from telegram_transcript.transcriber import (
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DEFAULT_TRANSLATION_PROMPT_KEY,
+    TRANSLATION_PROMPT_ALIASES,
     TRANSLATION_PROMPT_OPTIONS,
     DeepgramSpeechToTextProvider,
+    GeminiAudioCorrectionProvider,
     GeminiSpeechToTextProvider,
+    LowConfidenceTranscriptCorrector,
     OpenAISpeechToTextProvider,
     SpeechTranscriber,
+    TranscriptCandidateResolver,
     TranscriptRefiner,
     TranscriptionError,
+    canonicalize_translation_prompt_key,
     render_srt,
 )
 
@@ -67,7 +72,7 @@ HELP_MESSAGE = """Available commands:
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
 /model [deepgram|openai|gemini] - Show or select the transcription model.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
-/translation [normal|v2] - Show or select the translation prompt.
+/translation [natural|literal] - Show or select the translation style.
 
 Send a video, audio file, or voice note to create a transcript."""
 
@@ -155,7 +160,7 @@ def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesSt
         translation_models=frozenset(
             {settings.openrouter_refine_model, *(option.model for option in TRANSLATION_MODEL_OPTIONS.values())}
         ),
-        translation_prompts=frozenset(TRANSLATION_PROMPT_OPTIONS),
+        translation_prompts=frozenset(TRANSLATION_PROMPT_ALIASES),
     )
 
 
@@ -163,11 +168,12 @@ def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
     runtime_store = create_runtime_preferences_store(settings)
     runtime_preferences = runtime_store.load()
+    translation_prompt = canonicalize_translation_prompt_key(runtime_preferences.translation_prompt)
     transcriber = create_transcriber(
         settings,
         runtime_preferences.transcription_model,
         translation_model=runtime_preferences.translation_model,
-        translation_prompt=runtime_preferences.translation_prompt,
+        translation_prompt=translation_prompt,
     )
 
     app = (
@@ -181,7 +187,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["transcriber"] = transcriber
     app.bot_data["transcription_model"] = runtime_preferences.transcription_model
     app.bot_data["translation_model"] = runtime_preferences.translation_model
-    app.bot_data["translation_prompt"] = runtime_preferences.translation_prompt
+    app.bot_data["translation_prompt"] = translation_prompt
     app.bot_data["runtime_preferences_store"] = runtime_store
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
     app.bot_data["audio_tempo"] = runtime_preferences.audio_tempo
@@ -204,18 +210,32 @@ def create_transcriber(
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
 ) -> SpeechTranscriber:
     speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
+    canonical_prompt = canonicalize_translation_prompt_key(translation_prompt)
 
     refiner = (
         TranscriptRefiner(
             api_key=settings.openrouter_api_key,
             model=translation_model or settings.openrouter_refine_model,
-            system_prompt=TRANSLATION_PROMPT_OPTIONS[translation_prompt],
-            prompt_key=translation_prompt,
+            system_prompt=TRANSLATION_PROMPT_OPTIONS[canonical_prompt],
+            prompt_key=canonical_prompt,
         )
         if settings.refine
         else None
     )
-    return SpeechTranscriber(speech_to_text_provider=speech_to_text_provider, refiner=refiner)
+    corrector = None
+    if model_key == "deepgram" and settings.openrouter_api_key:
+        corrector = LowConfidenceTranscriptCorrector(
+            secondary_provider=GeminiAudioCorrectionProvider(api_key=settings.openrouter_api_key),
+            resolver=TranscriptCandidateResolver(
+                api_key=settings.openrouter_api_key,
+                model=translation_model or settings.openrouter_refine_model,
+            ),
+        )
+    return SpeechTranscriber(
+        speech_to_text_provider=speech_to_text_provider,
+        refiner=refiner,
+        corrector=corrector,
+    )
 
 
 def create_speech_to_text_provider(settings: Settings, model_key: str) -> object:
@@ -230,6 +250,7 @@ def create_speech_to_text_provider(settings: Settings, model_key: str) -> object
             api_key=settings.deepgram_api_key,
             model=settings.deepgram_transcribe_model,
             language=settings.deepgram_language,
+            keyterms=settings.deepgram_keyterms,
         )
     if option.provider == "openai":
         if not settings.openrouter_api_key:
@@ -425,8 +446,8 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
         await reply_to_source(message, format_unknown_translation_prompt_message())
         return
 
-    prompt_key = args[0].strip().lower()
-    if prompt_key not in TRANSLATION_PROMPT_OPTIONS:
+    prompt_key = TRANSLATION_PROMPT_ALIASES.get(args[0].strip().lower())
+    if prompt_key is None:
         await reply_to_source(message, format_unknown_translation_prompt_message())
         return
     try:
@@ -521,7 +542,7 @@ async def process_media_message(
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
         source_path = work_dir / f"source{get_media_attachment_suffix(attachment)}"
-        audio_path = work_dir / "audio.mp3"
+        audio_path = work_dir / "audio.flac"
 
         status = await reply_to_source(
             message,
@@ -555,10 +576,10 @@ async def process_media_message(
             await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
             return
 
-        await edit_status_message(status, f"Step 2/6: extracting MP3 audio at {audio_tempo:g}x...", job_id=job_id)
+        await edit_status_message(status, f"Step 2/6: extracting lossless FLAC audio at {audio_tempo:g}x...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
-            "job %s step 2/6 extracting MP3 audio: source_bytes=%d audio_tempo=%g",
+            "job %s step 2/6 extracting FLAC audio: source_bytes=%d audio_tempo=%g",
             job_id,
             source_bytes,
             audio_tempo,
@@ -571,7 +592,7 @@ async def process_media_message(
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(
-            "job %s step 2/6 extracted MP3 audio: audio_bytes=%d duration_ms=%d",
+            "job %s step 2/6 extracted FLAC audio: audio_bytes=%d duration_ms=%d",
             job_id,
             audio_bytes,
             elapsed_ms(step_started),
@@ -859,8 +880,10 @@ def get_runtime_translation_model(context: ContextTypes.DEFAULT_TYPE, settings: 
 
 def get_runtime_translation_prompt(context: ContextTypes.DEFAULT_TYPE) -> str:
     candidate = context.bot_data.get("translation_prompt", DEFAULT_TRANSLATION_PROMPT_KEY)
-    if isinstance(candidate, str) and candidate in TRANSLATION_PROMPT_OPTIONS:
-        return candidate
+    if isinstance(candidate, str):
+        canonical = TRANSLATION_PROMPT_ALIASES.get(candidate)
+        if canonical is not None:
+            return canonical
     return DEFAULT_TRANSLATION_PROMPT_KEY
 
 
@@ -944,13 +967,13 @@ def format_translation_prompt_settings_message(context: ContextTypes.DEFAULT_TYP
     current_prompt = get_runtime_translation_prompt(context)
     return (
         f"Current translation prompt: {current_prompt}\n\n"
-        "Available prompts:\n- normal\n- v2\n\n"
-        "Use /translation normal or /translation v2."
+        "Available prompts:\n- natural\n- literal\n\n"
+        "Use /translation natural or /translation literal. Legacy aliases v2 and normal remain accepted."
     )
 
 
 def format_unknown_translation_prompt_message() -> str:
-    return "Unknown translation prompt. Available prompts: normal, v2."
+    return "Unknown translation prompt. Available prompts: natural, literal."
 
 
 def is_model_option_configured(option: TranscriptionModelOption, settings: Settings) -> bool:

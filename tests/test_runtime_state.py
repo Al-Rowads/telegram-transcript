@@ -10,13 +10,13 @@ from telegram_transcript.runtime_state import RuntimePreferences, RuntimePrefere
 
 def make_store(tmp_path: object) -> RuntimePreferencesStore:
     path = tmp_path / "runtime.json"
-    defaults = RuntimePreferences(1.0, "gemini", "openai/gpt-5.5", "normal")
+    defaults = RuntimePreferences(1.0, "gemini", "openai/gpt-5.5", "natural")
     return RuntimePreferencesStore(
         path,
         defaults=defaults,
         transcription_models=frozenset({"gemini", "deepgram"}),
         translation_models=frozenset({"openai/gpt-5.5", "anthropic/claude-sonnet-4.6"}),
-        translation_prompts=frozenset({"normal", "v2"}),
+        translation_prompts=frozenset({"natural", "literal", "normal", "v2"}),
     )
 
 

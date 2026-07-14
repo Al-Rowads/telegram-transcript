@@ -9,14 +9,15 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Works in private chats, groups, and supergroups.
 - Ignores text, unsupported media, invalid commands, and oversized media without replying.
 - Downloads bot media through Telethon, allowing media up to Telegram's 2 GiB file limit.
-- Converts media audio to slowed mono 16 kHz MP3 with `ffmpeg`.
-- Splits converted audio longer than 1300 seconds into 1300-second chunks before sending each chunk to the selected provider.
+- Converts media audio to lossless mono 16 kHz FLAC with `ffmpeg`.
+- Splits converted audio longer than 1300 seconds near silence boundaries, adds 1.5 seconds of overlap, and removes duplicate overlap cues.
 - Uses OpenRouter `google/gemini-3.5-flash` for speech-to-text by default.
 - Supports runtime transcription model selection with `/model`: OpenRouter Gemini 3.5 Flash, OpenRouter `openai/whisper-large-v3`, or direct Deepgram Nova-3 as a manual fallback.
 - Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
-- Supports `/translation normal` and `/translation v2` to select literal or context-aware translation behavior.
+- Supports `/translation natural` and `/translation literal`; legacy `v2` and `normal` aliases remain accepted.
 - Persists successful command selections across bot and container restarts.
-- Optionally translates each SRT cue to exactly one Persian line and derives a line-by-line Arabic/Persian transcript from the translated SRT.
+- Optionally translates batches of up to 12 SRT cues with preceding and following context, while preserving one Persian line and the original timing for every cue.
+- For Deepgram results, preserves word confidence and rechecks only low-confidence Iraqi Arabic cues with a constrained Gemini candidate and resolver.
 - Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
 - Optional Telegram user allowlist to control usage.
@@ -41,12 +42,13 @@ Required variables:
 Optional variables:
 
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
-- `DEEPGRAM_LANGUAGE`: defaults to `ar`.
+- `DEEPGRAM_LANGUAGE`: defaults to Iraqi Arabic (`ar-IQ`).
+- `DEEPGRAM_KEYTERMS`: optional comma-separated Nova-3 keyterms for important names and terminology.
 - `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.5`.
 - `REFINE`: set to `true` to run OpenAI SRT translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
-- `AUDIO_TEMPO`: tempo for the generated MP3. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
+- `AUDIO_TEMPO`: tempo for the generated FLAC. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
 - `MAX_CONCURRENT_JOBS`: simultaneous transcription jobs. Defaults to `1`.
 - `RUNTIME_STATE_PATH`: JSON file used for durable bot-wide command settings. Defaults to `data/runtime-settings.json`.
 
@@ -87,7 +89,7 @@ Use `/model` to show the active transcription model and available providers. Use
 
 Use `/tmodel` to show the active translation model and whether translation is enabled. Use `/tmodel gemini`, `/tmodel gpt`, or `/tmodel claude` to switch translation for future media. Selecting a model does not enable translation when `REFINE=false`.
 
-Use `/translation` to show the active translation prompt. Use `/translation normal` for isolated, faithful cue translation or `/translation v2` for cohesive translation using the five preceding Arabic cues and their completed Persian translations.
+Use `/translation` to show the active translation style. Use `/translation natural` for conversational Persian informed by five preceding translated cues and five following Arabic cues, or `/translation literal` for a closer standard-Persian rendering. `/translation v2` maps to `natural` and `/translation normal` maps to `literal` for compatibility.
 
 Successful `/tempo`, `/model`, `/tmodel`, and `/translation` changes are bot-wide and written atomically to `RUNTIME_STATE_PATH`. Docker Compose mounts `/app/data` as a named volume so selections survive container recreation.
 
@@ -97,7 +99,11 @@ If the bot should process ordinary group video messages without being mentioned 
 
 When the selected transcription provider returns or can produce timestamps, the bot sends `transcript.srt` after the plain transcript. Deepgram timestamps come from Deepgram utterances or words. OpenRouter Whisper currently returns plain transcription text without speaker diarization or SRT cues. Gemini is prompted to return valid SRT directly. The plain transcript message is derived by removing SRT cue numbers, timestamps, and green font markup when present.
 
-With `REFINE=true`, each rendered SRT cue is sent through OpenRouter separately for Persian translation. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one normalized Persian line per cue, and rejects empty or malformed translation responses.
+With `REFINE=true`, rendered SRT cues are translated through OpenRouter in batches of up to 12. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one validated Persian line per cue, retries one malformed batch, then recursively splits it. A malformed single-cue response fails visibly instead of producing an untranslated fallback.
+
+## Quality Evaluation
+
+The production transcription default remains Gemini until a representative private Iraqi Arabic evaluation passes the quality gate. Follow [`quality/README.md`](quality/README.md) to compare current and candidate transcripts. The included evaluator reports WER, CER, relative WER improvement, and whether the candidate clears the required 10% relative WER improvement.
 
 ## Tests
 

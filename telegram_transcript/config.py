@@ -29,6 +29,7 @@ class Settings:
     deepgram_api_key: str = ""
     deepgram_transcribe_model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
     deepgram_language: str = DEFAULT_DEEPGRAM_LANGUAGE
+    deepgram_keyterms: tuple[str, ...] = ()
     openrouter_api_key: str = ""
     openrouter_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = False
@@ -65,6 +66,9 @@ def load_settings(
         or DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
     )
     deepgram_language = source.get("DEEPGRAM_LANGUAGE", DEFAULT_DEEPGRAM_LANGUAGE).strip() or DEFAULT_DEEPGRAM_LANGUAGE
+    deepgram_keyterms = parse_comma_separated_values(source.get("DEEPGRAM_KEYTERMS"))
+    if len(deepgram_keyterms) > 100:
+        raise ConfigError("DEEPGRAM_KEYTERMS supports at most 100 unique terms.")
 
     openrouter_api_key = require_value(source, "OPENROUTER_API_KEY")
     refine_model = (
@@ -83,6 +87,7 @@ def load_settings(
         deepgram_api_key=deepgram_api_key,
         deepgram_transcribe_model=deepgram_model,
         deepgram_language=deepgram_language,
+        deepgram_keyterms=deepgram_keyterms,
         openrouter_api_key=openrouter_api_key,
         openrouter_refine_model=refine_model,
         refine=refine,
@@ -122,6 +127,12 @@ def parse_user_ids(raw: str | None) -> frozenset[int]:
         except ValueError as exc:
             raise ConfigError(f"Invalid Telegram user ID: {candidate}") from exc
     return frozenset(user_ids)
+
+
+def parse_comma_separated_values(raw: str | None) -> tuple[str, ...]:
+    if not raw or not raw.strip():
+        return ()
+    return tuple(dict.fromkeys(part.strip() for part in raw.split(",") if part.strip()))
 
 
 def parse_positive_float(raw: str | None, name: str, default: float) -> float:

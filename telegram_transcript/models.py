@@ -11,6 +11,22 @@ class AudioChunk:
 
 
 @dataclass(frozen=True)
+class TranscriptWord:
+    start_seconds: float
+    end_seconds: float
+    text: str
+    confidence: float | None = None
+
+    def shifted(self, offset_seconds: float) -> TranscriptWord:
+        return TranscriptWord(
+            start_seconds=self.start_seconds + offset_seconds,
+            end_seconds=self.end_seconds + offset_seconds,
+            text=self.text,
+            confidence=self.confidence,
+        )
+
+
+@dataclass(frozen=True)
 class SubtitleCue:
     start_seconds: float
     end_seconds: float
@@ -28,6 +44,7 @@ class SubtitleCue:
 class FileTranscriptionResult:
     transcript: str
     subtitle_cues: tuple[SubtitleCue, ...] = ()
+    words: tuple[TranscriptWord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -37,6 +54,7 @@ class TranscriptionResult:
     subtitle_cues: tuple[SubtitleCue, ...] = ()
     translated_srt: str | None = None
     line_translated_transcript: str | None = None
+    words: tuple[TranscriptWord, ...] = ()
 
     @property
     def final_transcript(self) -> str:
