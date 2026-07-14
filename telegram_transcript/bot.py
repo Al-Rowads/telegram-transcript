@@ -31,6 +31,7 @@ from telegram_transcript.transcriber import (
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
     DEFAULT_TRANSLATION_PROMPT_KEY,
+    DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
     TRANSLATION_PROMPT_ALIASES,
     TRANSLATION_PROMPT_OPTIONS,
     DeepgramSpeechToTextProvider,
@@ -38,6 +39,7 @@ from telegram_transcript.transcriber import (
     GeminiSpeechToTextProvider,
     LowConfidenceTranscriptCorrector,
     OpenAISpeechToTextProvider,
+    OpenRouterWhisperSpeechToTextProvider,
     SpeechTranscriber,
     TranscriptCandidateResolver,
     TranscriptRefiner,
@@ -70,7 +72,7 @@ HELP_MESSAGE = """Available commands:
 /help - Show this help message (deleted after 20 seconds).
 /start - Start the bot (currently no additional setup is required).
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
-/model [deepgram|openai|gemini] - Show or select the primary transcription model.
+/model [gemini|deepgram|whisper|openai] - Show or select the primary transcription model.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 
@@ -93,11 +95,23 @@ class TranslationModelOption:
 
 
 TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
+    "gemini": TranscriptionModelOption(
+        key="gemini",
+        provider="gemini",
+        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        label="OpenRouter Gemini 3.5 Flash",
+    ),
     "deepgram": TranscriptionModelOption(
         key="deepgram",
         provider="deepgram",
         model=DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
         label=f"Deepgram {DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL}",
+    ),
+    "whisper": TranscriptionModelOption(
+        key="whisper",
+        provider="whisper",
+        model=DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
+        label="OpenAI: Whisper Large V3",
     ),
     "openai": TranscriptionModelOption(
         key="openai",
@@ -105,14 +119,8 @@ TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
         model=DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
         label="Direct OpenAI whisper-1",
     ),
-    "gemini": TranscriptionModelOption(
-        key="gemini",
-        provider="gemini",
-        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
-        label="OpenRouter Gemini 3.5 Flash",
-    ),
 }
-TRANSCRIPTION_FALLBACK_ORDER = ("gemini", "deepgram", "openai")
+TRANSCRIPTION_FALLBACK_ORDER = ("gemini", "deepgram", "whisper", "openai")
 TRANSCRIPTION_MODEL_ALIASES = {
     option.key: option.key
     for option in TRANSCRIPTION_MODEL_OPTIONS.values()
@@ -268,6 +276,13 @@ def create_speech_to_text_provider(settings: Settings, model_key: str) -> object
         if not settings.openai_api_key:
             raise ConfigError("OPENAI_API_KEY is required for direct OpenAI transcription.")
         return OpenAISpeechToTextProvider(api_key=settings.openai_api_key, model=option.model)
+    if option.provider == "whisper":
+        if not settings.openrouter_api_key:
+            raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter Whisper transcription.")
+        return OpenRouterWhisperSpeechToTextProvider(
+            api_key=settings.openrouter_api_key,
+            model=option.model,
+        )
     if option.provider == "gemini":
         if not settings.openrouter_api_key:
             raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter transcription.")
@@ -988,7 +1003,7 @@ def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: 
         availability = "available" if is_model_option_configured(option, settings) else "missing credentials"
         lines.append(f"- {option.key}: {option.label} ({availability})")
     lines.append("")
-    lines.append("Use /model deepgram, /model openai, or /model gemini.")
+    lines.append("Use /model gemini, /model deepgram, /model whisper, or /model openai.")
     return "\n".join(lines)
 
 
@@ -1039,7 +1054,7 @@ def is_model_option_configured(option: TranscriptionModelOption, settings: Setti
         return bool(settings.deepgram_api_key)
     if option.provider == "openai":
         return bool(settings.openai_api_key)
-    if option.provider == "gemini":
+    if option.provider in {"gemini", "whisper"}:
         return bool(settings.openrouter_api_key)
     return False
 

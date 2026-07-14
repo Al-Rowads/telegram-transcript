@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar-IQ"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_REQUIRE_PARAMETERS_BODY: dict[str, object] = {
+    "provider": {"require_parameters": True},
+}
+DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
 DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "google/gemini-3.5-flash"
 DEFAULT_REFINEMENT_MODEL = "openai/gpt-5.5"
@@ -265,24 +269,39 @@ class OpenAISpeechToTextProvider:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        request: dict[str, object] = {
-            "model": self.model,
-            "language": "ar",
-            "temperature": 0,
-            "response_format": "verbose_json",
-            "timestamp_granularities": ["segment"],
-        }
-        if previous_transcript.strip():
-            request["prompt"] = (
-                "The audio is Iraqi Arabic. The immediately preceding transcript was: "
-                + previous_transcript.strip()[-1000:]
-            )
-        try:
-            with audio_path.open("rb") as audio_file:
-                response = self.client.audio.transcriptions.create(file=audio_file, **request)
-        except OpenAIError as exc:
-            raise TranscriptionError("OpenAI transcription request failed.") from exc
-        return extract_openai_file_transcription_result(response)
+        return transcribe_timestamped_audio_file(
+            self.client,
+            audio_path,
+            model=self.model,
+            previous_transcript=previous_transcript,
+            failure_message="OpenAI transcription request failed.",
+        )
+
+
+class OpenRouterWhisperSpeechToTextProvider:
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str = DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
+        client: Any | None = None,
+    ) -> None:
+        self.provider_name = "whisper"
+        self.model = model
+        self.client = client if client is not None else create_openrouter_transcription_client(api_key)
+
+    def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
+        return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
+
+    def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+        return transcribe_timestamped_audio_file(
+            self.client,
+            audio_path,
+            model=self.model,
+            previous_transcript=previous_transcript,
+            extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
+            failure_message="OpenRouter Whisper transcription request failed.",
+        )
 
 
 class GeminiSpeechToTextProvider:
@@ -388,7 +407,7 @@ class GeminiAudioCorrectionProvider:
             ],
             temperature=0,
             response_format=CORRECTION_TRANSCRIPTION_RESPONSE_FORMAT,
-            provider={"require_parameters": True},
+            extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
         )
         return parse_single_string_json_response(
             extract_chat_completion_text(response),
@@ -438,7 +457,7 @@ class TranscriptCandidateResolver:
             ],
             temperature=0,
             response_format=CORRECTION_RESOLUTION_RESPONSE_FORMAT,
-            provider={"require_parameters": True},
+            extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
         )
         choice = parse_single_string_json_response(
             extract_chat_completion_text(response),
@@ -615,7 +634,7 @@ class TranscriptRefiner:
             ),
             temperature=0,
             response_format=SRT_BATCH_TRANSLATION_RESPONSE_FORMAT,
-            provider={"require_parameters": True},
+            extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
         )
         translations = parse_srt_batch_translation_response(
             extract_chat_completion_text(response),
@@ -980,6 +999,15 @@ def create_openrouter_client(api_key: str) -> OpenAI:
     )
 
 
+def create_openrouter_transcription_client(api_key: str) -> OpenAI:
+    return OpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        timeout=TRANSCRIPTION_REQUEST_TIMEOUT_SECONDS,
+        max_retries=TRANSCRIPTION_MAX_RETRIES,
+    )
+
+
 def create_openai_client(api_key: str) -> OpenAI:
     return OpenAI(
         api_key=api_key,
@@ -990,6 +1018,37 @@ def create_openai_client(api_key: str) -> OpenAI:
 
 def encode_audio_file(audio_path: Path) -> str:
     return base64.b64encode(audio_path.read_bytes()).decode("ascii")
+
+
+def transcribe_timestamped_audio_file(
+    client: Any,
+    audio_path: Path,
+    *,
+    model: str,
+    previous_transcript: str,
+    failure_message: str,
+    extra_body: Mapping[str, object] | None = None,
+) -> FileTranscriptionResult:
+    request: dict[str, object] = {
+        "model": model,
+        "language": "ar",
+        "temperature": 0,
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+    }
+    if previous_transcript.strip():
+        request["prompt"] = (
+            "The audio is Iraqi Arabic. The immediately preceding transcript was: "
+            + previous_transcript.strip()[-1000:]
+        )
+    if extra_body is not None:
+        request["extra_body"] = dict(extra_body)
+    try:
+        with audio_path.open("rb") as audio_file:
+            response = client.audio.transcriptions.create(file=audio_file, **request)
+    except OpenAIError as exc:
+        raise TranscriptionError(failure_message) from exc
+    return extract_openai_file_transcription_result(response)
 
 
 def extract_openai_file_transcription_result(response: Any) -> FileTranscriptionResult:

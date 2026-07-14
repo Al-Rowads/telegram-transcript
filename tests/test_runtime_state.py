@@ -14,7 +14,7 @@ def make_store(tmp_path: object) -> RuntimePreferencesStore:
     return RuntimePreferencesStore(
         path,
         defaults=defaults,
-        transcription_models=frozenset({"gemini", "deepgram"}),
+        transcription_models=frozenset({"gemini", "deepgram", "whisper"}),
         translation_models=frozenset({"openai/gpt-5.5", "anthropic/claude-sonnet-4.6"}),
         translation_prompts=frozenset({"natural", "literal", "normal", "v2"}),
     )
@@ -24,7 +24,7 @@ def test_runtime_preferences_round_trip_and_use_defaults_when_missing(tmp_path: 
     store = make_store(tmp_path)
     assert store.load() == store.defaults
 
-    preferences = RuntimePreferences(1.2, "deepgram", "anthropic/claude-sonnet-4.6", "v2")
+    preferences = RuntimePreferences(1.2, "whisper", "anthropic/claude-sonnet-4.6", "v2")
     store.save(preferences)
 
     assert store.load() == preferences

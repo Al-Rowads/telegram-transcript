@@ -12,8 +12,8 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Converts media audio to lossless mono 16 kHz FLAC with `ffmpeg`.
 - Splits converted audio into at most 420-second, 13 MiB chunks near silence boundaries, including 1.5 seconds of overlap, and removes duplicate overlap cues.
 - Uses OpenRouter `google/gemini-3.5-flash` for speech-to-text by default.
-- Automatically retries only a failed chunk using the selected model first, then the remaining providers in Gemini, Deepgram, OpenAI preference order.
-- Supports runtime primary-model selection with `/model`: OpenRouter Gemini 3.5 Flash, direct Deepgram Nova-3, or direct OpenAI Whisper.
+- Automatically retries only a failed chunk using the selected model first, then the remaining providers in Gemini, Deepgram, Whisper Large V3, OpenAI preference order.
+- Supports runtime primary-model selection with `/model`: OpenRouter Gemini 3.5 Flash, direct Deepgram Nova-3, OpenRouter `openai/whisper-large-v3`, or direct OpenAI `whisper-1`.
 - Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
 - Supports `/translation natural` and `/translation literal`; legacy `v2` and `normal` aliases remain accepted.
 - Persists successful command selections across bot and container restarts.
@@ -37,7 +37,7 @@ Required variables:
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
 - `TELEGRAM_API_ID`: Telegram API ID from https://my.telegram.org for Telethon downloads.
 - `TELEGRAM_API_HASH`: Telegram API hash from https://my.telegram.org for Telethon downloads.
-- `OPENROUTER_API_KEY`: OpenRouter key for Gemini transcription and optional Persian refinement.
+- `OPENROUTER_API_KEY`: OpenRouter key for Gemini and Whisper Large V3 transcription and optional Persian refinement.
 - `DEEPGRAM_API_KEY`: Deepgram API key for Nova-3 transcription and automatic fallback.
 - `OPENAI_API_KEY`: direct OpenAI API key for the timestamp-capable `whisper-1` fallback.
 
@@ -87,7 +87,7 @@ Add the bot to a group or supergroup to transcribe videos posted there. The bot 
 
 Use `/tempo 1.2` in a group or supergroup to change the audio tempo for future videos. Valid values are from `0.5` to `2.0`.
 
-Use `/model` to show the primary transcription model and available providers. Use `/model deepgram`, `/model openai`, or `/model gemini` to select the first provider tried for each chunk. Failed chunks automatically try the remaining providers; this temporary fallback does not change the saved primary model.
+Use `/model` to show the primary transcription model and available providers. Use `/model gemini`, `/model deepgram`, `/model whisper`, or `/model openai` to select the first provider tried for each chunk. Failed chunks automatically try the remaining providers in Gemini, Deepgram, Whisper Large V3, OpenAI preference order; this temporary fallback does not change the saved primary model.
 
 Use `/tmodel` to show the active translation model and whether translation is enabled. Use `/tmodel gemini`, `/tmodel gpt`, or `/tmodel claude` to switch translation for future media. Selecting a model does not enable translation when `REFINE=false`.
 
@@ -99,7 +99,7 @@ If the bot should process ordinary group video messages without being mentioned 
 
 ## Subtitle Files
 
-The bot sends `transcript.srt` after the plain transcript. Gemini is prompted to return valid SRT directly, Deepgram timestamps come from utterances or words, and direct OpenAI `whisper-1` returns structured segment timestamps that are rendered locally. A provider result with spoken text but no valid timestamps is rejected and the same chunk is tried with the next provider. The plain transcript is derived from the validated cues.
+The bot sends `transcript.srt` after the plain transcript. Gemini is prompted to return valid SRT directly, Deepgram timestamps come from utterances or words, and both OpenRouter Whisper Large V3 and direct OpenAI `whisper-1` return structured segment timestamps that are rendered locally. A provider result with spoken text but no valid timestamps is rejected and the same chunk is tried with the next provider. The plain transcript is derived from the validated cues.
 
 With `REFINE=true`, rendered SRT cues are translated through OpenRouter in batches of up to 12. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one validated Persian line per cue, retries one malformed batch, then recursively splits it. If translation ultimately fails, the validated raw transcript and SRT are still delivered with a warning.
 

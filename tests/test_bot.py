@@ -113,14 +113,21 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
 
     assert transcriber.provider_name == "gemini"
     assert transcriber.model == "google/gemini-3.5-flash"
+    assert tuple(provider.provider_name for provider in transcriber.speech_to_text_providers) == (
+        "gemini",
+        "deepgram",
+        "whisper",
+        "openai",
+    )
 
 
 @pytest.mark.parametrize(
     ("selected", "expected"),
     [
-        ("gemini", ("gemini", "deepgram", "openai")),
-        ("deepgram", ("deepgram", "gemini", "openai")),
-        ("openai", ("openai", "gemini", "deepgram")),
+        ("gemini", ("gemini", "deepgram", "whisper", "openai")),
+        ("deepgram", ("deepgram", "gemini", "whisper", "openai")),
+        ("whisper", ("whisper", "gemini", "deepgram", "openai")),
+        ("openai", ("openai", "gemini", "deepgram", "whisper")),
     ],
 )
 def test_transcription_model_order_uses_selected_provider_first(
@@ -128,6 +135,18 @@ def test_transcription_model_order_uses_selected_provider_first(
     expected: tuple[str, ...],
 ) -> None:
     assert bot_module.get_transcription_model_order(selected) == expected
+
+
+@pytest.mark.parametrize(
+    ("argument", "expected"),
+    [
+        ("Whisper", "whisper"),
+        (" openai/whisper-large-v3 ", "whisper"),
+        ("openai", "openai"),
+    ],
+)
+def test_parse_model_command_arg_accepts_whisper_aliases(argument: str, expected: str) -> None:
+    assert bot_module.parse_model_command_arg(argument) == expected
 
 
 @pytest.mark.parametrize(
@@ -247,7 +266,7 @@ async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: p
     reply = message.text_replies[0]
     assert "/help - Show this help message" in reply
     assert "/tempo <0.5-2.0>" in reply
-    assert "/model [deepgram|openai|gemini]" in reply
+    assert "/model [gemini|deepgram|whisper|openai]" in reply
     assert "/tmodel [gemini|gpt|claude]" in reply
     assert "/translation [natural|literal]" in reply
     assert message.text_reply_kwargs == [
@@ -483,6 +502,7 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
     await handle_model_command(update, context)
 
     assert "Current primary transcription model: Deepgram nova-3" in message.text_replies[0]
+    assert "whisper: OpenAI: Whisper Large V3 (available)" in message.text_replies[0]
     assert "openai: Direct OpenAI whisper-1 (available)" in message.text_replies[0]
     assert "gemini: OpenRouter Gemini 3.5 Flash (available)" in message.text_replies[0]
     assert message.text_reply_kwargs == [
@@ -507,14 +527,14 @@ async def test_handle_model_command_switches_runtime_transcriber(
         runtime_state_path=tmp_path / "runtime.json",
     )
     context = SimpleNamespace(
-        args=["gemini"],
+        args=["Whisper"],
         bot_data={
             "settings": settings,
             "translation_model": "anthropic/claude-sonnet-4.6",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
-    fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini-3.5-flash")
+    fake_transcriber = SimpleNamespace(provider_name="whisper", model="openai/whisper-large-v3")
     calls: list[tuple[Settings, str, str | None]] = []
 
     def fake_create_transcriber(
@@ -530,11 +550,11 @@ async def test_handle_model_command_switches_runtime_transcriber(
 
     await handle_model_command(update, context)
 
-    assert calls == [(settings, "gemini", "anthropic/claude-sonnet-4.6")]
+    assert calls == [(settings, "whisper", "anthropic/claude-sonnet-4.6")]
     assert context.bot_data["transcriber"] is fake_transcriber
-    assert context.bot_data["transcription_model"] == "gemini"
-    assert context.bot_data["runtime_preferences_store"].load().transcription_model == "gemini"
-    assert message.text_replies == ["Primary transcription model set to OpenRouter Gemini 3.5 Flash."]
+    assert context.bot_data["transcription_model"] == "whisper"
+    assert context.bot_data["runtime_preferences_store"].load().transcription_model == "whisper"
+    assert message.text_replies == ["Primary transcription model set to OpenAI: Whisper Large V3."]
 
 
 @pytest.mark.asyncio
@@ -553,6 +573,21 @@ async def test_handle_model_command_rejects_missing_provider_credentials() -> No
 
 
 @pytest.mark.asyncio
+async def test_handle_model_command_requires_openrouter_for_whisper() -> None:
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=["whisper"],
+        bot_data={"settings": Settings(telegram_bot_token="token", deepgram_api_key="deepgram-key")},
+    )
+
+    await handle_model_command(update, context)
+
+    assert message.text_replies == ["OPENROUTER_API_KEY is required for OpenRouter Whisper transcription."]
+    assert "transcription_model" not in context.bot_data
+
+
+@pytest.mark.asyncio
 async def test_handle_model_command_rejects_unknown_model() -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
@@ -563,7 +598,9 @@ async def test_handle_model_command_rejects_unknown_model() -> None:
 
     await handle_model_command(update, context)
 
-    assert message.text_replies == ["Unknown transcription model. Available models: deepgram, openai, gemini."]
+    assert message.text_replies == [
+        "Unknown transcription model. Available models: gemini, deepgram, whisper, openai."
+    ]
 
 
 @pytest.mark.asyncio

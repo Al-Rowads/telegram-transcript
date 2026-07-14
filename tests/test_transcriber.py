@@ -13,18 +13,22 @@ from telegram_transcript.transcriber import (
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
+    DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
     CORRECTION_FAILURE_WARNING,
     TRANSLATION_FAILURE_WARNING,
     DeepgramSpeechToTextProvider,
+    GeminiAudioCorrectionProvider,
     LowConfidenceTranscriptCorrector,
     GeminiSpeechToTextProvider,
     OpenAISpeechToTextProvider,
+    OpenRouterWhisperSpeechToTextProvider,
     CUE_TRANSLATION_END,
     CUE_TRANSLATION_START,
     SRT_TRANSLATION_REQUEST,
     SRT_TRANSLATION_SYSTEM_PROMPT,
     SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT,
     SpeechTranscriber,
+    TranscriptCandidateResolver,
     TranscriptRefiner,
     TranscriptionError,
     assemble_srt_chunks,
@@ -247,6 +251,76 @@ def test_openai_provider_preserves_empty_response_for_silence_detection(tmp_path
     assert provider.transcribe_file_result(audio) == FileTranscriptionResult(transcript="")
 
 
+def test_openrouter_whisper_provider_requests_timestamped_segments(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class FakeTranscriptions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            audio_file = kwargs.pop("file")
+            self.calls.append({"file": audio_file.read(), **kwargs})
+            return SimpleNamespace(
+                text="هلا شلونك",
+                segments=[SimpleNamespace(start=0.0, end=1.5, text="هلا شلونك")],
+            )
+
+    transcriptions = FakeTranscriptions()
+    provider = OpenRouterWhisperSpeechToTextProvider(
+        api_key="key",
+        client=SimpleNamespace(audio=SimpleNamespace(transcriptions=transcriptions)),
+    )
+
+    result = provider.transcribe_file_result(audio, previous_transcript="النص السابق")
+
+    assert provider.provider_name == "whisper"
+    assert result == FileTranscriptionResult(
+        transcript="هلا شلونك",
+        subtitle_cues=(SubtitleCue(0.0, 1.5, "هلا شلونك"),),
+    )
+    assert transcriptions.calls == [{
+        "file": b"audio",
+        "model": DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
+        "language": "ar",
+        "temperature": 0,
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+        "prompt": "The audio is Iraqi Arabic. The immediately preceding transcript was: النص السابق",
+        "extra_body": {"provider": {"require_parameters": True}},
+    }]
+
+
+def test_openrouter_whisper_provider_preserves_empty_response_for_silence_detection(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    transcriptions = SimpleNamespace(create=lambda **kwargs: SimpleNamespace(text="", segments=[]))
+    provider = OpenRouterWhisperSpeechToTextProvider(
+        api_key="key",
+        client=SimpleNamespace(audio=SimpleNamespace(transcriptions=transcriptions)),
+    )
+
+    assert provider.transcribe_file_result(audio) == FileTranscriptionResult(transcript="")
+
+
+def test_openrouter_whisper_provider_wraps_api_errors(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class FailingTranscriptions:
+        def create(self, **kwargs: object) -> object:
+            raise transcriber_module.OpenAIError("request failed")
+
+    provider = OpenRouterWhisperSpeechToTextProvider(
+        api_key="key",
+        client=SimpleNamespace(audio=SimpleNamespace(transcriptions=FailingTranscriptions())),
+    )
+
+    with pytest.raises(TranscriptionError, match="OpenRouter Whisper transcription request failed"):
+        provider.transcribe_file_result(audio)
+
+
 @pytest.mark.parametrize(
     "cues",
     [
@@ -334,6 +408,66 @@ def test_gemini_provider_preserves_empty_response_for_silence_detection(tmp_path
     provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
 
     assert provider.transcribe_file_result(audio) == FileTranscriptionResult(transcript="")
+
+
+def test_gemini_audio_correction_passes_openrouter_routing_in_extra_body(tmp_path: Path) -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"transcription":"صحيح"}'))]
+            )
+
+    audio = tmp_path / "window.flac"
+    audio.write_bytes(b"audio")
+    completions = FakeCompletions()
+    provider = GeminiAudioCorrectionProvider(
+        api_key="key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    assert provider.transcribe_candidate(
+        audio,
+        primary_text="غلط",
+        previous_text="قبل",
+        following_text="بعد",
+    ) == "صحيح"
+    assert completions.calls[0]["extra_body"] == {
+        "provider": {"require_parameters": True},
+    }
+    assert "provider" not in completions.calls[0]
+
+
+def test_candidate_resolver_passes_openrouter_routing_in_extra_body() -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def create(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"choice":"secondary"}'))]
+            )
+
+    completions = FakeCompletions()
+    resolver = TranscriptCandidateResolver(
+        api_key="key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    assert resolver.resolve(
+        primary_text="غلط",
+        secondary_text="صحيح",
+        previous_text="قبل",
+        following_text="بعد",
+    ) == "صحيح"
+    assert completions.calls[0]["extra_body"] == {
+        "provider": {"require_parameters": True},
+    }
+    assert "provider" not in completions.calls[0]
 
 
 @pytest.mark.asyncio
@@ -539,7 +673,7 @@ async def test_transcribe_chunks_treats_all_empty_provider_results_as_silence(tm
         def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
             return FileTranscriptionResult(transcript="")
 
-    providers = tuple(EmptyProvider(name) for name in ("gemini", "deepgram", "openai"))
+    providers = tuple(EmptyProvider(name) for name in ("gemini", "deepgram", "whisper", "openai"))
     result = await SpeechTranscriber(
         speech_to_text_provider=providers[0],
         fallback_speech_to_text_providers=providers[1:],
@@ -569,6 +703,7 @@ async def test_transcribe_chunks_rejects_mixed_errors_and_empty_results(tmp_path
     providers = (
         Provider("gemini", fail=True),
         Provider("deepgram"),
+        Provider("whisper"),
         Provider("openai"),
     )
 
@@ -607,6 +742,81 @@ async def test_transcribe_chunks_falls_back_when_provider_returns_text_without_t
     ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
 
     assert result.raw_transcript == "valid"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "valid"),)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_retries_openai_after_whisper_returns_no_timestamps(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+    calls: list[str] = []
+
+    class WhisperProvider:
+        provider_name = "whisper"
+        model = DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            calls.append(self.provider_name)
+            return FileTranscriptionResult(transcript="text without timestamps")
+
+    class OpenAIProvider:
+        provider_name = "openai"
+        model = DEFAULT_OPENAI_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            calls.append(self.provider_name)
+            return FileTranscriptionResult(
+                transcript="valid",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "valid"),),
+            )
+
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        events.append((event, dict(data)))
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=WhisperProvider(),
+        fallback_speech_to_text_providers=(OpenAIProvider(),),
+    ).transcribe_chunks_async(
+        (AudioChunk(audio, duration_seconds=10.0),),
+        progress_callback=record_progress,
+    )
+
+    assert calls == ["whisper", "openai"]
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "valid"),)
+    fallback_event = next(data for event, data in events if event == "provider_fallback")
+    assert fallback_event["failed_provider"] == "whisper"
+    assert fallback_event["next_provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_stops_after_valid_whisper_srt(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class WhisperProvider:
+        provider_name = "whisper"
+        model = DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="valid",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "valid"),),
+            )
+
+    class UnusedOpenAIProvider:
+        provider_name = "openai"
+        model = DEFAULT_OPENAI_TRANSCRIPTION_MODEL
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            raise AssertionError("OpenAI should not be called after valid Whisper timestamps")
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=WhisperProvider(),
+        fallback_speech_to_text_providers=(UnusedOpenAIProvider(),),
+    ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
+
     assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "valid"),)
 
 
@@ -840,7 +1050,8 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
     assert call["temperature"] == 0
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["strict"] is True
-    assert call["provider"] == {"require_parameters": True}
+    assert call["extra_body"] == {"provider": {"require_parameters": True}}
+    assert "provider" not in call
 
 
 def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
