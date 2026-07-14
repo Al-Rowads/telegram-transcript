@@ -12,7 +12,8 @@ from telegram_transcript.models import AudioChunk
 
 DEFAULT_AUDIO_BITRATE_KBPS = 64
 DEFAULT_AUDIO_TEMPO = 1.0
-DEEPGRAM_CHUNK_SECONDS = 1300
+TRANSCRIPTION_CHUNK_SECONDS = 420
+MAX_AUDIO_CHUNK_BYTES = 13 * 1024 * 1024
 CHUNK_OVERLAP_SECONDS = 1.5
 SILENCE_SEARCH_SECONDS = 30.0
 SILENCE_NOISE_DB = -35
@@ -70,7 +71,7 @@ def build_extract_audio_command(
 def build_split_audio_command(
     audio_path: Path,
     output_pattern: Path,
-    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
+    chunk_seconds: int = TRANSCRIPTION_CHUNK_SECONDS,
     *,
     executable: str = "ffmpeg",
 ) -> list[str]:
@@ -273,12 +274,16 @@ def split_audio_to_timed_chunks(
     *,
     executable: str = "ffmpeg",
     probe_executable: str = "ffprobe",
-    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
+    chunk_seconds: int = TRANSCRIPTION_CHUNK_SECONDS,
     overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
+    max_chunk_bytes: int = MAX_AUDIO_CHUNK_BYTES,
 ) -> list[AudioChunk]:
     duration_seconds = probe_audio_duration_seconds(audio_path, executable=probe_executable)
-    if duration_seconds <= chunk_seconds:
-        return [AudioChunk(path=audio_path)]
+    if duration_seconds <= chunk_seconds and audio_path.stat().st_size <= max_chunk_bytes:
+        return [AudioChunk(path=audio_path, duration_seconds=duration_seconds)]
+
+    if max_chunk_bytes <= 0:
+        raise ValueError("max_chunk_bytes must be greater than zero.")
 
     chunks_dir.mkdir(parents=True, exist_ok=True)
     clear_chunk_dir(chunks_dir)
@@ -291,9 +296,10 @@ def split_audio_to_timed_chunks(
         chunk_seconds=chunk_seconds,
         overlap_seconds=overlap_seconds,
     )
-    chunks = []
-    for index, (start_seconds, end_seconds) in enumerate(ranges):
-        chunk_path = chunks_dir / f"chunk_{index:03d}.flac"
+    chunks: list[AudioChunk] = []
+
+    def extract_bounded_range(start_seconds: float, end_seconds: float) -> None:
+        chunk_path = chunks_dir / f"chunk_{len(chunks):03d}.flac"
         run_command(
             build_extract_audio_window_command(
                 audio_path,
@@ -304,9 +310,42 @@ def split_audio_to_timed_chunks(
             )
         )
         if not chunk_path.exists() or chunk_path.stat().st_size == 0:
-            raise FfmpegError(f"Unable to create audio chunk {index + 1}.")
-        chunks.append(AudioChunk(path=chunk_path, start_seconds=start_seconds))
+            raise FfmpegError(f"Unable to create audio chunk {len(chunks) + 1}.")
+        if chunk_path.stat().st_size <= max_chunk_bytes:
+            chunks.append(
+                AudioChunk(
+                    path=chunk_path,
+                    start_seconds=start_seconds,
+                    duration_seconds=end_seconds - start_seconds,
+                )
+            )
+            return
+
+        chunk_path.unlink()
+        midpoint = choose_size_split_boundary(start_seconds, end_seconds, parse_silence_end_seconds(silence_output))
+        if midpoint - start_seconds <= overlap_seconds or end_seconds - midpoint <= overlap_seconds:
+            raise FfmpegError("Unable to split audio below the provider upload limit.")
+        extract_bounded_range(start_seconds, min(end_seconds, midpoint + overlap_seconds))
+        extract_bounded_range(max(start_seconds, midpoint - overlap_seconds), end_seconds)
+
+    for start_seconds, end_seconds in ranges:
+        extract_bounded_range(start_seconds, end_seconds)
     return chunks
+
+
+def choose_size_split_boundary(
+    start_seconds: float,
+    end_seconds: float,
+    silence_ends: Sequence[float],
+) -> float:
+    if start_seconds < 0 or end_seconds <= start_seconds:
+        raise ValueError("Audio range must have a non-negative start before its end.")
+
+    midpoint = start_seconds + (end_seconds - start_seconds) / 2
+    minimum = start_seconds + (end_seconds - start_seconds) * 0.25
+    maximum = start_seconds + (end_seconds - start_seconds) * 0.75
+    candidates = [value for value in silence_ends if minimum <= value <= maximum]
+    return min(candidates, key=lambda value: abs(value - midpoint)) if candidates else midpoint
 
 
 def parse_silence_end_seconds(output: str) -> tuple[float, ...]:
@@ -317,25 +356,35 @@ def choose_silence_aware_chunk_ranges(
     duration_seconds: float,
     silence_ends: Sequence[float],
     *,
-    chunk_seconds: int = DEEPGRAM_CHUNK_SECONDS,
+    chunk_seconds: int = TRANSCRIPTION_CHUNK_SECONDS,
     overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
 ) -> tuple[tuple[float, float], ...]:
     if duration_seconds <= 0 or chunk_seconds <= 0 or overlap_seconds < 0:
         raise ValueError("Audio duration and chunk size must be positive and overlap cannot be negative.")
+    maximum_core_seconds = chunk_seconds - 2 * overlap_seconds
+    if maximum_core_seconds <= 0:
+        raise ValueError("Chunk size must be greater than twice the overlap.")
 
     boundaries = [0.0]
-    while duration_seconds - boundaries[-1] > chunk_seconds + SILENCE_SEARCH_SECONDS:
-        target = boundaries[-1] + chunk_seconds
+    while True:
+        remaining_seconds = duration_seconds - boundaries[-1]
+        maximum_remaining_seconds = chunk_seconds if len(boundaries) == 1 else chunk_seconds - overlap_seconds
+        if remaining_seconds <= maximum_remaining_seconds:
+            break
+
+        if remaining_seconds <= 2 * (chunk_seconds - overlap_seconds):
+            target = boundaries[-1] + remaining_seconds / 2
+        else:
+            target = boundaries[-1] + maximum_core_seconds
         candidates = [
             value
             for value in silence_ends
             if boundaries[-1] + 1.0 < value < duration_seconds
             and abs(value - target) <= SILENCE_SEARCH_SECONDS
+            and value - boundaries[-1] <= maximum_core_seconds
         ]
         boundary = min(candidates, key=lambda value: abs(value - target)) if candidates else target
         boundaries.append(boundary)
-    if len(boundaries) == 1 and duration_seconds > chunk_seconds:
-        boundaries.append(duration_seconds / 2)
     boundaries.append(duration_seconds)
 
     ranges = []
@@ -369,5 +418,6 @@ def extract_audio_window(
 
 
 def clear_chunk_dir(chunks_dir: Path) -> None:
-    for chunk in chunks_dir.glob("chunk_*"):
-        chunk.unlink()
+    for pattern in ("chunk_*", "candidate_*"):
+        for chunk in chunks_dir.glob(pattern):
+            chunk.unlink()

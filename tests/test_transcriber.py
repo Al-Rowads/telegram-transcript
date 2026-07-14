@@ -13,6 +13,8 @@ from telegram_transcript.transcriber import (
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
+    CORRECTION_FAILURE_WARNING,
+    TRANSLATION_FAILURE_WARNING,
     DeepgramSpeechToTextProvider,
     LowConfidenceTranscriptCorrector,
     GeminiSpeechToTextProvider,
@@ -30,6 +32,7 @@ from telegram_transcript.transcriber import (
     extract_deepgram_file_transcription_result,
     extract_deepgram_transcript_text,
     extract_deepgram_transcript_words,
+    extract_openai_file_transcription_result,
     merge_overlapping_subtitle_cues,
     parse_srt_batch_translation_response,
     parse_srt_cue_translation_response,
@@ -38,8 +41,14 @@ from telegram_transcript.transcriber import (
     render_srt,
     render_translated_srt_block,
     split_srt_by_byte_limit,
+    validate_file_transcription_result,
 )
 from telegram_transcript.models import AudioChunk, FileTranscriptionResult, SubtitleCue, TranscriptWord
+
+
+@pytest.fixture(autouse=True)
+def stub_audio_duration_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transcriber_module, "probe_audio_duration_seconds", lambda _: 3600.0)
 
 
 def test_extract_deepgram_transcript_text_from_dict() -> None:
@@ -121,6 +130,7 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             punctuate: bool,
             paragraphs: bool,
             utterances: bool,
+            request_options: dict[str, object],
         ) -> object:
             self.calls.append(
                 {
@@ -131,6 +141,7 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
                     "punctuate": punctuate,
                     "paragraphs": paragraphs,
                     "utterances": utterances,
+                    "request_options": request_options,
                 }
             )
             return {
@@ -161,6 +172,10 @@ def test_deepgram_provider_uses_nova_3_arabic(tmp_path: Path) -> None:
             "punctuate": True,
             "paragraphs": True,
             "utterances": True,
+            "request_options": {
+                "timeout_in_seconds": 300,
+                "max_retries": 2,
+            },
         }
     ]
 
@@ -187,58 +202,69 @@ def test_deepgram_provider_passes_deduplicated_keyterms(tmp_path: Path) -> None:
     assert calls[0]["keyterm"] == ("اسم", "مصطلح")
 
 
-def test_openai_provider_uses_openrouter_transcription_endpoint(tmp_path: Path) -> None:
+def test_openai_provider_uses_direct_verbose_transcription_with_segments(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return
-
-        def json(self) -> dict[str, str]:
-            return {"text": "هلا شلونك"}
-
-    class FakeSession:
+    class FakeTranscriptions:
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def post(self, url: str, **kwargs: object) -> FakeResponse:
-            self.calls.append({"url": url, **kwargs})
-            return FakeResponse()
+        def create(self, **kwargs: object) -> object:
+            audio_file = kwargs.pop("file")
+            self.calls.append({"file": audio_file.read(), **kwargs})
+            return SimpleNamespace(
+                text="هلا شلونك",
+                segments=[SimpleNamespace(start=0.0, end=1.5, text="هلا شلونك")],
+            )
 
-    fake_session = FakeSession()
-    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_session)
+    fake_transcriptions = FakeTranscriptions()
+    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
+    provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
 
     result = provider.transcribe_file_result(audio)
 
     assert result.transcript == "هلا شلونك"
-    assert result.subtitle_cues == ()
-    assert fake_session.calls[0]["url"].endswith("/audio/transcriptions")
-    assert fake_session.calls[0]["headers"]["Authorization"] == "Bearer key"
-    assert fake_session.calls[0]["json"] == {
-        "input_audio": {"data": "YXVkaW8=", "format": "mp3"},
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.5, "هلا شلونك"),)
+    assert fake_transcriptions.calls == [{
+        "file": b"audio",
         "model": DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
         "language": "ar",
         "temperature": 0,
-    }
+        "response_format": "verbose_json",
+        "timestamp_granularities": ["segment"],
+    }]
 
 
-def test_openai_provider_rejects_missing_text(tmp_path: Path) -> None:
+def test_openai_provider_preserves_empty_response_for_silence_detection(tmp_path: Path) -> None:
     audio = tmp_path / "audio.mp3"
     audio.write_bytes(b"audio")
 
-    class FakeResponse:
-        def raise_for_status(self) -> None:
-            return
-
-        def json(self) -> dict[str, str]:
-            return {"text": ""}
-
-    fake_client = SimpleNamespace(post=lambda *args, **kwargs: FakeResponse())
+    fake_transcriptions = SimpleNamespace(create=lambda **kwargs: SimpleNamespace(text="", segments=[]))
+    fake_client = SimpleNamespace(audio=SimpleNamespace(transcriptions=fake_transcriptions))
     provider = OpenAISpeechToTextProvider(api_key="key", client=fake_client)
 
-    with pytest.raises(TranscriptionError, match="OpenRouter transcription"):
-        provider.transcribe_file_result(audio)
+    assert provider.transcribe_file_result(audio) == FileTranscriptionResult(transcript="")
+
+
+@pytest.mark.parametrize(
+    "cues",
+    [
+        (SubtitleCue(-0.1, 1.0, "negative"),),
+        (SubtitleCue(1.0, 1.0, "zero duration"),),
+        (SubtitleCue(0.0, 13.0, "past tolerance"),),
+        (SubtitleCue(2.0, 3.0, "later"), SubtitleCue(1.0, 2.0, "out of order")),
+    ],
+)
+def test_validate_file_transcription_result_rejects_invalid_timestamps(
+    cues: tuple[SubtitleCue, ...],
+) -> None:
+    with pytest.raises(TranscriptionError, match="invalid subtitle timestamps"):
+        validate_file_transcription_result(
+            FileTranscriptionResult(transcript="spoken", subtitle_cues=cues),
+            duration_seconds=10.0,
+            provider_name="test",
+        )
 
 
 def test_gemini_provider_requests_srt_and_parses_response(tmp_path: Path) -> None:
@@ -294,6 +320,20 @@ def test_gemini_provider_rejects_invalid_srt(tmp_path: Path) -> None:
 
     with pytest.raises(TranscriptionError, match="SRT"):
         provider.transcribe_file_result(audio)
+
+
+def test_gemini_provider_preserves_empty_response_for_silence_detection(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.mp3"
+    audio.write_bytes(b"audio")
+
+    class FakeCompletions:
+        def create(self, **_: object) -> object:
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=""))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    provider = GeminiSpeechToTextProvider(api_key="key", client=fake_client)
+
+    assert provider.transcribe_file_result(audio) == FileTranscriptionResult(transcript="")
 
 
 @pytest.mark.asyncio
@@ -401,6 +441,242 @@ async def test_transcribe_chunks_reports_progress_and_refines(
     assert progress_events[4][1]["index"] == 1
     assert progress_events[5][1]["index"] == 2
     assert progress_events[6][1]["line_translated_transcript_chars"] == len("first\nاول\n\nsecond\nدوم\n")
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_falls_back_only_for_failed_chunk_and_restarts_primary_next_chunk(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.flac"
+    second = tmp_path / "second.flac"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    class PrimaryProvider:
+        provider_name = "gemini"
+        model = "gemini-model"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            self.calls.append(audio_path.stem)
+            if audio_path == first:
+                raise TranscriptionError("Gemini response did not include SRT cues.")
+            return FileTranscriptionResult(
+                transcript="primary second",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "primary second"),),
+            )
+
+    class FallbackProvider:
+        provider_name = "deepgram"
+        model = "deepgram-model"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            self.calls.append(audio_path.stem)
+            return FileTranscriptionResult(
+                transcript="fallback first",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "fallback first"),),
+            )
+
+    class UnusedProvider:
+        provider_name = "openai"
+        model = "whisper-1"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            self.calls.append(audio_path.stem)
+            raise AssertionError("OpenAI should not be needed")
+
+    primary = PrimaryProvider()
+    fallback = FallbackProvider()
+    unused = UnusedProvider()
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        events.append((event, dict(data)))
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=primary,
+        fallback_speech_to_text_providers=(fallback, unused),
+    ).transcribe_chunks_async(
+        (
+            AudioChunk(first, 0.0, 5.0),
+            AudioChunk(second, 10.0, 5.0),
+        ),
+        progress_callback=record_progress,
+    )
+
+    assert result.raw_transcript == "fallback first\n\nprimary second"
+    assert result.subtitle_cues == (
+        SubtitleCue(0.0, 1.0, "fallback first"),
+        SubtitleCue(10.0, 11.0, "primary second"),
+    )
+    assert primary.calls == ["first", "second"]
+    assert fallback.calls == ["first"]
+    assert unused.calls == []
+    fallback_event = next(data for event, data in events if event == "provider_fallback")
+    assert fallback_event["failed_provider"] == "gemini"
+    assert fallback_event["next_provider"] == "deepgram"
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_treats_all_empty_provider_results_as_silence(tmp_path: Path) -> None:
+    audio = tmp_path / "silence.flac"
+    audio.write_bytes(b"silence")
+
+    class EmptyProvider:
+        model = "model"
+
+        def __init__(self, provider_name: str) -> None:
+            self.provider_name = provider_name
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(transcript="")
+
+    providers = tuple(EmptyProvider(name) for name in ("gemini", "deepgram", "openai"))
+    result = await SpeechTranscriber(
+        speech_to_text_provider=providers[0],
+        fallback_speech_to_text_providers=providers[1:],
+    ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
+
+    assert result.raw_transcript == ""
+    assert result.subtitle_cues == ()
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_rejects_mixed_errors_and_empty_results(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class Provider:
+        model = "model"
+
+        def __init__(self, provider_name: str, *, fail: bool = False) -> None:
+            self.provider_name = provider_name
+            self.fail = fail
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            if self.fail:
+                raise TranscriptionError("request failed")
+            return FileTranscriptionResult(transcript="")
+
+    providers = (
+        Provider("gemini", fail=True),
+        Provider("deepgram"),
+        Provider("openai"),
+    )
+
+    with pytest.raises(TranscriptionError, match="All transcription providers failed"):
+        await SpeechTranscriber(
+            speech_to_text_provider=providers[0],
+            fallback_speech_to_text_providers=providers[1:],
+        ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_falls_back_when_provider_returns_text_without_timestamps(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class TextOnlyProvider:
+        provider_name = "gemini"
+        model = "gemini-model"
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(transcript="text without timestamps")
+
+    class TimestampProvider:
+        provider_name = "deepgram"
+        model = "nova-3"
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="valid",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "valid"),),
+            )
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=TextOnlyProvider(),
+        fallback_speech_to_text_providers=(TimestampProvider(),),
+    ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
+
+    assert result.raw_transcript == "valid"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "valid"),)
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_keeps_raw_srt_when_translation_fails(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class Provider:
+        provider_name = "gemini"
+        model = "gemini-model"
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="raw",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "raw"),),
+            )
+
+    class FailingRefiner:
+        model = "translation-model"
+
+        def translate_srt_blocks(self, *args: object, **kwargs: object) -> tuple[str, ...]:
+            raise TranscriptionError("translation failed")
+
+    events: list[str] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        events.append(event)
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=Provider(),
+        refiner=FailingRefiner(),
+    ).transcribe_chunks_async(
+        (AudioChunk(audio, duration_seconds=10.0),),
+        progress_callback=record_progress,
+    )
+
+    assert result.raw_transcript == "raw"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "raw"),)
+    assert result.translated_srt is None
+    assert result.warnings == (TRANSLATION_FAILURE_WARNING,)
+    assert "refinement_failed" in events
+
+
+@pytest.mark.asyncio
+async def test_transcribe_chunks_keeps_deepgram_result_when_confidence_correction_fails(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class Provider:
+        provider_name = "deepgram"
+        model = "nova-3"
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="original",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "original"),),
+            )
+
+    class FailingCorrector:
+        def correct_file_result(self, audio_path: Path, result: FileTranscriptionResult) -> FileTranscriptionResult:
+            raise TranscriptionError("correction failed")
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=Provider(),
+        correctors_by_provider={"deepgram": FailingCorrector()},
+    ).transcribe_chunks_async((AudioChunk(audio, duration_seconds=10.0),))
+
+    assert result.raw_transcript == "original"
+    assert result.warnings == (CORRECTION_FAILURE_WARNING,)
 
 
 @pytest.mark.asyncio
@@ -716,8 +992,11 @@ async def test_transcribe_chunks_async_skips_refinement_when_disabled(
         provider_name = "deepgram"
         model = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
 
-        def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
-            return "raw transcript"
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="raw transcript",
+                subtitle_cues=(SubtitleCue(0.0, 1.0, "raw transcript"),),
+            )
 
     transcriber = SpeechTranscriber(speech_to_text_provider=FakeSpeechToTextProvider())
     progress_events: list[str] = []

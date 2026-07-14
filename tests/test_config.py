@@ -16,6 +16,7 @@ BASE_ENV = {
     "TELEGRAM_API_ID": "12345",
     "TELEGRAM_API_HASH": "telegram-api-hash",
     "DEEPGRAM_API_KEY": "deepgram-key",
+    "OPENAI_API_KEY": "openai-key",
     "OPENROUTER_API_KEY": "openrouter-key",
 }
 
@@ -30,6 +31,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.deepgram_transcribe_model == "nova-3"
     assert settings.deepgram_language == "ar-IQ"
     assert settings.deepgram_keyterms == ()
+    assert settings.openai_api_key == "openai-key"
     assert settings.openrouter_api_key == "openrouter-key"
     assert settings.openrouter_refine_model == "openai/gpt-5.5"
     assert settings.refine is False
@@ -146,6 +148,12 @@ def test_legacy_provider_setting_does_not_replace_deepgram() -> None:
 def test_openrouter_api_key_is_required() -> None:
     env = {key: value for key, value in BASE_ENV.items() if key != "OPENROUTER_API_KEY"}
     with pytest.raises(ConfigError, match="OPENROUTER_API_KEY"):
+        load_settings(env, load_dotenv_file=False)
+
+
+def test_openai_api_key_is_required() -> None:
+    env = {key: value for key, value in BASE_ENV.items() if key != "OPENAI_API_KEY"}
+    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
         load_settings(env, load_dotenv_file=False)
 
 

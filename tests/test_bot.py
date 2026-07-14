@@ -106,12 +106,28 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
         Settings(
             telegram_bot_token="token",
             deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
             openrouter_api_key="openrouter-key",
         )
     )
 
     assert transcriber.provider_name == "gemini"
     assert transcriber.model == "google/gemini-3.5-flash"
+
+
+@pytest.mark.parametrize(
+    ("selected", "expected"),
+    [
+        ("gemini", ("gemini", "deepgram", "openai")),
+        ("deepgram", ("deepgram", "gemini", "openai")),
+        ("openai", ("openai", "gemini", "deepgram")),
+    ],
+)
+def test_transcription_model_order_uses_selected_provider_first(
+    selected: str,
+    expected: tuple[str, ...],
+) -> None:
+    assert bot_module.get_transcription_model_order(selected) == expected
 
 
 @pytest.mark.parametrize(
@@ -127,6 +143,7 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
         Settings(
             telegram_bot_token="token",
             deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
             openrouter_api_key="openrouter-key",
             refine=True,
         ),
@@ -456,6 +473,7 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
             "settings": Settings(
                 telegram_bot_token="token",
                 deepgram_api_key="deepgram-key",
+                openai_api_key="openai-key",
                 openrouter_api_key="openrouter-key",
             ),
             "transcription_model": "deepgram",
@@ -464,8 +482,8 @@ async def test_handle_model_command_lists_current_and_available_models() -> None
 
     await handle_model_command(update, context)
 
-    assert "Current transcription model: Deepgram nova-3" in message.text_replies[0]
-    assert "openai: OpenRouter Whisper large v3 (available)" in message.text_replies[0]
+    assert "Current primary transcription model: Deepgram nova-3" in message.text_replies[0]
+    assert "openai: Direct OpenAI whisper-1 (available)" in message.text_replies[0]
     assert "gemini: OpenRouter Gemini 3.5 Flash (available)" in message.text_replies[0]
     assert message.text_reply_kwargs == [
         {
@@ -516,7 +534,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["transcription_model"] == "gemini"
     assert context.bot_data["runtime_preferences_store"].load().transcription_model == "gemini"
-    assert message.text_replies == ["Transcription model set to OpenRouter Gemini 3.5 Flash."]
+    assert message.text_replies == ["Primary transcription model set to OpenRouter Gemini 3.5 Flash."]
 
 
 @pytest.mark.asyncio
@@ -530,7 +548,7 @@ async def test_handle_model_command_rejects_missing_provider_credentials() -> No
 
     await handle_model_command(update, context)
 
-    assert message.text_replies == ["OPENROUTER_API_KEY is required for OpenRouter transcription."]
+    assert message.text_replies == ["OPENAI_API_KEY is required for direct OpenAI transcription."]
     assert "transcription_model" not in context.bot_data
 
 
@@ -902,6 +920,17 @@ async def test_process_video_message_reports_step_by_step_flow(
                     "model": "nova-3",
                 },
             )
+            await progress_callback(
+                "provider_fallback",
+                {
+                    "index": 1,
+                    "total": 1,
+                    "failed_provider": "gemini",
+                    "failed_model": "gemini-model",
+                    "next_provider": "deepgram",
+                    "next_model": "nova-3",
+                },
+            )
             await progress_callback("chunk_transcribed", {"index": 1, "total": 1, "raw_chars": 12})
             await progress_callback(
                 "refining_transcript",
@@ -965,6 +994,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Step 2/6: extracting lossless FLAC audio at 1.4x...",
         "Step 3/6: preparing audio chunks...",
         "Step 4/6: transcribing chunk 1/1...",
+        "Gemini could not produce valid SRT; retrying chunk 1/1 with Deepgram...",
         "Step 5/6: translating subtitles...",
         "Step 6/6: sending transcript...",
         "Transcript ready.",

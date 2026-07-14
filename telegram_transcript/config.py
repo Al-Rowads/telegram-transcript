@@ -30,6 +30,7 @@ class Settings:
     deepgram_transcribe_model: str = DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
     deepgram_language: str = DEFAULT_DEEPGRAM_LANGUAGE
     deepgram_keyterms: tuple[str, ...] = ()
+    openai_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_refine_model: str = DEFAULT_REFINEMENT_MODEL
     refine: bool = False
@@ -71,6 +72,7 @@ def load_settings(
         raise ConfigError("DEEPGRAM_KEYTERMS supports at most 100 unique terms.")
 
     openrouter_api_key = require_value(source, "OPENROUTER_API_KEY")
+    openai_api_key = require_value(source, "OPENAI_API_KEY")
     refine_model = (
         source.get("OPENROUTER_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip()
         or DEFAULT_REFINEMENT_MODEL
@@ -88,6 +90,7 @@ def load_settings(
         deepgram_transcribe_model=deepgram_model,
         deepgram_language=deepgram_language,
         deepgram_keyterms=deepgram_keyterms,
+        openai_api_key=openai_api_key,
         openrouter_api_key=openrouter_api_key,
         openrouter_refine_model=refine_model,
         refine=refine,

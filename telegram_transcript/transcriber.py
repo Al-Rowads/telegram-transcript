@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-import requests
-from openai import OpenAI
+import httpx
+from openai import OpenAI, OpenAIError
 
-from telegram_transcript.ffmpeg import extract_audio_window
+from telegram_transcript.ffmpeg import FfmpegError, extract_audio_window, probe_audio_duration_seconds
 from telegram_transcript.models import (
     AudioChunk,
     FileTranscriptionResult,
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL = "nova-3"
 DEFAULT_DEEPGRAM_LANGUAGE = "ar-IQ"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "openai/whisper-large-v3"
+DEFAULT_OPENAI_TRANSCRIPTION_MODEL = "whisper-1"
 DEFAULT_GEMINI_TRANSCRIPTION_MODEL = "google/gemini-3.5-flash"
 DEFAULT_REFINEMENT_MODEL = "openai/gpt-5.5"
 CLAUDE_SONNET_TRANSLATION_MODEL = "anthropic/claude-sonnet-4.6"
@@ -37,6 +37,14 @@ MAX_TRANSLATION_CONTEXT_CUES = 5
 TRANSLATION_BATCH_CUES = 12
 LOW_CONFIDENCE_WORD_THRESHOLD = 0.65
 CORRECTION_WINDOW_PADDING_SECONDS = 1.5
+OPENROUTER_REQUEST_TIMEOUT_SECONDS = 120.0
+TRANSCRIPTION_REQUEST_TIMEOUT_SECONDS = 300.0
+TRANSCRIPTION_MAX_RETRIES = 2
+SUBTITLE_CUE_DURATION_TOLERANCE_SECONDS = 2.0
+TRANSLATION_FAILURE_WARNING = "Persian translation failed; raw subtitles were sent."
+CORRECTION_FAILURE_WARNING = (
+    "Deepgram confidence correction was unavailable; original Deepgram subtitles were used."
+)
 CUE_TRANSLATION_START = "<srt_cue>"
 CUE_TRANSLATION_END = "</srt_cue>"
 ProgressCallback = Callable[[str, Mapping[str, object]], Awaitable[None]]
@@ -165,6 +173,7 @@ SRT_TRANSCRIPTION_PROMPT = """Transcribe this predominantly Iraqi/Baghdadi Arabi
 
 Rules:
 - Output only SRT content.
+- If the audio contains no speech, return an empty response.
 - Include sequential cue numbers.
 - Use timestamps in HH:MM:SS,mmm --> HH:MM:SS,mmm format.
 - Put only spoken text in cue text lines.
@@ -205,13 +214,16 @@ class DeepgramSpeechToTextProvider:
         self.model = model
         self.language = language
         self.keyterms = tuple(dict.fromkeys(term.strip() for term in keyterms if term.strip()))
-        self.client = client if client is not None else create_deepgram_client(api_key)
+        self.api_key = api_key
+        self.client = client
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
         del previous_transcript
+        if self.client is None:
+            self.client = create_deepgram_client(self.api_key)
         with audio_path.open("rb") as audio_file:
             options: dict[str, object] = {
                 "request": audio_file.read(),
@@ -221,10 +233,19 @@ class DeepgramSpeechToTextProvider:
                 "punctuate": True,
                 "paragraphs": True,
                 "utterances": True,
+                "request_options": {
+                    "timeout_in_seconds": int(TRANSCRIPTION_REQUEST_TIMEOUT_SECONDS),
+                    "max_retries": TRANSCRIPTION_MAX_RETRIES,
+                },
             }
             if self.keyterms:
                 options["keyterm"] = self.keyterms
-            response = self.client.listen.v1.media.transcribe_file(**options)
+            try:
+                response = self.client.listen.v1.media.transcribe_file(**options)
+            except Exception as exc:
+                if is_deepgram_api_exception(exc):
+                    raise TranscriptionError("Deepgram transcription request failed.") from exc
+                raise
         return extract_deepgram_file_transcription_result(response)
 
 
@@ -238,47 +259,30 @@ class OpenAISpeechToTextProvider:
     ) -> None:
         self.provider_name = "openai"
         self.model = model
-        self.client = client if client is not None else requests.Session()
-        self.api_key = api_key
+        self.client = client if client is not None else create_openai_client(api_key)
 
     def transcribe_file(self, audio_path: Path, *, previous_transcript: str = "") -> str:
         return self.transcribe_file_result(audio_path, previous_transcript=previous_transcript).transcript
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        payload: dict[str, object] = {
-            "input_audio": {
-                "data": encode_audio_file(audio_path),
-                "format": audio_path.suffix.lstrip(".").lower(),
-            },
+        request: dict[str, object] = {
             "model": self.model,
             "language": "ar",
             "temperature": 0,
+            "response_format": "verbose_json",
+            "timestamp_granularities": ["segment"],
         }
         if previous_transcript.strip():
-            payload["provider"] = {
-                "options": {
-                    "groq": {
-                        "prompt": (
-                            "The audio is Iraqi Arabic. The immediately preceding transcript was: "
-                            + previous_transcript.strip()[-1000:]
-                        )
-                    }
-                }
-            }
-        try:
-            response = self.client.post(
-                f"{OPENROUTER_BASE_URL}/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=300,
+            request["prompt"] = (
+                "The audio is Iraqi Arabic. The immediately preceding transcript was: "
+                + previous_transcript.strip()[-1000:]
             )
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            raise TranscriptionError("OpenRouter transcription request failed.") from exc
-        return extract_openrouter_transcription_result(response.json())
+        try:
+            with audio_path.open("rb") as audio_file:
+                response = self.client.audio.transcriptions.create(file=audio_file, **request)
+        except OpenAIError as exc:
+            raise TranscriptionError("OpenAI transcription request failed.") from exc
+        return extract_openai_file_transcription_result(response)
 
 
 class GeminiSpeechToTextProvider:
@@ -305,25 +309,34 @@ class GeminiSpeechToTextProvider:
                 "\n\nThe previous audio chunk ended with this transcript. Use it only for continuity and do not repeat it:\n"
                 + previous_transcript.strip()[-1000:]
             )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": encode_audio_file(audio_path),
-                                "format": audio_path.suffix.lstrip(".").lower(),
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "input_audio",
+                                "input_audio": {
+                                    "data": encode_audio_file(audio_path),
+                                    "format": audio_path.suffix.lstrip(".").lower(),
+                                },
                             },
-                        },
-                    ],
-                }
-            ],
-            temperature=0,
-        )
+                        ],
+                    }
+                ],
+                temperature=0,
+            )
+        except OpenAIError as exc:
+            raise TranscriptionError("Gemini transcription request failed.") from exc
+        choices = get_response_field(response, "choices")
+        if isinstance(choices, Sequence) and not isinstance(choices, (str, bytes)) and choices:
+            message = get_response_field(choices[0], "message")
+            content = get_response_field(message, "content")
+            if isinstance(content, str) and not content.strip():
+                return FileTranscriptionResult(transcript="")
         srt = extract_chat_completion_text(response).strip()
         return parse_srt_file_transcription_result(srt, provider_name="Gemini")
 
@@ -616,12 +629,20 @@ class SpeechTranscriber:
         self,
         *,
         speech_to_text_provider: SpeechToTextProvider,
+        fallback_speech_to_text_providers: Sequence[SpeechToTextProvider] = (),
         refiner: TranscriptRefiner | None = None,
         corrector: LowConfidenceTranscriptCorrector | None = None,
+        correctors_by_provider: Mapping[str, LowConfidenceTranscriptCorrector] | None = None,
     ) -> None:
         self.speech_to_text_provider = speech_to_text_provider
+        self.speech_to_text_providers = (
+            speech_to_text_provider,
+            *fallback_speech_to_text_providers,
+        )
         self.refiner = refiner
-        self.corrector = corrector
+        self.correctors_by_provider = dict(correctors_by_provider or {})
+        if corrector is not None:
+            self.correctors_by_provider.setdefault(speech_to_text_provider.provider_name, corrector)
 
     @property
     def provider_name(self) -> str:
@@ -646,11 +667,10 @@ class SpeechTranscriber:
         )
 
     def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-        transcribe_file_result = getattr(self.speech_to_text_provider, "transcribe_file_result", None)
-        if callable(transcribe_file_result):
-            return transcribe_file_result(audio_path, previous_transcript=previous_transcript)
-        return FileTranscriptionResult(
-            transcript=self.transcribe_file(audio_path, previous_transcript=previous_transcript)
+        return transcribe_provider_file_result(
+            self.speech_to_text_provider,
+            audio_path,
+            previous_transcript=previous_transcript,
         )
 
     def transcribe_chunks(self, chunks: Sequence[Path]) -> str:
@@ -680,6 +700,7 @@ class SpeechTranscriber:
         transcripts = []
         subtitle_cues: list[SubtitleCue] = []
         transcript_words: list[TranscriptWord] = []
+        warnings: list[str] = []
         previous_transcript = ""
         for index, chunk in enumerate(chunks, start=1):
             audio_chunk = normalize_audio_chunk(chunk)
@@ -694,19 +715,21 @@ class SpeechTranscriber:
                         "model": self.model,
                     },
                 )
-            file_result = (
-                await asyncio.to_thread(
-                    self.transcribe_file_result,
+            duration_seconds = audio_chunk.duration_seconds
+            if duration_seconds is None:
+                duration_seconds = await asyncio.to_thread(
+                    probe_audio_duration_seconds,
                     audio_chunk.path,
-                    previous_transcript=previous_transcript,
                 )
+            file_result, provider, chunk_warnings = await self._transcribe_chunk_with_fallback(
+                audio_chunk.path,
+                duration_seconds=duration_seconds,
+                previous_transcript=previous_transcript,
+                chunk_index=index,
+                total_chunks=total,
+                progress_callback=progress_callback,
             )
-            if self.corrector is not None:
-                file_result = await asyncio.to_thread(
-                    self.corrector.correct_file_result,
-                    audio_chunk.path,
-                    file_result,
-                )
+            warnings.extend(chunk_warnings)
             text = file_result.transcript.strip()
             if text:
                 non_overlapping_text = merge_transcript_chunk_text(transcripts[-1], text) if transcripts else text
@@ -724,6 +747,8 @@ class SpeechTranscriber:
                         "index": index,
                         "total": total,
                         "raw_chars": len(text),
+                        "provider": provider.provider_name,
+                        "model": provider.model,
                     },
                 )
 
@@ -735,6 +760,7 @@ class SpeechTranscriber:
                 raw_transcript=transcript,
                 subtitle_cues=tuple(subtitle_cues),
                 words=tuple(transcript_words),
+                warnings=tuple(dict.fromkeys(warnings)),
             )
 
         raw_srt_blocks = parse_srt_blocks(render_srt(subtitle_cues))
@@ -757,13 +783,28 @@ class SpeechTranscriber:
                             "model": self.refiner.model,
                         },
                     )
-            translations = await asyncio.to_thread(
-                translate_blocks_with_refiner,
-                self.refiner,
-                target_blocks,
-                tuple(translation_context[-MAX_TRANSLATION_CONTEXT_CUES:]),
-                following_blocks,
-            )
+            try:
+                translations = await asyncio.to_thread(
+                    translate_blocks_with_refiner,
+                    self.refiner,
+                    target_blocks,
+                    tuple(translation_context[-MAX_TRANSLATION_CONTEXT_CUES:]),
+                    following_blocks,
+                )
+            except (TranscriptionError, OpenAIError) as exc:
+                logger.warning("Persian subtitle translation failed; returning raw subtitles.", exc_info=exc)
+                warnings.append(TRANSLATION_FAILURE_WARNING)
+                if progress_callback is not None:
+                    await progress_callback(
+                        "refinement_failed",
+                        {"model": self.refiner.model},
+                    )
+                return TranscriptionResult(
+                    raw_transcript=transcript,
+                    subtitle_cues=tuple(subtitle_cues),
+                    words=tuple(transcript_words),
+                    warnings=tuple(dict.fromkeys(warnings)),
+                )
             for raw_srt_block, translation in zip(target_blocks, translations, strict=True):
                 translated_blocks.append(render_translated_srt_block(raw_srt_block, translation))
                 translation_context.append((raw_srt_block, translation))
@@ -783,7 +824,143 @@ class SpeechTranscriber:
             translated_srt=translated_srt,
             line_translated_transcript=line_translated_transcript,
             words=tuple(transcript_words),
+            warnings=tuple(dict.fromkeys(warnings)),
         )
+
+    async def _transcribe_chunk_with_fallback(
+        self,
+        audio_path: Path,
+        *,
+        duration_seconds: float,
+        previous_transcript: str,
+        chunk_index: int,
+        total_chunks: int,
+        progress_callback: ProgressCallback | None,
+    ) -> tuple[FileTranscriptionResult, SpeechToTextProvider, tuple[str, ...]]:
+        empty_results = 0
+        warnings: list[str] = []
+        for attempt_index, provider in enumerate(self.speech_to_text_providers):
+            failure_reason = ""
+            failure: TranscriptionError | None = None
+            try:
+                file_result = await asyncio.to_thread(
+                    transcribe_provider_file_result,
+                    provider,
+                    audio_path,
+                    previous_transcript=previous_transcript,
+                )
+                validated_result = validate_file_transcription_result(
+                    file_result,
+                    duration_seconds=duration_seconds,
+                    provider_name=provider.provider_name,
+                )
+                if validated_result is None:
+                    empty_results += 1
+                    failure_reason = "empty transcription"
+                else:
+                    corrector = self.correctors_by_provider.get(provider.provider_name)
+                    if corrector is not None:
+                        try:
+                            corrected_result = await asyncio.to_thread(
+                                corrector.correct_file_result,
+                                audio_path,
+                                validated_result,
+                            )
+                            validated_result = validate_file_transcription_result(
+                                corrected_result,
+                                duration_seconds=duration_seconds,
+                                provider_name=provider.provider_name,
+                            ) or validated_result
+                        except (FfmpegError, OpenAIError, TranscriptionError) as exc:
+                            logger.warning(
+                                "Deepgram confidence correction failed; retaining the original subtitles.",
+                                exc_info=exc,
+                            )
+                            warnings.append(CORRECTION_FAILURE_WARNING)
+                    return validated_result, provider, tuple(warnings)
+            except TranscriptionError as exc:
+                failure = exc
+                failure_reason = str(exc)
+                logger.warning(
+                    "Transcription provider failed for chunk %d/%d: provider=%s model=%s",
+                    chunk_index,
+                    total_chunks,
+                    provider.provider_name,
+                    provider.model,
+                    exc_info=exc,
+                )
+
+            next_attempt_index = attempt_index + 1
+            if next_attempt_index < len(self.speech_to_text_providers):
+                next_provider = self.speech_to_text_providers[next_attempt_index]
+                if progress_callback is not None:
+                    await progress_callback(
+                        "provider_fallback",
+                        {
+                            "index": chunk_index,
+                            "total": total_chunks,
+                            "failed_provider": provider.provider_name,
+                            "failed_model": provider.model,
+                            "next_provider": next_provider.provider_name,
+                            "next_model": next_provider.model,
+                            "reason": failure_reason,
+                        },
+                    )
+            elif failure is not None:
+                break
+
+        if empty_results == len(self.speech_to_text_providers):
+            return FileTranscriptionResult(transcript=""), self.speech_to_text_providers[-1], tuple(warnings)
+        provider_names = ", ".join(provider.provider_name for provider in self.speech_to_text_providers)
+        raise TranscriptionError(
+            f"All transcription providers failed to produce valid SRT for chunk {chunk_index}/{total_chunks}: "
+            f"{provider_names}."
+        )
+
+
+def transcribe_provider_file_result(
+    provider: SpeechToTextProvider,
+    audio_path: Path,
+    *,
+    previous_transcript: str = "",
+) -> FileTranscriptionResult:
+    transcribe_file_result = getattr(provider, "transcribe_file_result", None)
+    if callable(transcribe_file_result):
+        return transcribe_file_result(audio_path, previous_transcript=previous_transcript)
+    return FileTranscriptionResult(
+        transcript=provider.transcribe_file(audio_path, previous_transcript=previous_transcript)
+    )
+
+
+def validate_file_transcription_result(
+    result: FileTranscriptionResult,
+    *,
+    duration_seconds: float,
+    provider_name: str,
+) -> FileTranscriptionResult | None:
+    transcript = result.transcript.strip()
+    if not transcript and not result.subtitle_cues:
+        return None
+    if not result.subtitle_cues:
+        raise TranscriptionError(f"{provider_name} transcription did not include subtitle timestamps.")
+
+    previous_start = -1.0
+    for cue in result.subtitle_cues:
+        if (
+            cue.start_seconds < 0
+            or cue.start_seconds < previous_start
+            or cue.end_seconds <= cue.start_seconds
+            or cue.end_seconds > duration_seconds + SUBTITLE_CUE_DURATION_TOLERANCE_SECONDS
+            or not cue.text.strip()
+        ):
+            raise TranscriptionError(f"{provider_name} transcription included invalid subtitle timestamps.")
+        previous_start = cue.start_seconds
+
+    return FileTranscriptionResult(
+        transcript=transcript or "\n\n".join(cue.text.strip() for cue in result.subtitle_cues),
+        subtitle_cues=result.subtitle_cues,
+        words=result.words,
+    )
 
 
 def create_deepgram_client(api_key: str) -> Any:
@@ -795,18 +972,51 @@ def create_deepgram_client(api_key: str) -> Any:
 
 
 def create_openrouter_client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+    return OpenAI(
+        api_key=api_key,
+        base_url=OPENROUTER_BASE_URL,
+        timeout=OPENROUTER_REQUEST_TIMEOUT_SECONDS,
+        max_retries=TRANSCRIPTION_MAX_RETRIES,
+    )
+
+
+def create_openai_client(api_key: str) -> OpenAI:
+    return OpenAI(
+        api_key=api_key,
+        timeout=TRANSCRIPTION_REQUEST_TIMEOUT_SECONDS,
+        max_retries=TRANSCRIPTION_MAX_RETRIES,
+    )
 
 
 def encode_audio_file(audio_path: Path) -> str:
     return base64.b64encode(audio_path.read_bytes()).decode("ascii")
 
 
-def extract_openrouter_transcription_result(response: Any) -> FileTranscriptionResult:
+def extract_openai_file_transcription_result(response: Any) -> FileTranscriptionResult:
     text = get_response_field(response, "text")
-    if not isinstance(text, str) or not text.strip():
-        raise TranscriptionError("OpenRouter transcription response did not include text.")
-    return FileTranscriptionResult(transcript=text.strip())
+    transcript = text.strip() if isinstance(text, str) else ""
+    segments = get_response_field(response, "segments")
+    cues = []
+    if isinstance(segments, Sequence) and not isinstance(segments, (str, bytes)):
+        for segment in segments:
+            cue = build_subtitle_cue(
+                start=get_response_field(segment, "start"),
+                end=get_response_field(segment, "end"),
+                text=get_response_field(segment, "text"),
+            )
+            if cue is not None:
+                cues.append(cue)
+    return FileTranscriptionResult(transcript=transcript, subtitle_cues=tuple(cues))
+
+
+def is_deepgram_api_exception(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    try:
+        from deepgram.core.api_error import ApiError
+    except ImportError:
+        return False
+    return isinstance(exc, ApiError)
 
 
 def parse_srt_file_transcription_result(srt: str, *, provider_name: str) -> FileTranscriptionResult:

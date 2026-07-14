@@ -70,7 +70,7 @@ HELP_MESSAGE = """Available commands:
 /help - Show this help message (deleted after 20 seconds).
 /start - Start the bot (currently no additional setup is required).
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
-/model [deepgram|openai|gemini] - Show or select the transcription model.
+/model [deepgram|openai|gemini] - Show or select the primary transcription model.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 
@@ -103,7 +103,7 @@ TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
         key="openai",
         provider="openai",
         model=DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
-        label="OpenRouter Whisper large v3",
+        label="Direct OpenAI whisper-1",
     ),
     "gemini": TranscriptionModelOption(
         key="gemini",
@@ -112,6 +112,7 @@ TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
         label="OpenRouter Gemini 3.5 Flash",
     ),
 }
+TRANSCRIPTION_FALLBACK_ORDER = ("gemini", "deepgram", "openai")
 TRANSCRIPTION_MODEL_ALIASES = {
     option.key: option.key
     for option in TRANSCRIPTION_MODEL_OPTIONS.values()
@@ -209,7 +210,11 @@ def create_transcriber(
     translation_model: str | None = None,
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
 ) -> SpeechTranscriber:
-    speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
+    model_order = get_transcription_model_order(model_key)
+    speech_to_text_providers = [
+        create_speech_to_text_provider(settings, ordered_model_key)
+        for ordered_model_key in model_order
+    ]
     canonical_prompt = canonicalize_translation_prompt_key(translation_prompt)
 
     refiner = (
@@ -222,20 +227,27 @@ def create_transcriber(
         if settings.refine
         else None
     )
-    corrector = None
-    if model_key == "deepgram" and settings.openrouter_api_key:
-        corrector = LowConfidenceTranscriptCorrector(
+    correctors_by_provider = {
+        "deepgram": LowConfidenceTranscriptCorrector(
             secondary_provider=GeminiAudioCorrectionProvider(api_key=settings.openrouter_api_key),
             resolver=TranscriptCandidateResolver(
                 api_key=settings.openrouter_api_key,
                 model=translation_model or settings.openrouter_refine_model,
             ),
         )
+    }
     return SpeechTranscriber(
-        speech_to_text_provider=speech_to_text_provider,
+        speech_to_text_provider=speech_to_text_providers[0],
+        fallback_speech_to_text_providers=speech_to_text_providers[1:],
         refiner=refiner,
-        corrector=corrector,
+        correctors_by_provider=correctors_by_provider,
     )
+
+
+def get_transcription_model_order(model_key: str) -> tuple[str, ...]:
+    if model_key not in TRANSCRIPTION_MODEL_OPTIONS:
+        raise ConfigError(f"Unknown transcription model: {model_key}")
+    return (model_key, *(key for key in TRANSCRIPTION_FALLBACK_ORDER if key != model_key))
 
 
 def create_speech_to_text_provider(settings: Settings, model_key: str) -> object:
@@ -253,9 +265,9 @@ def create_speech_to_text_provider(settings: Settings, model_key: str) -> object
             keyterms=settings.deepgram_keyterms,
         )
     if option.provider == "openai":
-        if not settings.openrouter_api_key:
-            raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter transcription.")
-        return OpenAISpeechToTextProvider(api_key=settings.openrouter_api_key, model=option.model)
+        if not settings.openai_api_key:
+            raise ConfigError("OPENAI_API_KEY is required for direct OpenAI transcription.")
+        return OpenAISpeechToTextProvider(api_key=settings.openai_api_key, model=option.model)
     if option.provider == "gemini":
         if not settings.openrouter_api_key:
             raise ConfigError("OPENROUTER_API_KEY is required for OpenRouter transcription.")
@@ -378,7 +390,7 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     context.bot_data["transcriber"] = transcriber
     context.bot_data["transcription_model"] = model_key
-    await reply_to_source(message, f"Transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
+    await reply_to_source(message, f"Primary transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
 
 
 async def handle_translation_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -601,7 +613,7 @@ async def process_media_message(
         await edit_status_message(status, "Step 3/6: preparing audio chunks...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
-            "job %s step 3/6 preparing 1300-second chunks: audio_bytes=%d",
+            "job %s step 3/6 preparing bounded transcription chunks: audio_bytes=%d",
             job_id,
             audio_bytes,
         )
@@ -646,6 +658,27 @@ async def process_media_message(
                     progress_data.get("total"),
                     progress_data.get("raw_chars"),
                 )
+            elif event == "provider_fallback":
+                index = progress_data.get("index")
+                total = progress_data.get("total")
+                failed_provider = format_provider_name(progress_data.get("failed_provider"))
+                next_provider = format_provider_name(progress_data.get("next_provider"))
+                await edit_status_message(
+                    status,
+                    f"{failed_provider} could not produce valid SRT; "
+                    f"retrying chunk {index}/{total} with {next_provider}...",
+                    job_id=job_id,
+                )
+                logger.warning(
+                    "job %s step 4/6 provider fallback for chunk %s/%s: failed_provider=%s failed_model=%s next_provider=%s next_model=%s",
+                    job_id,
+                    index,
+                    total,
+                    progress_data.get("failed_provider"),
+                    progress_data.get("failed_model"),
+                    progress_data.get("next_provider"),
+                    progress_data.get("next_model"),
+                )
             elif event == "refining_transcript":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
@@ -675,6 +708,17 @@ async def process_media_message(
                     job_id,
                     progress_data.get("translated_srt_chars"),
                     progress_data.get("line_translated_transcript_chars"),
+                )
+            elif event == "refinement_failed":
+                await edit_status_message(
+                    status,
+                    "Step 5/6: translation failed; preparing raw subtitles...",
+                    job_id=job_id,
+                )
+                logger.warning(
+                    "job %s step 5/6 translation failed; raw subtitles will be delivered: model=%s",
+                    job_id,
+                    progress_data.get("model"),
                 )
 
         transcription_result = normalize_transcription_result(
@@ -716,7 +760,13 @@ async def process_media_message(
             filename=f"{base_name}.translation.txt",
             caption="Line-by-line translation",
         )
-    if srt:
+    if transcription_result.warnings:
+        await edit_status_message(
+            status,
+            "Transcript ready. " + " ".join(transcription_result.warnings),
+            job_id=job_id,
+        )
+    elif srt:
         await edit_status_message(status, "Transcript ready.", job_id=job_id)
     else:
         await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
@@ -783,6 +833,14 @@ def normalize_transcription_result(result: object) -> TranscriptionResult:
     if isinstance(result, str):
         return TranscriptionResult(raw_transcript=result)
     raise TranscriptionError("Transcriber returned an unsupported result.")
+
+
+def format_provider_name(value: object) -> str:
+    if value == "openai":
+        return "OpenAI"
+    if isinstance(value, str) and value:
+        return value.title()
+    return "Provider"
 
 
 async def reply_to_source(message: Message, text: str) -> Message:
@@ -922,7 +980,7 @@ def get_runtime_transcriber_info(context: ContextTypes.DEFAULT_TYPE, settings: S
 def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
     current_model_key = get_runtime_model_key(context)
     lines = [
-        f"Current transcription model: {TRANSCRIPTION_MODEL_OPTIONS[current_model_key].label}",
+        f"Current primary transcription model: {TRANSCRIPTION_MODEL_OPTIONS[current_model_key].label}",
         "",
         "Available models:",
     ]
@@ -980,7 +1038,7 @@ def is_model_option_configured(option: TranscriptionModelOption, settings: Setti
     if option.provider == "deepgram":
         return bool(settings.deepgram_api_key)
     if option.provider == "openai":
-        return bool(settings.openrouter_api_key)
+        return bool(settings.openai_api_key)
     if option.provider == "gemini":
         return bool(settings.openrouter_api_key)
     return False

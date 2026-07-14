@@ -8,6 +8,7 @@ from pathlib import Path
 class AudioChunk:
     path: Path
     start_seconds: float = 0.0
+    duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,7 @@ class TranscriptionResult:
     translated_srt: str | None = None
     line_translated_transcript: str | None = None
     words: tuple[TranscriptWord, ...] = ()
+    warnings: tuple[str, ...] = ()
 
     @property
     def final_transcript(self) -> str:
