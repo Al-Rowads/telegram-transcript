@@ -41,6 +41,7 @@ class Settings:
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
     runtime_state_path: Path = Path("data/runtime-settings.json")
+    iraqi_training_resources_path: Path = Path("data/iraqi-training-resources")
 
     @property
     def max_video_bytes(self) -> int:
@@ -115,6 +116,13 @@ def load_settings(
         runtime_state_path=Path(
             source.get("RUNTIME_STATE_PATH", "data/runtime-settings.json").strip()
             or "data/runtime-settings.json"
+        ).expanduser(),
+        iraqi_training_resources_path=Path(
+            source.get(
+                "IRAQI_TRAINING_RESOURCES_PATH",
+                "data/iraqi-training-resources",
+            ).strip()
+            or "data/iraqi-training-resources"
         ).expanduser(),
     )
 

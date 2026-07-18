@@ -40,6 +40,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
     assert settings.runtime_state_path.as_posix() == "data/runtime-settings.json"
+    assert settings.iraqi_training_resources_path.as_posix() == "data/iraqi-training-resources"
 
 
 def test_load_settings_parses_optional_values() -> None:
@@ -56,6 +57,7 @@ def test_load_settings_parses_optional_values() -> None:
             "AUDIO_TEMPO": "1",
             "MAX_CONCURRENT_JOBS": "3",
             "RUNTIME_STATE_PATH": "~/telegram-state.json",
+            "IRAQI_TRAINING_RESOURCES_PATH": "~/iraqi-training-data",
         },
         load_dotenv_file=False,
     )
@@ -71,6 +73,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
     assert settings.runtime_state_path.name == "telegram-state.json"
+    assert settings.iraqi_training_resources_path.name == "iraqi-training-data"
 
 
 def test_load_settings_rejects_more_than_one_hundred_deepgram_keyterms() -> None:
