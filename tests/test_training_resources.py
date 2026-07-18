@@ -15,7 +15,14 @@ from telegram_transcript.training_resources import (
 )
 
 
-def make_resource(source: str, relative_path: str, url: str, payload: bytes) -> TrainingResource:
+def make_resource(
+    source: str,
+    relative_path: str,
+    url: str,
+    payload: bytes,
+    *,
+    encoding: str = "utf-8",
+) -> TrainingResource:
     digest = hashlib.sha1(f"blob {len(payload)}\0".encode("ascii") + payload).hexdigest()
     return TrainingResource(
         source=source,
@@ -23,6 +30,7 @@ def make_resource(source: str, relative_path: str, url: str, payload: bytes) -> 
         url=url,
         size=len(payload),
         git_blob_sha1=digest,
+        encoding=encoding,
     )
 
 
@@ -123,3 +131,61 @@ def test_production_manifest_excludes_modern_arabic_newspaper_sources() -> None:
     assert "Modern_Arabic_E-Newspapers" not in paths_and_urls
     assert any("huggingface.co" in resource.url for resource in IRAQI_ARABIC_TRAINING_RESOURCES)
     assert any("raw.githubusercontent.com" in resource.url for resource in IRAQI_ARABIC_TRAINING_RESOURCES)
+
+
+@pytest.mark.asyncio
+async def test_legacy_iso_8859_6_resource_is_decoded_to_unicode_context(tmp_path: Path) -> None:
+    arabic_text = "قيل لـ رجل عاقل"
+    payload = arabic_text.encode("iso-8859-6")
+    resource = make_resource(
+        "IA2D",
+        "ia2d/Tweets_Raw_Data.txt",
+        "https://example.test/tweets",
+        payload,
+        encoding="iso-8859-6",
+    )
+    path = tmp_path / resource.relative_path
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+
+    context = await IraqiArabicTrainingResourceManager(
+        tmp_path,
+        resources=(resource,),
+    ).ensure_available()
+
+    assert arabic_text in context
+
+
+@pytest.mark.asyncio
+async def test_resource_with_bytes_invalid_for_declared_encoding_is_rejected(tmp_path: Path) -> None:
+    payload = b"\xe2\xea\xe4"
+    resource = make_resource(
+        "IA2D",
+        "ia2d/invalid.txt",
+        "https://example.test/invalid",
+        payload,
+    )
+    path = tmp_path / resource.relative_path
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+
+    with pytest.raises(TrainingResourceError, match="Unable to read Iraqi Arabic training resource"):
+        await IraqiArabicTrainingResourceManager(
+            tmp_path,
+            resources=(resource,),
+        ).ensure_available()
+
+
+def test_production_manifest_declares_legacy_tweets_encoding() -> None:
+    raw_tweets = next(
+        resource
+        for resource in IRAQI_ARABIC_TRAINING_RESOURCES
+        if resource.relative_path.name == "Tweets_Raw_Data.txt"
+    )
+
+    assert raw_tweets.encoding == "iso-8859-6"
+    assert all(
+        resource.encoding == "utf-8"
+        for resource in IRAQI_ARABIC_TRAINING_RESOURCES
+        if resource is not raw_tweets
+    )

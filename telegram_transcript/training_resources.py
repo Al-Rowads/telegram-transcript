@@ -28,6 +28,7 @@ class TrainingResource:
     url: str
     size: int
     git_blob_sha1: str
+    encoding: str = "utf-8"
 
 
 IRAQI_ARABIC_TRAINING_RESOURCES = (
@@ -91,6 +92,7 @@ IRAQI_ARABIC_TRAINING_RESOURCES = (
         ),
         size=210_900,
         git_blob_sha1="ce8e6901faf88540df090a61ca7b2de13c8af1a7",
+        encoding="iso-8859-6",
     ),
 )
 
@@ -203,8 +205,8 @@ def build_iraqi_arabic_training_context(
         if not resource_file_is_valid(path, resource):
             raise TrainingResourceError(f"Iraqi Arabic training resource is missing or invalid: {path}")
         try:
-            content = path.read_text(encoding="utf-8").strip()
-        except (OSError, UnicodeDecodeError) as exc:
+            content = path.read_bytes().decode(resource.encoding).strip()
+        except (OSError, UnicodeDecodeError, LookupError) as exc:
             raise TrainingResourceError(f"Unable to read Iraqi Arabic training resource {path}: {exc}") from exc
         sections.append(
             f"SOURCE: {resource.source}\nFILE: {resource.relative_path.as_posix()}\n{content}"
