@@ -17,9 +17,11 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
 - Supports `/translation natural` and `/translation literal`; legacy `v2` and `normal` aliases remain accepted.
 - Persists successful command selections across bot and container restarts.
-- Optionally translates batches of up to 12 SRT cues with preceding and following context, while preserving one Persian line and the original timing for every cue.
+- Always refines validated SRT into natural Iraqi Baghdadi Arabic through a dedicated OpenRouter model before optional translation.
+- Limits Arabic refinement inputs to 20 KiB UTF-8 chunks, preserves cue IDs and timestamps, and atomically falls back to the original SRT if refinement fails.
+- Optionally translates batches of up to 12 refined SRT cues with preceding and following context, while preserving one Persian line and the original timing for every cue.
 - For Deepgram results, preserves word confidence and rechecks only low-confidence Iraqi Arabic cues with a constrained Gemini candidate and resolver.
-- Sends raw transcripts first, `transcript.srt` second when timestamps are available, and the bilingual transcript third when `REFINE=true`.
+- Sends the refined Arabic transcript first, refined or bilingual SRT second, and the bilingual transcript third when `REFINE=true`.
 - Sends short transcripts as Telegram messages and long transcripts as `.txt` documents.
 - Optional Telegram user allowlist to control usage.
 - Dockerized runtime with `ffmpeg` included.
@@ -37,7 +39,7 @@ Required variables:
 - `TELEGRAM_BOT_TOKEN`: token from BotFather.
 - `TELEGRAM_API_ID`: Telegram API ID from https://my.telegram.org for Telethon downloads.
 - `TELEGRAM_API_HASH`: Telegram API hash from https://my.telegram.org for Telethon downloads.
-- `OPENROUTER_API_KEY`: OpenRouter key for Gemini and Whisper Large V3 transcription and optional Persian refinement.
+- `OPENROUTER_API_KEY`: OpenRouter key for Gemini and Whisper Large V3 transcription, Iraqi Arabic refinement, and optional Persian translation.
 - `DEEPGRAM_API_KEY`: Deepgram API key for Nova-3 transcription and automatic fallback.
 - `OPENAI_API_KEY`: direct OpenAI API key for the timestamp-capable `whisper-1` fallback.
 
@@ -46,8 +48,9 @@ Optional variables:
 - `DEEPGRAM_TRANSCRIBE_MODEL`: defaults to `nova-3`.
 - `DEEPGRAM_LANGUAGE`: defaults to Iraqi Arabic (`ar-IQ`).
 - `DEEPGRAM_KEYTERMS`: optional comma-separated Nova-3 keyterms for important names and terminology.
+- `OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL`: OpenRouter text model used to convert validated SRT into natural Iraqi Baghdadi Arabic. Defaults to `openai/gpt-5.5` and runs independently of Persian translation settings.
 - `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.5`.
-- `REFINE`: set to `true` to run OpenAI SRT translation after transcription, or `false` to return raw ASR output. Defaults to `false`.
+- `REFINE`: set to `true` to add Persian translation after Iraqi Arabic refinement, or `false` to return only the refined Arabic output. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
 - `MAX_VIDEO_MB`: maximum Telegram media size accepted by the bot. Defaults to `2048`, Telegram's 2 GiB media limit.
 - `AUDIO_TEMPO`: tempo for the generated FLAC. Defaults to `1.0` for normal speed. Use values below `1` to slow fast speakers while preserving pitch.
@@ -101,7 +104,9 @@ If the bot should process ordinary group video messages without being mentioned 
 
 The bot sends `transcript.srt` after the plain transcript. Gemini is prompted to return valid SRT directly, Deepgram timestamps come from utterances or words, and both OpenRouter Whisper Large V3 and direct OpenAI `whisper-1` return structured segment timestamps that are rendered locally. A provider result with spoken text but no valid timestamps is rejected and the same chunk is tried with the next provider. The plain transcript is derived from the validated cues.
 
-With `REFINE=true`, rendered SRT cues are translated through OpenRouter in batches of up to 12. The bot preserves cue numbers, timestamps, and source subtitle text locally, appends exactly one validated Persian line per cue, retries one malformed batch, then recursively splits it. If translation ultimately fails, the validated raw transcript and SRT are still delivered with a warning.
+After transcription, the bot renders the validated cues as SRT and sends complete-cue groups of at most 20 KiB to the dedicated Iraqi Arabic refinement model. The supplied refinement prompt is used verbatim. Every response must preserve the exact cue count, order, sequence numbers, and timestamps. Malformed batches are retried and recursively split; an oversized individual cue is split at UTF-8-safe text boundaries. If any refinement request ultimately fails, all partial refinements are discarded and the complete original SRT is used with a warning.
+
+With `REFINE=true`, the refined SRT cues are then translated through OpenRouter in batches of up to 12. The bot preserves cue numbers, timestamps, and refined Arabic source text locally, appends exactly one validated Persian line per cue, retries one malformed batch, then recursively splits it. If translation ultimately fails, the refined Arabic transcript and SRT are still delivered with a warning.
 
 ## Quality Evaluation
 

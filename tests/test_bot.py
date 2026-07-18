@@ -119,6 +119,7 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
         "whisper",
         "openai",
     )
+    assert transcriber.transcription_refinement_model == "openai/gpt-5.5"
 
 
 @pytest.mark.parametrize(
@@ -170,6 +171,21 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
     )
 
     assert transcriber.refinement_model == translation_model
+
+
+def test_create_transcriber_uses_dedicated_transcription_refinement_model() -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
+            openrouter_api_key="openrouter-key",
+            openrouter_transcription_refinement_model="custom-arabic-refinement-model",
+        )
+    )
+
+    assert transcriber.transcription_refinement_model == "custom-arabic-refinement-model"
+    assert transcriber.refinement_model is None
 
 
 def test_is_authorized_allows_everyone_without_allowlist() -> None:
@@ -970,14 +986,33 @@ async def test_process_video_message_reports_step_by_step_flow(
             )
             await progress_callback("chunk_transcribed", {"index": 1, "total": 1, "raw_chars": 12})
             await progress_callback(
-                "refining_transcript",
+                "refining_transcription",
                 {
                     "raw_chars": 12,
+                    "raw_bytes": 24,
+                    "model": "arabic-model",
+                },
+            )
+            await progress_callback(
+                "transcription_refinement_complete",
+                {
+                    "refined_srt_chars": 53,
+                    "refined_transcript_chars": 10,
+                    "model": "arabic-model",
+                },
+            )
+            await progress_callback(
+                "translating_subtitles",
+                {
+                    "index": 1,
+                    "total": 1,
+                    "raw_chars": 12,
+                    "raw_bytes": 24,
                     "model": "gpt-5.4",
                 },
             )
             await progress_callback(
-                "refinement_complete",
+                "translation_complete",
                 {
                     "translated_srt_chars": 95,
                     "line_translated_transcript_chars": 17,
@@ -985,14 +1020,15 @@ async def test_process_video_message_reports_step_by_step_flow(
             )
             return TranscriptionResult(
                 raw_transcript="هاي خام",
-                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
+                refined_transcript="هاي منقحة",
+                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي منقحة"),),
                 translated_srt=(
                     "1\n"
                     "00:00:00,000 --> 00:00:01,250\n"
-                    "هاي خام\n"
+                    "هاي منقحة\n"
                     '<font color="green">این خام است</font>\n'
                 ),
-                line_translated_transcript="هاي خام\nاین خام است\n",
+                line_translated_transcript="هاي منقحة\nاین خام است\n",
             )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
@@ -1011,7 +1047,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     caplog.set_level("INFO", logger="telegram_transcript.bot")
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     downloader = FakeMediaDownloader()
     context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber(), "media_downloader": downloader})
 
@@ -1020,24 +1056,25 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
     assert message.text_replies == [
         "Video received. Starting transcription...",
-        "هاي خام",
-        "هاي خام\nاین خام است",
+        "هاي منقحة",
+        "هاي منقحة\nاین خام است",
     ]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     assert [document.filename for document, _ in message.document_replies] == ["clip.srt"]
     status = message.status_replies[0]
     assert status.edits == [
-        "Step 1/6: downloading media...",
-        "Step 2/6: extracting lossless FLAC audio at 1.4x...",
-        "Step 3/6: preparing audio chunks...",
-        "Step 4/6: transcribing chunk 1/1...",
+        "Step 1/7: downloading media...",
+        "Step 2/7: extracting lossless FLAC audio at 1.4x...",
+        "Step 3/7: preparing audio chunks...",
+        "Step 4/7: transcribing chunk 1/1...",
         "Gemini could not produce valid SRT; retrying chunk 1/1 with Deepgram...",
-        "Step 5/6: translating subtitles...",
-        "Step 6/6: sending transcript...",
+        "Step 5/7: refining Iraqi Arabic transcription...",
+        "Step 6/7: translating subtitles...",
+        "Step 7/7: sending transcript...",
         "Transcript ready.",
     ]
-    assert "job1234 step 1/6" in caplog.text
-    assert "job1234 step 6/6" in caplog.text
+    assert "job1234 step 1/7" in caplog.text
+    assert "job1234 step 7/7" in caplog.text
     assert "این خام است" not in caplog.text
 
 
@@ -1058,15 +1095,15 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
             assert progress_callback is not None
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 1, "total": 2, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
             )
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 2, "total": 2, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
             )
             await progress_callback(
-                "refinement_complete",
+                "translation_complete",
                 {"translated_srt_chars": 95, "line_translated_transcript_chars": 17},
             )
             return TranscriptionResult(
@@ -1092,15 +1129,15 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
-    assert "Step 5/6: translating subtitle cue 1/2..." in message.status_replies[0].edits
-    assert "Step 5/6: translating subtitle cue 2/2..." not in message.status_replies[0].edits
+    assert "Step 6/7: translating subtitle cue 1/2..." in message.status_replies[0].edits
+    assert "Step 6/7: translating subtitle cue 2/2..." not in message.status_replies[0].edits
 
 
 @pytest.mark.asyncio
@@ -1123,17 +1160,17 @@ async def test_process_video_message_reports_translation_progress_after_throttle
             assert progress_callback is not None
             current_time[0] = 0.0
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 1, "total": 3, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
             )
             current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS - 1
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 2, "total": 3, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
             )
             current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 3, "total": 3, "raw_chars": 62, "raw_bytes": 62, "model": "gpt-5.4"},
             )
             return TranscriptionResult(raw_transcript="raw only")
@@ -1149,7 +1186,7 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -1157,9 +1194,9 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     edits = message.status_replies[0].edits
-    assert "Step 5/6: translating subtitle cue 1/3..." in edits
-    assert "Step 5/6: translating subtitle cue 2/3..." not in edits
-    assert "Step 5/6: translating subtitle cue 3/3..." in edits
+    assert "Step 6/7: translating subtitle cue 1/3..." in edits
+    assert "Step 6/7: translating subtitle cue 2/3..." not in edits
+    assert "Step 6/7: translating subtitle cue 3/3..." in edits
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openai_api_key == "openai-key"
     assert settings.openrouter_api_key == "openrouter-key"
     assert settings.openrouter_refine_model == "openai/gpt-5.5"
+    assert settings.openrouter_transcription_refinement_model == "openai/gpt-5.5"
     assert settings.refine is False
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
@@ -47,6 +48,7 @@ def test_load_settings_parses_optional_values() -> None:
             **BASE_ENV,
             "OPENROUTER_API_KEY": "custom-openrouter-key",
             "OPENROUTER_REFINE_MODEL": "custom-refine-model",
+            "OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL": "custom-transcription-refinement-model",
             "DEEPGRAM_KEYTERMS": "اسم, مصطلح, اسم",
             "REFINE": "true",
             "ALLOWED_TELEGRAM_USER_IDS": "123, 456",
@@ -61,6 +63,7 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.deepgram_api_key == "deepgram-key"
     assert settings.openrouter_api_key == "custom-openrouter-key"
     assert settings.openrouter_refine_model == "custom-refine-model"
+    assert settings.openrouter_transcription_refinement_model == "custom-transcription-refinement-model"
     assert settings.deepgram_keyterms == ("اسم", "مصطلح")
     assert settings.refine is True
     assert settings.allowed_telegram_user_ids == frozenset({123, 456})

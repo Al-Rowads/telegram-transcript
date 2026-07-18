@@ -12,6 +12,7 @@ from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
+    DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
 )
 
 MAX_TELEGRAM_MEDIA_MB = 2048.0
@@ -33,6 +34,7 @@ class Settings:
     openai_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_refine_model: str = DEFAULT_REFINEMENT_MODEL
+    openrouter_transcription_refinement_model: str = DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL
     refine: bool = False
     allowed_telegram_user_ids: frozenset[int] = frozenset()
     max_video_mb: float = MAX_TELEGRAM_MEDIA_MB
@@ -77,6 +79,13 @@ def load_settings(
         source.get("OPENROUTER_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip()
         or DEFAULT_REFINEMENT_MODEL
     )
+    transcription_refinement_model = (
+        source.get(
+            "OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL",
+            DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
+        ).strip()
+        or DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL
+    )
     max_video_mb = parse_positive_float(source.get("MAX_VIDEO_MB"), "MAX_VIDEO_MB", MAX_TELEGRAM_MEDIA_MB)
     if max_video_mb > MAX_TELEGRAM_MEDIA_MB:
         raise ConfigError("MAX_VIDEO_MB must be less than or equal to Telegram's 2048 MB file limit.")
@@ -93,6 +102,7 @@ def load_settings(
         openai_api_key=openai_api_key,
         openrouter_api_key=openrouter_api_key,
         openrouter_refine_model=refine_model,
+        openrouter_transcription_refinement_model=transcription_refinement_model,
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,

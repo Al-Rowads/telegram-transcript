@@ -37,6 +37,7 @@ from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
     GeminiAudioCorrectionProvider,
     GeminiSpeechToTextProvider,
+    IraqiArabicTranscriptRefiner,
     LowConfidenceTranscriptCorrector,
     OpenAISpeechToTextProvider,
     OpenRouterWhisperSpeechToTextProvider,
@@ -247,6 +248,10 @@ def create_transcriber(
     return SpeechTranscriber(
         speech_to_text_provider=speech_to_text_providers[0],
         fallback_speech_to_text_providers=speech_to_text_providers[1:],
+        transcription_refiner=IraqiArabicTranscriptRefiner(
+            api_key=settings.openrouter_api_key,
+            model=settings.openrouter_transcription_refinement_model,
+        ),
         refiner=refiner,
         correctors_by_provider=correctors_by_provider,
     )
@@ -520,13 +525,14 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     translation_model = get_runtime_translation_model(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s transcription_refinement_model=%s translation_enabled=%s translation_model=%s",
         job_id,
         get_media_attachment_suffix(attachment),
         file_size,
         audio_tempo,
         provider_name,
         model_name,
+        settings.openrouter_transcription_refinement_model,
         settings.refine,
         translation_model,
     )
@@ -565,6 +571,8 @@ async def process_media_message(
     transcriber: SpeechTranscriber = context.bot_data["transcriber"]
     base_name = get_media_attachment_basename(attachment)
     job_started = time.monotonic()
+    total_steps = 7 if settings.refine else 6
+    sending_step = 7 if settings.refine else 6
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -578,18 +586,20 @@ async def process_media_message(
         status_ref["message"] = status
 
         step_started = time.monotonic()
-        await edit_status_message(status, "Step 1/6: downloading media...", job_id=job_id)
+        await edit_status_message(status, f"Step 1/{total_steps}: downloading media...", job_id=job_id)
         logger.info(
-            "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
+            "job %s step 1/%d downloading media: suffix=%s telegram_file_size=%s",
             job_id,
+            total_steps,
             get_media_attachment_suffix(attachment),
             get_attachment_file_size(attachment),
         )
         await download_message_media(context, message, source_path)
         source_bytes = source_path.stat().st_size
         logger.info(
-            "job %s step 1/6 downloaded media: source_bytes=%d duration_ms=%d",
+            "job %s step 1/%d downloaded media: source_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             source_bytes,
             elapsed_ms(step_started),
         )
@@ -603,11 +613,16 @@ async def process_media_message(
             await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
             return
 
-        await edit_status_message(status, f"Step 2/6: extracting lossless FLAC audio at {audio_tempo:g}x...", job_id=job_id)
+        await edit_status_message(
+            status,
+            f"Step 2/{total_steps}: extracting lossless FLAC audio at {audio_tempo:g}x...",
+            job_id=job_id,
+        )
         step_started = time.monotonic()
         logger.info(
-            "job %s step 2/6 extracting FLAC audio: source_bytes=%d audio_tempo=%g",
+            "job %s step 2/%d extracting FLAC audio: source_bytes=%d audio_tempo=%g",
             job_id,
+            total_steps,
             source_bytes,
             audio_tempo,
         )
@@ -619,17 +634,19 @@ async def process_media_message(
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(
-            "job %s step 2/6 extracted FLAC audio: audio_bytes=%d duration_ms=%d",
+            "job %s step 2/%d extracted FLAC audio: audio_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             audio_bytes,
             elapsed_ms(step_started),
         )
 
-        await edit_status_message(status, "Step 3/6: preparing audio chunks...", job_id=job_id)
+        await edit_status_message(status, f"Step 3/{total_steps}: preparing audio chunks...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
-            "job %s step 3/6 preparing bounded transcription chunks: audio_bytes=%d",
+            "job %s step 3/%d preparing bounded transcription chunks: audio_bytes=%d",
             job_id,
+            total_steps,
             audio_bytes,
         )
         chunks = await asyncio.to_thread(
@@ -639,8 +656,9 @@ async def process_media_message(
         )
         chunk_sizes = [chunk.path.stat().st_size for chunk in chunks]
         logger.info(
-            "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
+            "job %s step 3/%d prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             len(chunks),
             sum(chunk_sizes),
             min(chunk_sizes),
@@ -655,10 +673,15 @@ async def process_media_message(
             if event == "transcribing_chunk":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
-                await edit_status_message(status, f"Step 4/6: transcribing chunk {index}/{total}...", job_id=job_id)
+                await edit_status_message(
+                    status,
+                    f"Step 4/{total_steps}: transcribing chunk {index}/{total}...",
+                    job_id=job_id,
+                )
                 logger.info(
-                    "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
+                    "job %s step 4/%d transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("chunk_bytes"),
@@ -667,8 +690,9 @@ async def process_media_message(
                 )
             elif event == "chunk_transcribed":
                 logger.info(
-                    "job %s step 4/6 transcribed chunk %s/%s: raw_chars=%s",
+                    "job %s step 4/%d transcribed chunk %s/%s: raw_chars=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("index"),
                     progress_data.get("total"),
                     progress_data.get("raw_chars"),
@@ -685,8 +709,9 @@ async def process_media_message(
                     job_id=job_id,
                 )
                 logger.warning(
-                    "job %s step 4/6 provider fallback for chunk %s/%s: failed_provider=%s failed_model=%s next_provider=%s next_model=%s",
+                    "job %s step 4/%d provider fallback for chunk %s/%s: failed_provider=%s failed_model=%s next_provider=%s next_model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("failed_provider"),
@@ -694,13 +719,48 @@ async def process_media_message(
                     progress_data.get("next_provider"),
                     progress_data.get("next_model"),
                 )
-            elif event == "refining_transcript":
+            elif event == "refining_transcription":
+                await edit_status_message(
+                    status,
+                    f"Step 5/{total_steps}: refining Iraqi Arabic transcription...",
+                    job_id=job_id,
+                )
+                logger.info(
+                    "job %s step 5/%d refining Iraqi Arabic SRT: srt_chars=%s srt_bytes=%s model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("raw_chars"),
+                    progress_data.get("raw_bytes"),
+                    progress_data.get("model"),
+                )
+            elif event == "transcription_refinement_complete":
+                logger.info(
+                    "job %s step 5/%d refined Iraqi Arabic SRT: refined_srt_chars=%s refined_transcript_chars=%s model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("refined_srt_chars"),
+                    progress_data.get("refined_transcript_chars"),
+                    progress_data.get("model"),
+                )
+            elif event == "transcription_refinement_failed":
+                await edit_status_message(
+                    status,
+                    f"Step 5/{total_steps}: refinement failed; using original subtitles...",
+                    job_id=job_id,
+                )
+                logger.warning(
+                    "job %s step 5/%d Iraqi Arabic refinement failed; original subtitles will be used: model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("model"),
+                )
+            elif event == "translating_subtitles":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
                 if isinstance(total, int) and total > 1:
-                    status_text = f"Step 5/6: translating subtitle cue {index}/{total}..."
+                    status_text = f"Step 6/{total_steps}: translating subtitle cue {index}/{total}..."
                 else:
-                    status_text = "Step 5/6: translating subtitles..."
+                    status_text = f"Step 6/{total_steps}: translating subtitles..."
                 now = time.monotonic()
                 if (
                     last_translation_status_attempt_at is None
@@ -709,30 +769,33 @@ async def process_media_message(
                     last_translation_status_attempt_at = now
                     await edit_status_message(status, status_text, job_id=job_id)
                 logger.info(
-                    "job %s step 5/6 translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
+                    "job %s step 6/%d translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("raw_chars"),
                     progress_data.get("raw_bytes"),
                     progress_data.get("model"),
                 )
-            elif event == "refinement_complete":
+            elif event == "translation_complete":
                 logger.info(
-                    "job %s step 5/6 translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
+                    "job %s step 6/%d translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("translated_srt_chars"),
                     progress_data.get("line_translated_transcript_chars"),
                 )
-            elif event == "refinement_failed":
+            elif event == "translation_failed":
                 await edit_status_message(
                     status,
-                    "Step 5/6: translation failed; preparing raw subtitles...",
+                    f"Step 6/{total_steps}: translation failed; preparing Arabic subtitles...",
                     job_id=job_id,
                 )
                 logger.warning(
-                    "job %s step 5/6 translation failed; raw subtitles will be delivered: model=%s",
+                    "job %s step 6/%d translation failed; Arabic subtitles will be delivered: model=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("model"),
                 )
 
@@ -740,7 +803,7 @@ async def process_media_message(
             await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
         )
 
-    raw_transcript = transcription_result.raw_transcript.strip() or "No speech was detected."
+    final_transcript = transcription_result.final_transcript.strip() or "No speech was detected."
     translated_srt = (
         transcription_result.translated_srt.strip() if transcription_result.translated_srt is not None else None
     )
@@ -750,19 +813,25 @@ async def process_media_message(
         else None
     )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
-    await edit_status_message(status, "Step 6/6: sending transcript...", job_id=job_id)
+    await edit_status_message(
+        status,
+        f"Step {sending_step}/{total_steps}: sending transcript...",
+        job_id=job_id,
+    )
     logger.info(
-        "job %s step 6/6 sending transcript: raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d raw_delivery=%s",
+        "job %s step %d/%d sending transcript: final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d delivery=%s",
         job_id,
-        len(raw_transcript),
+        sending_step,
+        total_steps,
+        len(final_transcript),
         len(translated_srt) if translated_srt is not None else None,
         len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
-        "text" if should_send_as_text(raw_transcript) else "document",
+        "text" if should_send_as_text(final_transcript) else "document",
     )
     await send_transcript(
         message,
-        raw_transcript,
+        final_transcript,
         filename=f"{base_name}.transcription.txt",
         caption="Transcription",
     )
@@ -786,10 +855,10 @@ async def process_media_message(
     else:
         await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
     logger.info(
-        "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
+        "job %s completed: duration_ms=%d final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
         elapsed_ms(job_started),
-        len(raw_transcript),
+        len(final_transcript),
         len(translated_srt) if translated_srt is not None else None,
         len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
