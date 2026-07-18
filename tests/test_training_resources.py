@@ -134,15 +134,16 @@ def test_production_manifest_excludes_modern_arabic_newspaper_sources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_iso_8859_6_resource_is_decoded_to_unicode_context(tmp_path: Path) -> None:
-    arabic_text = "قيل لـ رجل عاقل"
-    payload = arabic_text.encode("iso-8859-6")
+async def test_legacy_mac_arabic_resource_is_decoded_to_unicode_context(tmp_path: Path) -> None:
+    arabic_text = "صدگ يعني لو سادين الگهاوي"
+    payload = arabic_text.encode("mac_arabic")
+    assert b"\xf8" in payload
     resource = make_resource(
         "IA2D",
         "ia2d/Tweets_Raw_Data.txt",
         "https://example.test/tweets",
         payload,
-        encoding="iso-8859-6",
+        encoding="mac_arabic",
     )
     path = tmp_path / resource.relative_path
     path.parent.mkdir(parents=True)
@@ -183,7 +184,7 @@ def test_production_manifest_declares_legacy_tweets_encoding() -> None:
         if resource.relative_path.name == "Tweets_Raw_Data.txt"
     )
 
-    assert raw_tweets.encoding == "iso-8859-6"
+    assert raw_tweets.encoding == "mac_arabic"
     assert all(
         resource.encoding == "utf-8"
         for resource in IRAQI_ARABIC_TRAINING_RESOURCES

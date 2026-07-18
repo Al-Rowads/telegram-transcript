@@ -92,7 +92,9 @@ IRAQI_ARABIC_TRAINING_RESOURCES = (
         ),
         size=210_900,
         git_blob_sha1="ce8e6901faf88540df090a61ca7b2de13c8af1a7",
-        encoding="iso-8859-6",
+        # The upstream file uses legacy Mac Arabic; Iraqi letters such as گ use
+        # byte values that are undefined in ISO-8859-6.
+        encoding="mac_arabic",
     ),
 )
 
