@@ -82,6 +82,7 @@ HELP_MESSAGE = """Available commands:
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
 /model [gemini|deepgram|whisper|openai] - Show or select the primary transcription model.
 /refiner [gpt|gemini] - Show or select the Iraqi transcription refinement model.
+/translate - Toggle Persian translation for future media.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 
@@ -196,6 +197,7 @@ def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesSt
         audio_tempo=settings.audio_tempo,
         transcription_model=DEFAULT_TRANSCRIPTION_MODEL_KEY,
         transcription_refinement_model=settings.openrouter_transcription_refinement_model,
+        translation_enabled=settings.refine,
         translation_model=settings.openrouter_refine_model,
         translation_prompt=DEFAULT_TRANSLATION_PROMPT_KEY,
     )
@@ -230,6 +232,7 @@ def create_application(settings: Settings | None = None) -> Application:
     transcriber = create_transcriber(
         settings,
         runtime_preferences.transcription_model,
+        translation_enabled=runtime_preferences.translation_enabled,
         transcription_refinement_model=initial_effective_refinement_model,
         translation_model=runtime_preferences.translation_model,
         translation_prompt=translation_prompt,
@@ -247,6 +250,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["transcription_model"] = runtime_preferences.transcription_model
     app.bot_data["transcription_refinement_model"] = selected_refinement_model
     app.bot_data["effective_transcription_refinement_model"] = initial_effective_refinement_model
+    app.bot_data["translation_enabled"] = runtime_preferences.translation_enabled
     app.bot_data["translation_model"] = runtime_preferences.translation_model
     app.bot_data["translation_prompt"] = translation_prompt
     app.bot_data["runtime_preferences_store"] = runtime_store
@@ -265,6 +269,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(CommandHandler("model", handle_model_command))
     app.add_handler(CommandHandler("refiner", handle_transcription_refinement_model_command))
+    app.add_handler(CommandHandler("translate", handle_translation_toggle_command))
     app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
     app.add_handler(CommandHandler("translation", handle_translation_prompt_command))
     app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
@@ -279,6 +284,7 @@ def create_transcriber(
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
     transcription_refinement_model: str | None = None,
     iraqi_training_context: str | None = None,
+    translation_enabled: bool | None = None,
 ) -> SpeechTranscriber:
     model_order = get_transcription_model_order(model_key)
     speech_to_text_providers = [
@@ -286,6 +292,7 @@ def create_transcriber(
         for ordered_model_key in model_order
     ]
     canonical_prompt = canonicalize_translation_prompt_key(translation_prompt)
+    effective_translation_enabled = settings.refine if translation_enabled is None else translation_enabled
 
     refiner = (
         TranscriptRefiner(
@@ -294,7 +301,7 @@ def create_transcriber(
             system_prompt=TRANSLATION_PROMPT_OPTIONS[canonical_prompt],
             prompt_key=canonical_prompt,
         )
-        if settings.refine
+        if effective_translation_enabled
         else None
     )
     correctors_by_provider = {
@@ -343,6 +350,7 @@ def create_effective_transcriber(
     settings: Settings,
     *,
     model_key: str | None = None,
+    translation_enabled: bool | None = None,
     translation_model: str | None = None,
     translation_prompt: str | None = None,
     transcription_refinement_model: str | None = None,
@@ -361,6 +369,11 @@ def create_effective_transcriber(
         create_transcriber(
             settings,
             model_key or get_runtime_model_key(context),
+            translation_enabled=(
+                get_runtime_translation_enabled(context, settings)
+                if translation_enabled is None
+                else translation_enabled
+            ),
             translation_model=translation_model or get_runtime_translation_model(context, settings),
             translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
             transcription_refinement_model=effective_refinement_model,
@@ -630,6 +643,41 @@ async def handle_transcription_refinement_model_command(
     await reply_to_source(message, f"Transcription refinement model set to {option.label}.")
 
 
+async def handle_translation_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+
+    args = getattr(context, "args", None)
+    if not isinstance(args, list) or args:
+        await reply_to_source(message, "Usage: /translate")
+        return
+
+    translation_enabled = not get_runtime_translation_enabled(context, settings)
+    try:
+        transcriber, effective_refinement_model = create_effective_transcriber(
+            context,
+            settings,
+            translation_enabled=translation_enabled,
+        )
+        persist_runtime_preferences(context, translation_enabled=translation_enabled)
+    except (ConfigError, RuntimeStateError) as exc:
+        await reply_to_source(message, str(exc))
+        return
+
+    context.bot_data["transcriber"] = transcriber
+    context.bot_data["translation_enabled"] = translation_enabled
+    context.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
+    state = "enabled" if translation_enabled else "disabled"
+    await reply_to_source(message, f"Translation {state}.")
+
+
 async def handle_translation_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None or get_chat_type(message) == ChatType.CHANNEL:
@@ -740,6 +788,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     audio_tempo = get_runtime_audio_tempo(context, settings)
     provider_name, model_name = get_runtime_transcriber_info(context, settings)
     transcription_refinement_model = get_effective_transcription_refinement_model(context, settings)
+    translation_enabled = get_runtime_translation_enabled(context, settings)
     translation_model = get_runtime_translation_model(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
@@ -751,7 +800,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         provider_name,
         model_name,
         transcription_refinement_model,
-        settings.refine,
+        translation_enabled,
         translation_model,
     )
 
@@ -787,12 +836,13 @@ async def process_media_message(
     audio_tempo: float,
 ) -> None:
     transcriber: SpeechTranscriber = context.bot_data["transcriber"]
+    translation_enabled = get_runtime_translation_enabled(context, settings)
     base_name = get_media_attachment_basename(attachment)
     video_registry = context.bot_data.get("video_registry")
     incoming_file_name = getattr(attachment, "file_name", None)
     job_started = time.monotonic()
-    total_steps = 7 if settings.refine else 6
-    sending_step = 7 if settings.refine else 6
+    total_steps = 7 if translation_enabled else 6
+    sending_step = 7 if translation_enabled else 6
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -1270,6 +1320,14 @@ def get_runtime_translation_model(context: ContextTypes.DEFAULT_TYPE, settings: 
     return settings.openrouter_refine_model
 
 
+def get_runtime_translation_enabled(
+    context: ContextTypes.DEFAULT_TYPE | Application,
+    settings: Settings,
+) -> bool:
+    candidate = context.bot_data.get("translation_enabled", settings.refine)
+    return candidate if isinstance(candidate, bool) else settings.refine
+
+
 def get_runtime_transcription_refinement_model(
     context: ContextTypes.DEFAULT_TYPE,
     settings: Settings,
@@ -1319,6 +1377,7 @@ def persist_runtime_preferences(
     audio_tempo: float | None = None,
     transcription_model: str | None = None,
     transcription_refinement_model: str | None = None,
+    translation_enabled: bool | None = None,
     translation_model: str | None = None,
     translation_prompt: str | None = None,
 ) -> None:
@@ -1333,6 +1392,11 @@ def persist_runtime_preferences(
             transcription_refinement_model=(
                 transcription_refinement_model
                 or get_runtime_transcription_refinement_model(context, settings)
+            ),
+            translation_enabled=(
+                get_runtime_translation_enabled(context, settings)
+                if translation_enabled is None
+                else translation_enabled
             ),
             translation_model=translation_model or get_runtime_translation_model(context, settings),
             translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
@@ -1421,7 +1485,7 @@ def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE
     )
     lines = [
         f"Current translation model: {current_label}",
-        f"Translation: {'enabled' if settings.refine else 'disabled (REFINE=false)'}",
+        f"Translation: {'enabled' if get_runtime_translation_enabled(context, settings) else 'disabled'}",
         "",
         "Available models:",
     ]

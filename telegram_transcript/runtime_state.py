@@ -9,8 +9,8 @@ from typing import Any
 
 from telegram_transcript.config import ConfigError, parse_audio_tempo
 
-RUNTIME_PREFERENCES_VERSION = 2
-LEGACY_RUNTIME_PREFERENCES_VERSION = 1
+RUNTIME_PREFERENCES_VERSION = 3
+LEGACY_RUNTIME_PREFERENCES_VERSIONS = frozenset({1, 2})
 
 
 class RuntimeStateError(RuntimeError):
@@ -22,6 +22,7 @@ class RuntimePreferences:
     audio_tempo: float
     transcription_model: str
     transcription_refinement_model: str
+    translation_enabled: bool
     translation_model: str
     translation_prompt: str
 
@@ -52,7 +53,7 @@ class RuntimePreferencesStore:
         except (OSError, json.JSONDecodeError) as exc:
             raise ConfigError(f"Unable to read runtime state from {self.path}: {exc}") from exc
         if not isinstance(payload, dict) or payload.get("version") not in {
-            LEGACY_RUNTIME_PREFERENCES_VERSION,
+            *LEGACY_RUNTIME_PREFERENCES_VERSIONS,
             RUNTIME_PREFERENCES_VERSION,
         }:
             raise ConfigError(f"Unsupported runtime state format in {self.path}.")
@@ -62,11 +63,16 @@ class RuntimePreferencesStore:
             raise ConfigError(f"Runtime state in {self.path} is missing required settings.")
         refinement_model = (
             payload.get("transcription_refinement_model")
-            if payload["version"] == RUNTIME_PREFERENCES_VERSION
+            if payload["version"] >= 2
             else self.defaults.transcription_refinement_model
         )
-        if payload["version"] == RUNTIME_PREFERENCES_VERSION and refinement_model is None:
+        if payload["version"] >= 2 and refinement_model is None:
             raise ConfigError(f"Runtime state in {self.path} is missing required settings.")
+        translation_enabled = (
+            self._validate_bool(payload.get("translation_enabled"), "translation enabled")
+            if payload["version"] == RUNTIME_PREFERENCES_VERSION
+            else self.defaults.translation_enabled
+        )
         preferences = RuntimePreferences(
             audio_tempo=parse_audio_tempo(str(payload["audio_tempo"])),
             transcription_model=self._validate_choice(
@@ -77,6 +83,7 @@ class RuntimePreferencesStore:
                 self.transcription_refinement_models,
                 "transcription refinement model",
             ),
+            translation_enabled=translation_enabled,
             translation_model=self._validate_choice(
                 payload["translation_model"], self.translation_models, "translation model"
             ),
@@ -108,5 +115,11 @@ class RuntimePreferencesStore:
     @staticmethod
     def _validate_choice(value: object, choices: frozenset[str], label: str) -> str:
         if not isinstance(value, str) or value not in choices:
+            raise ConfigError(f"Invalid persisted {label}: {value!r}.")
+        return value
+
+    @staticmethod
+    def _validate_bool(value: object, label: str) -> bool:
+        if not isinstance(value, bool):
             raise ConfigError(f"Invalid persisted {label}: {value!r}.")
         return value

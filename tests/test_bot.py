@@ -20,6 +20,7 @@ from telegram_transcript.bot import (
     help_command,
     handle_model_command,
     handle_transcription_refinement_model_command,
+    handle_translation_toggle_command,
     handle_translation_model_command,
     handle_translation_prompt_command,
     handle_non_video,
@@ -178,6 +179,42 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
     assert transcriber.refinement_model == translation_model
 
 
+@pytest.mark.parametrize(
+    ("settings_enabled", "runtime_enabled", "expected_model"),
+    [
+        (False, True, "openai/gpt-5.5"),
+        (True, False, None),
+    ],
+)
+def test_create_transcriber_runtime_translation_toggle_overrides_settings(
+    settings_enabled: bool,
+    runtime_enabled: bool,
+    expected_model: str | None,
+) -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
+            openrouter_api_key="openrouter-key",
+            refine=settings_enabled,
+        ),
+        translation_enabled=runtime_enabled,
+    )
+
+    assert transcriber.refinement_model == expected_model
+
+
+def test_runtime_translation_default_comes_from_refine_setting(tmp_path: Path) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        refine=True,
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+
+    assert bot_module.create_runtime_preferences_store(settings).load().translation_enabled is True
+
+
 def test_create_transcriber_uses_dedicated_transcription_refinement_model() -> None:
     transcriber = bot_module.create_transcriber(
         Settings(
@@ -275,6 +312,7 @@ async def test_initialize_application_loads_context_for_selected_gemini_refineme
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "natural",
         transcription_refinement_model: str | None = None,
@@ -338,6 +376,7 @@ async def test_initialize_application_temporarily_falls_back_to_gpt_when_resourc
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "natural",
         transcription_refinement_model: str | None = None,
@@ -491,6 +530,7 @@ async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: p
     assert "/tempo <0.5-2.0>" in reply
     assert "/model [gemini|deepgram|whisper|openai]" in reply
     assert "/refiner [gpt|gemini]" in reply
+    assert "/translate - Toggle Persian translation" in reply
     assert "/tmodel [gemini|gpt|claude]" in reply
     assert "/translation [natural|literal]" in reply
     assert message.text_reply_kwargs == [
@@ -768,6 +808,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -938,6 +979,7 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1058,6 +1100,136 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_enabled", "expected_enabled", "expected_reply"),
+    [
+        (False, True, "Translation enabled."),
+        (True, False, "Translation disabled."),
+    ],
+)
+async def test_handle_translation_toggle_command_switches_and_persists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    initial_enabled: bool,
+    expected_enabled: bool,
+    expected_reply: str,
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        openrouter_api_key="openrouter-key",
+        refine=initial_enabled,
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    active_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+    replacement_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": settings,
+            "transcriber": active_transcriber,
+            "translation_enabled": initial_enabled,
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
+        },
+    )
+    calls: list[bool | None] = []
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_enabled: bool | None = None,
+        translation_model: str | None = None,
+        translation_prompt: str = "natural",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
+    ) -> object:
+        assert settings_arg is settings
+        calls.append(translation_enabled)
+        return replacement_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+
+    await handle_translation_toggle_command(update, context)
+
+    assert calls == [expected_enabled]
+    assert context.bot_data["transcriber"] is replacement_transcriber
+    assert context.bot_data["translation_enabled"] is expected_enabled
+    assert context.bot_data["runtime_preferences_store"].load().translation_enabled is expected_enabled
+    assert message.text_replies == [expected_reply]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_toggle_command_keeps_active_state_when_save_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        openrouter_api_key="openrouter-key",
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    store = bot_module.create_runtime_preferences_store(settings)
+    active_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": settings,
+            "transcriber": active_transcriber,
+            "translation_enabled": False,
+            "runtime_preferences_store": store,
+        },
+    )
+
+    monkeypatch.setattr(
+        bot_module,
+        "create_transcriber",
+        lambda *args, **kwargs: SimpleNamespace(provider_name="gemini", model="gemini"),
+    )
+
+    def fail_save(preferences: object) -> None:
+        raise bot_module.RuntimeStateError("Unable to save runtime settings.")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    await handle_translation_toggle_command(update, context)
+
+    assert context.bot_data["transcriber"] is active_transcriber
+    assert context.bot_data["translation_enabled"] is False
+    assert message.text_replies == ["Unable to save runtime settings."]
+
+
+@pytest.mark.asyncio
+async def test_handle_translation_toggle_command_validates_access_and_arguments() -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        allowed_telegram_user_ids=frozenset({123}),
+    )
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
+    context = SimpleNamespace(args=[], bot_data={"settings": settings})
+
+    await handle_translation_toggle_command(update, context)
+
+    assert message.text_replies == ["Sorry, this bot is not enabled for your Telegram account."]
+
+    update.effective_user.id = 123
+    context.args = ["on"]
+    await handle_translation_toggle_command(update, context)
+
+    assert message.text_replies[-1] == "Usage: /translate"
+
+    channel_message = FakeMessage(chat_type=ChatType.CHANNEL)
+    await handle_translation_toggle_command(
+        SimpleNamespace(effective_message=channel_message, effective_user=SimpleNamespace(id=123)),
+        SimpleNamespace(args=[], bot_data={}),
+    )
+    assert channel_message.text_replies == []
+
+
+@pytest.mark.asyncio
 async def test_handle_translation_model_command_lists_current_models_and_refine_status() -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
@@ -1102,7 +1274,7 @@ async def test_handle_translation_model_command_reports_when_refine_is_disabled(
 
     await handle_translation_model_command(update, context)
 
-    assert "Translation: disabled (REFINE=false)" in message.text_replies[0]
+    assert "Translation: disabled" in message.text_replies[0]
 
 
 @pytest.mark.asyncio
@@ -1147,6 +1319,7 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1248,6 +1421,7 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
+        translation_enabled: bool | None = None,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,

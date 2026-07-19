@@ -175,7 +175,10 @@ CORRECTION_RESOLUTION_RESPONSE_FORMAT: dict[str, object] = {
     },
 }
 
-GREEN_FONT_RE = re.compile(r'^<font\s+color=["\']?green["\']?>\s*(.*?)\s*</font>$', re.IGNORECASE)
+TRANSLATION_FONT_RE = re.compile(
+    r'^<font\s+color=["\']?(?:green|yellow)["\']?>\s*(.*?)\s*</font>$',
+    re.IGNORECASE,
+)
 SRT_CUE_NUMBER_RE = re.compile(r"^\d+$")
 SRT_TIMESTAMP_RE = re.compile(
     r"^\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+\d{2}:\d{2}:\d{2},\d{3}(?:\s+.*)?$"
@@ -1756,7 +1759,7 @@ def render_translated_srt_block(block: SrtBlock, persian_translation: str) -> st
                 timestamp=block.timestamp,
                 text_lines=(
                     *block.text_lines,
-                    f'<font color="green">{translation}</font>',
+                    f'<font color="yellow">{translation}</font>',
                 ),
             ),
         )
@@ -1890,7 +1893,7 @@ def render_line_translated_transcript_from_srt(translated_srt: str) -> str:
         stripped_line = line.strip()
         if SRT_CUE_NUMBER_RE.fullmatch(stripped_line) or SRT_TIMESTAMP_RE.fullmatch(stripped_line):
             continue
-        match = GREEN_FONT_RE.fullmatch(stripped_line)
+        match = TRANSLATION_FONT_RE.fullmatch(stripped_line)
         text_lines.append(match.group(1).strip() if match is not None else stripped_line)
 
     while text_lines and not text_lines[0]:

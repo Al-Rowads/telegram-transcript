@@ -548,11 +548,11 @@ async def test_transcribe_chunks_reports_progress_and_refines(
         "1\n"
         "00:00:00,500 --> 00:00:01,000\n"
         "first\n"
-        '<font color="green">اول</font>\n\n'
+        '<font color="yellow">اول</font>\n\n'
         "2\n"
         "00:00:10,500 --> 00:00:11,000\n"
         "second\n"
-        '<font color="green">دوم</font>\n'
+        '<font color="yellow">دوم</font>\n'
     )
     assert result.line_translated_transcript == "first\nاول\n\nsecond\nدوم\n"
     assert result.subtitle_cues == (
@@ -1108,15 +1108,15 @@ async def test_transcribe_chunks_async_translates_each_srt_cue(
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
         "first\n"
-        '<font color="green">ترجمه 1</font>\n\n'
+        '<font color="yellow">ترجمه 1</font>\n\n'
         "2\n"
         "00:00:01,000 --> 00:00:02,000\n"
         "second\n"
-        '<font color="green">ترجمه 2</font>\n\n'
+        '<font color="yellow">ترجمه 2</font>\n\n'
         "3\n"
         "00:00:02,000 --> 00:00:03,000\n"
         "third\n"
-        '<font color="green">ترجمه 3</font>\n'
+        '<font color="yellow">ترجمه 3</font>\n'
     )
     assert result.line_translated_transcript == (
         "first\nترجمه 1\n\nsecond\nترجمه 2\n\nthird\nترجمه 3\n"
@@ -1170,7 +1170,7 @@ async def test_transcribe_chunks_async_collapses_multiline_persian_translation(
         "00:00:00,000 --> 00:00:01,000\n"
         "first\n"
         "second\n"
-        '<font color="green">ترجمه خط اول ترجمه خط دوم</font>\n'
+        '<font color="yellow">ترجمه خط اول ترجمه خط دوم</font>\n'
     )
     assert result.line_translated_transcript == (
         "first\n"
@@ -1363,7 +1363,7 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
         "هاي\n"
-        '<font color="green">سلام</font>\n'
+        '<font color="yellow">سلام</font>\n'
     )
     call = fake_completions.calls[0]
     assert call["model"] == DEFAULT_REFINEMENT_MODEL
@@ -1659,7 +1659,7 @@ def test_render_translated_srt_block_preserves_original_cue_and_adds_one_persian
         "00:00:01,000 --> 00:00:02,000\n"
         "line one\n"
         "line two\n"
-        '<font color="green">ترجمه اول ترجمه دوم</font>\n'
+        '<font color="yellow">ترجمه اول ترجمه دوم</font>\n'
     )
 
 
@@ -1688,6 +1688,17 @@ def test_render_line_translated_transcript_from_srt_removes_srt_structure_and_fo
     assert render_line_translated_transcript_from_srt(translated_srt) == (
         "هلا بالعالم\nسلام دنیا\n\nشلونك؟\nحالت چطوره؟\n"
     )
+
+
+def test_render_line_translated_transcript_from_srt_removes_yellow_font_markup() -> None:
+    translated_srt = (
+        "1\n"
+        "00:00:00,001 --> 00:00:01,000\n"
+        "هلا بالعالم\n"
+        '<font color="yellow">سلام دنیا</font>\n'
+    )
+
+    assert render_line_translated_transcript_from_srt(translated_srt) == "هلا بالعالم\nسلام دنیا\n"
 
 
 def test_render_line_translated_transcript_from_srt_keeps_plain_translation_text() -> None:

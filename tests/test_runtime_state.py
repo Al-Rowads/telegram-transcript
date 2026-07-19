@@ -11,11 +11,12 @@ from telegram_transcript.runtime_state import RuntimePreferences, RuntimePrefere
 def make_store(tmp_path: object) -> RuntimePreferencesStore:
     path = tmp_path / "runtime.json"
     defaults = RuntimePreferences(
-        1.0,
-        "gemini",
-        "openai/gpt-5.5",
-        "openai/gpt-5.5",
-        "natural",
+        audio_tempo=1.0,
+        transcription_model="gemini",
+        transcription_refinement_model="openai/gpt-5.5",
+        translation_enabled=False,
+        translation_model="openai/gpt-5.5",
+        translation_prompt="natural",
     )
     return RuntimePreferencesStore(
         path,
@@ -34,16 +35,17 @@ def test_runtime_preferences_round_trip_and_use_defaults_when_missing(tmp_path: 
     assert store.load() == store.defaults
 
     preferences = RuntimePreferences(
-        1.2,
-        "whisper",
-        "google/gemini-3.5-flash",
-        "anthropic/claude-sonnet-4.6",
-        "v2",
+        audio_tempo=1.2,
+        transcription_model="whisper",
+        transcription_refinement_model="google/gemini-3.5-flash",
+        translation_enabled=True,
+        translation_model="anthropic/claude-sonnet-4.6",
+        translation_prompt="v2",
     )
     store.save(preferences)
 
     assert store.load() == preferences
-    assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 2
+    assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 3
 
 
 def test_runtime_preferences_load_version_one_with_default_refinement_model(tmp_path: object) -> None:
@@ -65,7 +67,30 @@ def test_runtime_preferences_load_version_one_with_default_refinement_model(tmp_
 
     assert preferences.transcription_refinement_model == "openai/gpt-5.5"
     assert preferences.transcription_model == "whisper"
+    assert preferences.translation_enabled is False
     assert preferences.translation_model == "anthropic/claude-sonnet-4.6"
+
+
+def test_runtime_preferences_load_version_two_with_default_translation_enabled(tmp_path: object) -> None:
+    store = make_store(tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "audio_tempo": 1.2,
+                "transcription_model": "whisper",
+                "transcription_refinement_model": "google/gemini-3.5-flash",
+                "translation_model": "anthropic/claude-sonnet-4.6",
+                "translation_prompt": "v2",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    preferences = store.load()
+
+    assert preferences.transcription_refinement_model == "google/gemini-3.5-flash"
+    assert preferences.translation_enabled is False
 
 
 def test_runtime_preferences_reject_invalid_refinement_model(tmp_path: object) -> None:
@@ -85,6 +110,31 @@ def test_runtime_preferences_reject_invalid_refinement_model(tmp_path: object) -
     )
 
     with pytest.raises(ConfigError, match="transcription refinement model"):
+        store.load()
+
+
+@pytest.mark.parametrize("translation_enabled", [None, 1, "true"])
+def test_runtime_preferences_reject_invalid_translation_enabled(
+    tmp_path: object,
+    translation_enabled: object,
+) -> None:
+    store = make_store(tmp_path)
+    store.path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "audio_tempo": 1,
+                "transcription_model": "gemini",
+                "transcription_refinement_model": "openai/gpt-5.5",
+                "translation_enabled": translation_enabled,
+                "translation_model": "openai/gpt-5.5",
+                "translation_prompt": "natural",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="translation enabled"):
         store.load()
 
 
