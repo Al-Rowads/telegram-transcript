@@ -473,6 +473,10 @@ def test_candidate_resolver_passes_openrouter_routing_in_extra_body() -> None:
         previous_text="قبل",
         following_text="بعد",
     ) == "صحيح"
+    assert completions.calls[0]["model"] == DEFAULT_REFINEMENT_MODEL
+    assert "temperature" not in completions.calls[0]
+    assert completions.calls[0]["response_format"]["type"] == "json_schema"
+    assert completions.calls[0]["response_format"]["json_schema"]["strict"] is True
     assert completions.calls[0]["extra_body"] == {
         "provider": {"require_parameters": True},
     }

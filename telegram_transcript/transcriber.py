@@ -617,7 +617,6 @@ class TranscriptCandidateResolver:
                     ),
                 },
             ],
-            temperature=0,
             response_format=CORRECTION_RESOLUTION_RESPONSE_FORMAT,
             extra_body=OPENROUTER_REQUIRE_PARAMETERS_BODY,
         )
