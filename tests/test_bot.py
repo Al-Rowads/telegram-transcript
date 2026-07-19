@@ -19,6 +19,7 @@ from telegram_transcript.bot import (
     get_video_attachment,
     help_command,
     handle_model_command,
+    handle_transcription_refinement_model_command,
     handle_translation_model_command,
     handle_translation_prompt_command,
     handle_non_video,
@@ -123,6 +124,7 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
         "whisper",
         "openai",
     )
+    assert transcriber.transcription_refinement_model == "openai/gpt-5.5"
 
 
 @pytest.mark.parametrize(
@@ -174,6 +176,223 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
     )
 
     assert transcriber.refinement_model == translation_model
+
+
+def test_create_transcriber_uses_dedicated_transcription_refinement_model() -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
+            openrouter_api_key="openrouter-key",
+            openrouter_transcription_refinement_model="custom-arabic-refinement-model",
+        )
+    )
+
+    assert transcriber.transcription_refinement_model == "custom-arabic-refinement-model"
+    assert transcriber.refinement_model is None
+
+
+def test_create_transcriber_uses_runtime_transcription_refinement_model() -> None:
+    transcriber = bot_module.create_transcriber(
+        Settings(
+            telegram_bot_token="token",
+            deepgram_api_key="deepgram-key",
+            openai_api_key="openai-key",
+            openrouter_api_key="openrouter-key",
+        ),
+        transcription_refinement_model="google/gemini-3.5-flash",
+        iraqi_training_context="SOURCE: IANLP\nهواية",
+    )
+
+    assert transcriber.transcription_refinement_model == "google/gemini-3.5-flash"
+
+
+def test_create_transcriber_attaches_training_context_only_to_gemini_refinement() -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
+        openrouter_api_key="openrouter-key",
+    )
+
+    gemini_transcriber = bot_module.create_transcriber(
+        settings,
+        transcription_refinement_model="google/gemini-3.5-flash",
+        iraqi_training_context="SOURCE: IANLP\nهواية",
+    )
+    gpt_transcriber = bot_module.create_transcriber(
+        settings,
+        transcription_refinement_model="openai/gpt-5.5",
+        iraqi_training_context="SOURCE: IANLP\nهواية",
+    )
+
+    assert gemini_transcriber.transcription_refiner.reference_context == "SOURCE: IANLP\nهواية"
+    assert gpt_transcriber.transcription_refiner.reference_context is None
+
+
+def test_create_transcriber_rejects_gemini_refinement_without_training_context() -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
+        openrouter_api_key="openrouter-key",
+    )
+
+    with pytest.raises(bot_module.ConfigError, match="training resources"):
+        bot_module.create_transcriber(
+            settings,
+            transcription_refinement_model="google/gemini-3.5-flash",
+        )
+
+
+@pytest.mark.asyncio
+async def test_initialize_application_loads_context_for_selected_gemini_refinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
+        openrouter_api_key="openrouter-key",
+    )
+
+    class ResourceManager:
+        async def ensure_available(self) -> str:
+            return "SOURCE: IANLP\nهواية"
+
+    class Downloader:
+        def __init__(self, settings_arg: Settings) -> None:
+            assert settings_arg is settings
+            self.started = False
+
+        async def start(self) -> None:
+            self.started = True
+
+    calls: list[tuple[str | None, str | None]] = []
+    replacement_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+        translation_prompt: str = "natural",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
+    ) -> object:
+        assert settings_arg is settings
+        calls.append((transcription_refinement_model, iraqi_training_context))
+        return replacement_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+    monkeypatch.setattr(bot_module, "TelegramMediaDownloader", Downloader)
+    application = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "transcription_model": "gemini",
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "translation_model": "openai/gpt-5.5",
+            "translation_prompt": "natural",
+            "iraqi_training_resource_manager": ResourceManager(),
+            "gemini_refinement_available": False,
+        }
+    )
+
+    await bot_module.initialize_application(application)
+
+    assert calls == [("google/gemini-3.5-flash", "SOURCE: IANLP\nهواية")]
+    assert application.bot_data["gemini_refinement_available"] is True
+    assert application.bot_data["effective_transcription_refinement_model"] == "google/gemini-3.5-flash"
+    assert application.bot_data["transcriber"] is replacement_transcriber
+    assert application.bot_data["media_downloader"].started is True
+
+
+@pytest.mark.asyncio
+async def test_initialize_application_temporarily_falls_back_to_gpt_when_resources_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
+        openrouter_api_key="openrouter-key",
+        openrouter_transcription_refinement_model="google/gemini-3.5-flash",
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    store = bot_module.create_runtime_preferences_store(settings)
+
+    class ResourceManager:
+        async def ensure_available(self) -> str:
+            raise bot_module.TrainingResourceError("dataset host unavailable")
+
+    class Downloader:
+        def __init__(self, settings_arg: Settings) -> None:
+            pass
+
+        async def start(self) -> None:
+            pass
+
+    calls: list[tuple[str | None, str | None]] = []
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+        translation_prompt: str = "natural",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
+    ) -> object:
+        calls.append((transcription_refinement_model, iraqi_training_context))
+        return SimpleNamespace(provider_name="gemini", model="gemini")
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+    monkeypatch.setattr(bot_module, "TelegramMediaDownloader", Downloader)
+    application = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "transcription_model": "gemini",
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "translation_model": "openai/gpt-5.5",
+            "translation_prompt": "natural",
+            "runtime_preferences_store": store,
+            "iraqi_training_resource_manager": ResourceManager(),
+            "gemini_refinement_available": False,
+        }
+    )
+
+    await bot_module.initialize_application(application)
+
+    assert calls == [("openai/gpt-5.5", None)]
+    assert application.bot_data["transcription_refinement_model"] == "google/gemini-3.5-flash"
+    assert application.bot_data["effective_transcription_refinement_model"] == "openai/gpt-5.5"
+    assert application.bot_data["gemini_refinement_available"] is False
+    assert store.load().transcription_refinement_model == "google/gemini-3.5-flash"
+
+
+def test_unrelated_runtime_save_preserves_selected_gemini_during_temporary_fallback(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        telegram_bot_token="token",
+        openrouter_api_key="key",
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    context = SimpleNamespace(
+        bot_data={
+            "settings": settings,
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "effective_transcription_refinement_model": "openai/gpt-5.5",
+            "gemini_refinement_available": False,
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
+        }
+    )
+
+    bot_module.persist_runtime_preferences(context, audio_tempo=1.2)
+
+    persisted = context.bot_data["runtime_preferences_store"].load()
+    assert persisted.audio_tempo == 1.2
+    assert persisted.transcription_refinement_model == "google/gemini-3.5-flash"
 
 
 def test_is_authorized_allows_everyone_without_allowlist() -> None:
@@ -271,6 +490,7 @@ async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: p
     assert "/help - Show this help message" in reply
     assert "/tempo <0.5-2.0>" in reply
     assert "/model [gemini|deepgram|whisper|openai]" in reply
+    assert "/refiner [gpt|gemini]" in reply
     assert "/tmodel [gemini|gpt|claude]" in reply
     assert "/translation [natural|literal]" in reply
     assert message.text_reply_kwargs == [
@@ -527,6 +747,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
     settings = Settings(
         telegram_bot_token="token",
         deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
         openrouter_api_key="openrouter-key",
         runtime_state_path=tmp_path / "runtime.json",
     )
@@ -534,27 +755,41 @@ async def test_handle_model_command_switches_runtime_transcriber(
         args=["Whisper"],
         bot_data={
             "settings": settings,
+            "transcription_refinement_model": "google/gemini-3.5-flash",
             "translation_model": "anthropic/claude-sonnet-4.6",
+            "gemini_refinement_available": True,
+            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
     fake_transcriber = SimpleNamespace(provider_name="whisper", model="openai/whisper-large-v3")
-    calls: list[tuple[Settings, str, str | None]] = []
+    calls: list[tuple[Settings, str, str | None, str | None]] = []
 
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
     ) -> object:
-        calls.append((settings_arg, model_key, translation_model))
+        calls.append(
+            (settings_arg, model_key, translation_model, transcription_refinement_model)
+        )
         return fake_transcriber
 
     monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
 
     await handle_model_command(update, context)
 
-    assert calls == [(settings, "whisper", "anthropic/claude-sonnet-4.6")]
+    assert calls == [
+        (
+            settings,
+            "whisper",
+            "anthropic/claude-sonnet-4.6",
+            "google/gemini-3.5-flash",
+        )
+    ]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["transcription_model"] == "whisper"
     assert context.bot_data["runtime_preferences_store"].load().transcription_model == "whisper"
@@ -605,6 +840,221 @@ async def test_handle_model_command_rejects_unknown_model() -> None:
     assert message.text_replies == [
         "Unknown transcription model. Available models: gemini, deepgram, whisper, openai."
     ]
+
+
+@pytest.mark.asyncio
+async def test_handle_transcription_refinement_model_command_lists_current_model() -> None:
+    message = FakeMessage(message_id=123, message_thread_id=8)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openrouter_api_key="openrouter-key",
+            ),
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "gemini_refinement_available": True,
+            "iraqi_training_context": "SOURCE: IANLP\nهواية",
+        },
+    )
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    reply = message.text_replies[0]
+    assert "Current transcription refinement model: OpenRouter Gemini 3.5 Flash" in reply
+    assert "gpt: OpenRouter GPT-5.5" in reply
+    assert "gemini: OpenRouter Gemini 3.5 Flash" in reply
+    assert "Use /refiner gpt or /refiner gemini." in reply
+
+
+@pytest.mark.asyncio
+async def test_refiner_command_reports_temporary_fallback_and_rejects_unavailable_gemini() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=[],
+        bot_data={
+            "settings": Settings(telegram_bot_token="token", openrouter_api_key="key"),
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "effective_transcription_refinement_model": "openai/gpt-5.5",
+            "gemini_refinement_available": False,
+            "gemini_refinement_unavailable_reason": "dataset host unavailable",
+        },
+    )
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    reply = message.text_replies[-1]
+    assert "Effective model for this process: OpenRouter GPT-5.5 (temporary fallback)" in reply
+    assert "gemini: OpenRouter Gemini 3.5 Flash (unavailable" in reply
+
+    context.args = ["gemini"]
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert "dataset host unavailable" in message.text_replies[-1]
+    assert context.bot_data["transcription_refinement_model"] == "google/gemini-3.5-flash"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("argument", "expected_model", "expected_label"),
+    [
+        ("gpt", "openai/gpt-5.5", "OpenRouter GPT-5.5"),
+        ("google/gemini-3.5-flash", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
+    ],
+)
+async def test_handle_transcription_refinement_model_command_switches_and_persists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argument: str,
+    expected_model: str,
+    expected_label: str,
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openrouter_api_key="openrouter-key",
+        refine=True,
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    context = SimpleNamespace(
+        args=[argument],
+        bot_data={
+            "settings": settings,
+            "transcription_model": "deepgram",
+            "translation_model": "anthropic/claude-sonnet-4.6",
+            "translation_prompt": "literal",
+            "gemini_refinement_available": True,
+            "iraqi_training_context": "SOURCE: IANLP\nهواية",
+            "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
+        },
+    )
+    replacement_transcriber = SimpleNamespace(provider_name="deepgram", model="nova-3")
+    calls: list[tuple[str, str | None, str, str | None]] = []
+
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        translation_model: str | None = None,
+        translation_prompt: str = "normal",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
+    ) -> object:
+        assert settings_arg is settings
+        calls.append(
+            (
+                model_key,
+                translation_model,
+                translation_prompt,
+                transcription_refinement_model,
+            )
+        )
+        return replacement_transcriber
+
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert calls == [
+        ("deepgram", "anthropic/claude-sonnet-4.6", "literal", expected_model)
+    ]
+    assert context.bot_data["transcriber"] is replacement_transcriber
+    assert context.bot_data["transcription_refinement_model"] == expected_model
+    persisted = context.bot_data["runtime_preferences_store"].load()
+    assert persisted.transcription_refinement_model == expected_model
+    assert persisted.transcription_model == "deepgram"
+    assert persisted.translation_model == "anthropic/claude-sonnet-4.6"
+    assert persisted.translation_prompt == "literal"
+    assert message.text_replies == [
+        f"Transcription refinement model set to {expected_label}."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_handle_transcription_refinement_model_command_rejects_invalid_and_unauthorized() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(
+        args=["unknown"],
+        bot_data={
+            "settings": Settings(
+                telegram_bot_token="token",
+                openrouter_api_key="key",
+            )
+        },
+    )
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert message.text_replies == [
+        "Unknown transcription refinement model. Available models: gpt, gemini."
+    ]
+
+    message.text_replies.clear()
+    context.bot_data["settings"] = Settings(
+        telegram_bot_token="token",
+        openrouter_api_key="key",
+        allowed_telegram_user_ids=frozenset({999}),
+    )
+    context.args = ["gemini"]
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert message.text_replies == ["Sorry, this bot is not enabled for your Telegram account."]
+
+
+@pytest.mark.asyncio
+async def test_handle_transcription_refinement_model_command_ignores_channels() -> None:
+    message = FakeMessage(chat_type=ChatType.CHANNEL)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(args=["gemini"], bot_data={})
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_handle_transcription_refinement_model_command_keeps_active_model_when_save_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    settings = Settings(
+        telegram_bot_token="token",
+        deepgram_api_key="deepgram-key",
+        openai_api_key="openai-key",
+        openrouter_api_key="openrouter-key",
+        runtime_state_path=tmp_path / "runtime.json",
+    )
+    store = bot_module.create_runtime_preferences_store(settings)
+    active_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
+    context = SimpleNamespace(
+        args=["gemini"],
+        bot_data={
+            "settings": settings,
+            "transcriber": active_transcriber,
+            "transcription_refinement_model": "openai/gpt-5.5",
+            "gemini_refinement_available": True,
+            "iraqi_training_context": "SOURCE: IANLP\nهواية",
+            "runtime_preferences_store": store,
+        },
+    )
+
+    def fail_save(preferences: object) -> None:
+        raise bot_module.RuntimeStateError("Unable to save runtime settings.")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    await handle_transcription_refinement_model_command(update, context)
+
+    assert context.bot_data["transcriber"] is active_transcriber
+    assert context.bot_data["transcription_refinement_model"] == "openai/gpt-5.5"
+    assert message.text_replies == ["Unable to save runtime settings."]
 
 
 @pytest.mark.asyncio
@@ -685,26 +1135,35 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
         bot_data={
             "settings": settings,
             "transcription_model": "deepgram",
+            "transcription_refinement_model": "google/gemini-3.5-flash",
+            "gemini_refinement_available": True,
+            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
     fake_transcriber = SimpleNamespace(provider_name="deepgram", model="nova-3")
-    calls: list[tuple[Settings, str, str | None]] = []
+    calls: list[tuple[Settings, str, str | None, str | None]] = []
 
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
     ) -> object:
-        calls.append((settings_arg, model_key, translation_model))
+        calls.append(
+            (settings_arg, model_key, translation_model, transcription_refinement_model)
+        )
         return fake_transcriber
 
     monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
 
     await handle_translation_model_command(update, context)
 
-    assert calls == [(settings, "deepgram", expected_model)]
+    assert calls == [
+        (settings, "deepgram", expected_model, "google/gemini-3.5-flash")
+    ]
     assert context.bot_data["transcriber"] is fake_transcriber
     assert context.bot_data["translation_model"] == expected_model
     assert context.bot_data["runtime_preferences_store"].load().translation_model == expected_model
@@ -784,22 +1243,33 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     assert "Current translation prompt: literal" in message.text_replies[-1]
 
     fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
-    calls: list[tuple[str, str, str]] = []
+    calls: list[tuple[str, str, str, str | None]] = []
 
     def fake_create_transcriber(
         settings_arg: Settings,
         model_key: str,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
+        transcription_refinement_model: str | None = None,
+        iraqi_training_context: str | None = None,
     ) -> object:
-        calls.append((model_key, translation_model or "", translation_prompt))
+        calls.append(
+            (
+                model_key,
+                translation_model or "",
+                translation_prompt,
+                transcription_refinement_model,
+            )
+        )
         return fake_transcriber
 
     monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
     context.args = ["v2"]
     await handle_translation_prompt_command(update, context)
 
-    assert calls == [("gemini", "openai/gpt-5.5", "natural")]
+    assert calls == [
+        ("gemini", "openai/gpt-5.5", "natural", "openai/gpt-5.5")
+    ]
     assert context.bot_data["translation_prompt"] == "natural"
     assert context.bot_data["transcriber"] is fake_transcriber
     assert store.load().translation_prompt == "natural"
@@ -974,14 +1444,33 @@ async def test_process_video_message_reports_step_by_step_flow(
             )
             await progress_callback("chunk_transcribed", {"index": 1, "total": 1, "raw_chars": 12})
             await progress_callback(
-                "refining_transcript",
+                "refining_transcription",
                 {
                     "raw_chars": 12,
+                    "raw_bytes": 24,
+                    "model": "arabic-model",
+                },
+            )
+            await progress_callback(
+                "transcription_refinement_complete",
+                {
+                    "refined_srt_chars": 53,
+                    "refined_transcript_chars": 10,
+                    "model": "arabic-model",
+                },
+            )
+            await progress_callback(
+                "translating_subtitles",
+                {
+                    "index": 1,
+                    "total": 1,
+                    "raw_chars": 12,
+                    "raw_bytes": 24,
                     "model": "gpt-5.4",
                 },
             )
             await progress_callback(
-                "refinement_complete",
+                "translation_complete",
                 {
                     "translated_srt_chars": 95,
                     "line_translated_transcript_chars": 17,
@@ -989,14 +1478,15 @@ async def test_process_video_message_reports_step_by_step_flow(
             )
             return TranscriptionResult(
                 raw_transcript="هاي خام",
-                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي خام"),),
+                refined_transcript="هاي منقحة",
+                subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي منقحة"),),
                 translated_srt=(
                     "1\n"
                     "00:00:00,000 --> 00:00:01,250\n"
-                    "هاي خام\n"
+                    "هاي منقحة\n"
                     '<font color="green">این خام است</font>\n'
                 ),
-                line_translated_transcript="هاي خام\nاین خام است\n",
+                line_translated_transcript="هاي منقحة\nاین خام است\n",
             )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
@@ -1015,7 +1505,7 @@ async def test_process_video_message_reports_step_by_step_flow(
     caplog.set_level("INFO", logger="telegram_transcript.bot")
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     downloader = FakeMediaDownloader()
     context = SimpleNamespace(bot_data={"transcriber": FakeTranscriber(), "media_downloader": downloader})
 
@@ -1024,24 +1514,25 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
     assert message.text_replies == [
         "Video received. Starting transcription...",
-        "هاي خام",
-        "هاي خام\nاین خام است",
+        "هاي منقحة",
+        "هاي منقحة\nاین خام است",
     ]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     assert [document.filename for document, _ in message.document_replies] == ["clip.srt"]
     status = message.status_replies[0]
     assert status.edits == [
-        "Step 1/6: downloading media...",
-        "Step 2/6: extracting lossless FLAC audio at 1.4x...",
-        "Step 3/6: preparing audio chunks...",
-        "Step 4/6: transcribing chunk 1/1...",
+        "Step 1/7: downloading media...",
+        "Step 2/7: extracting lossless FLAC audio at 1.4x...",
+        "Step 3/7: preparing audio chunks...",
+        "Step 4/7: transcribing chunk 1/1...",
         "Gemini could not produce valid SRT; retrying chunk 1/1 with Deepgram...",
-        "Step 5/6: translating subtitles...",
-        "Step 6/6: sending transcript...",
+        "Step 5/7: refining Iraqi Arabic transcription...",
+        "Step 6/7: translating subtitles...",
+        "Step 7/7: sending transcript...",
         "Transcript ready.",
     ]
-    assert "job1234 step 1/6" in caplog.text
-    assert "job1234 step 6/6" in caplog.text
+    assert "job1234 step 1/7" in caplog.text
+    assert "job1234 step 7/7" in caplog.text
     assert "این خام است" not in caplog.text
 
 
@@ -1062,15 +1553,15 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
             assert progress_callback is not None
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 1, "total": 2, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
             )
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 2, "total": 2, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
             )
             await progress_callback(
-                "refinement_complete",
+                "translation_complete",
                 {"translated_srt_chars": 95, "line_translated_transcript_chars": 17},
             )
             return TranscriptionResult(
@@ -1096,15 +1587,15 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
-    assert "Step 5/6: translating subtitle cue 1/2..." in message.status_replies[0].edits
-    assert "Step 5/6: translating subtitle cue 2/2..." not in message.status_replies[0].edits
+    assert "Step 6/7: translating subtitle cue 1/2..." in message.status_replies[0].edits
+    assert "Step 6/7: translating subtitle cue 2/2..." not in message.status_replies[0].edits
 
 
 @pytest.mark.asyncio
@@ -1127,17 +1618,17 @@ async def test_process_video_message_reports_translation_progress_after_throttle
             assert progress_callback is not None
             current_time[0] = 0.0
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 1, "total": 3, "raw_chars": 60, "raw_bytes": 60, "model": "gpt-5.4"},
             )
             current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS - 1
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 2, "total": 3, "raw_chars": 61, "raw_bytes": 61, "model": "gpt-5.4"},
             )
             current_time[0] = bot_module.STATUS_PROGRESS_EDIT_INTERVAL_SECONDS
             await progress_callback(
-                "refining_transcript",
+                "translating_subtitles",
                 {"index": 3, "total": 3, "raw_chars": 62, "raw_bytes": 62, "model": "gpt-5.4"},
             )
             return TranscriptionResult(raw_transcript="raw only")
@@ -1153,7 +1644,7 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
     message = FakeMessage()
     status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key", refine=True)
     context = SimpleNamespace(
         bot_data={"transcriber": FakeTranscriber(), "media_downloader": FakeMediaDownloader()}
     )
@@ -1161,9 +1652,9 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     edits = message.status_replies[0].edits
-    assert "Step 5/6: translating subtitle cue 1/3..." in edits
-    assert "Step 5/6: translating subtitle cue 2/3..." not in edits
-    assert "Step 5/6: translating subtitle cue 3/3..." in edits
+    assert "Step 6/7: translating subtitle cue 1/3..." in edits
+    assert "Step 6/7: translating subtitle cue 2/3..." not in edits
+    assert "Step 6/7: translating subtitle cue 3/3..." in edits
 
 
 @pytest.mark.asyncio

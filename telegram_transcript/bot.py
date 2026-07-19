@@ -19,6 +19,10 @@ from telegram_transcript.config import ConfigError, Settings, load_settings, par
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
 from telegram_transcript.runtime_state import RuntimePreferences, RuntimePreferencesStore, RuntimeStateError
+from telegram_transcript.training_resources import (
+    IraqiArabicTrainingResourceManager,
+    TrainingResourceError,
+)
 from telegram_transcript.telegram_utils import (
     format_transcript_for_delivery,
     should_send_as_text,
@@ -32,6 +36,7 @@ from telegram_transcript.transcriber import (
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
+    DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
     DEFAULT_TRANSLATION_PROMPT_KEY,
     DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
     TRANSLATION_PROMPT_ALIASES,
@@ -39,6 +44,7 @@ from telegram_transcript.transcriber import (
     DeepgramSpeechToTextProvider,
     GeminiAudioCorrectionProvider,
     GeminiSpeechToTextProvider,
+    IraqiArabicTranscriptRefiner,
     LowConfidenceTranscriptCorrector,
     OpenAISpeechToTextProvider,
     OpenRouterWhisperSpeechToTextProvider,
@@ -75,6 +81,7 @@ HELP_MESSAGE = """Available commands:
 /start - Start the bot (currently no additional setup is required).
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
 /model [gemini|deepgram|whisper|openai] - Show or select the primary transcription model.
+/refiner [gpt|gemini] - Show or select the Iraqi transcription refinement model.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 
@@ -91,6 +98,13 @@ class TranscriptionModelOption:
 
 @dataclass(frozen=True)
 class TranslationModelOption:
+    key: str
+    model: str
+    label: str
+
+
+@dataclass(frozen=True)
+class TranscriptionRefinementModelOption:
     key: str
     model: str
     label: str
@@ -156,11 +170,32 @@ TRANSLATION_MODEL_ALIASES = {
     for option in TRANSLATION_MODEL_OPTIONS.values()
 }
 
+TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS: dict[str, TranscriptionRefinementModelOption] = {
+    "gpt": TranscriptionRefinementModelOption(
+        key="gpt",
+        model=DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
+        label="OpenRouter GPT-5.5",
+    ),
+    "gemini": TranscriptionRefinementModelOption(
+        key="gemini",
+        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
+        label="OpenRouter Gemini 3.5 Flash",
+    ),
+}
+TRANSCRIPTION_REFINEMENT_MODEL_ALIASES = {
+    option.key: option.model
+    for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+} | {
+    option.model: option.model
+    for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+}
+
 
 def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesStore:
     defaults = RuntimePreferences(
         audio_tempo=settings.audio_tempo,
         transcription_model=DEFAULT_TRANSCRIPTION_MODEL_KEY,
+        transcription_refinement_model=settings.openrouter_transcription_refinement_model,
         translation_model=settings.openrouter_refine_model,
         translation_prompt=DEFAULT_TRANSLATION_PROMPT_KEY,
     )
@@ -168,6 +203,12 @@ def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesSt
         settings.runtime_state_path,
         defaults=defaults,
         transcription_models=frozenset(TRANSCRIPTION_MODEL_OPTIONS),
+        transcription_refinement_models=frozenset(
+            {
+                settings.openrouter_transcription_refinement_model,
+                *(option.model for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()),
+            }
+        ),
         translation_models=frozenset(
             {settings.openrouter_refine_model, *(option.model for option in TRANSLATION_MODEL_OPTIONS.values())}
         ),
@@ -180,9 +221,16 @@ def create_application(settings: Settings | None = None) -> Application:
     runtime_store = create_runtime_preferences_store(settings)
     runtime_preferences = runtime_store.load()
     translation_prompt = canonicalize_translation_prompt_key(runtime_preferences.translation_prompt)
+    selected_refinement_model = runtime_preferences.transcription_refinement_model
+    initial_effective_refinement_model = (
+        DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL
+        if selected_refinement_model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+        else selected_refinement_model
+    )
     transcriber = create_transcriber(
         settings,
         runtime_preferences.transcription_model,
+        transcription_refinement_model=initial_effective_refinement_model,
         translation_model=runtime_preferences.translation_model,
         translation_prompt=translation_prompt,
     )
@@ -190,24 +238,33 @@ def create_application(settings: Settings | None = None) -> Application:
     app = (
         Application.builder()
         .token(settings.telegram_bot_token)
-        .post_init(start_media_downloader)
+        .post_init(initialize_application)
         .post_shutdown(stop_media_downloader)
         .build()
     )
     app.bot_data["settings"] = settings
     app.bot_data["transcriber"] = transcriber
     app.bot_data["transcription_model"] = runtime_preferences.transcription_model
+    app.bot_data["transcription_refinement_model"] = selected_refinement_model
+    app.bot_data["effective_transcription_refinement_model"] = initial_effective_refinement_model
     app.bot_data["translation_model"] = runtime_preferences.translation_model
     app.bot_data["translation_prompt"] = translation_prompt
     app.bot_data["runtime_preferences_store"] = runtime_store
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
     app.bot_data["audio_tempo"] = runtime_preferences.audio_tempo
     app.bot_data["video_registry"] = VideoRegistry(settings.video_registry_path)
+    app.bot_data["gemini_refinement_available"] = False
+    app.bot_data["gemini_refinement_unavailable_reason"] = "Training resources have not been prepared yet."
+    app.bot_data["iraqi_training_context"] = None
+    app.bot_data["iraqi_training_resource_manager"] = IraqiArabicTrainingResourceManager(
+        settings.iraqi_training_resources_path
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(CommandHandler("model", handle_model_command))
+    app.add_handler(CommandHandler("refiner", handle_transcription_refinement_model_command))
     app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
     app.add_handler(CommandHandler("translation", handle_translation_prompt_command))
     app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
@@ -220,6 +277,8 @@ def create_transcriber(
     model_key: str = DEFAULT_TRANSCRIPTION_MODEL_KEY,
     translation_model: str | None = None,
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
+    transcription_refinement_model: str | None = None,
+    iraqi_training_context: str | None = None,
 ) -> SpeechTranscriber:
     model_order = get_transcription_model_order(model_key)
     speech_to_text_providers = [
@@ -247,11 +306,73 @@ def create_transcriber(
             ),
         )
     }
+    selected_refinement_model = (
+        transcription_refinement_model or settings.openrouter_transcription_refinement_model
+    )
+    normalized_training_context = (
+        iraqi_training_context.strip()
+        if isinstance(iraqi_training_context, str) and iraqi_training_context.strip()
+        else None
+    )
+    if (
+        selected_refinement_model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+        and normalized_training_context is None
+    ):
+        raise ConfigError(
+            "Gemini transcription refinement requires prepared Iraqi Arabic training resources."
+        )
     return SpeechTranscriber(
         speech_to_text_provider=speech_to_text_providers[0],
         fallback_speech_to_text_providers=speech_to_text_providers[1:],
+        transcription_refiner=IraqiArabicTranscriptRefiner(
+            api_key=settings.openrouter_api_key,
+            model=selected_refinement_model,
+            reference_context=(
+                normalized_training_context
+                if selected_refinement_model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+                else None
+            ),
+        ),
         refiner=refiner,
         correctors_by_provider=correctors_by_provider,
+    )
+
+
+def create_effective_transcriber(
+    context: ContextTypes.DEFAULT_TYPE | Application,
+    settings: Settings,
+    *,
+    model_key: str | None = None,
+    translation_model: str | None = None,
+    translation_prompt: str | None = None,
+    transcription_refinement_model: str | None = None,
+) -> tuple[SpeechTranscriber, str]:
+    selected_refinement_model = (
+        transcription_refinement_model
+        or get_runtime_transcription_refinement_model(context, settings)
+    )
+    effective_refinement_model = get_effective_transcription_refinement_model(
+        context,
+        settings,
+        selected_model=selected_refinement_model,
+    )
+    training_context = context.bot_data.get("iraqi_training_context")
+    return (
+        create_transcriber(
+            settings,
+            model_key or get_runtime_model_key(context),
+            translation_model=translation_model or get_runtime_translation_model(context, settings),
+            translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
+            transcription_refinement_model=effective_refinement_model,
+            iraqi_training_context=(
+                training_context
+                if effective_refinement_model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+                and isinstance(training_context, str)
+                and training_context.strip()
+                else None
+            ),
+        ),
+        effective_refinement_model,
     )
 
 
@@ -292,6 +413,37 @@ def create_speech_to_text_provider(settings: Settings, model_key: str) -> object
         return GeminiSpeechToTextProvider(api_key=settings.openrouter_api_key, model=option.model)
 
     raise ConfigError(f"Unsupported transcription provider: {option.provider}")
+
+
+async def initialize_application(application: Application) -> None:
+    manager = application.bot_data.get("iraqi_training_resource_manager")
+    ensure_available = getattr(manager, "ensure_available", None)
+    try:
+        if not callable(ensure_available):
+            raise TrainingResourceError("Iraqi Arabic training resource manager is unavailable.")
+        training_context = await ensure_available()
+    except TrainingResourceError as exc:
+        application.bot_data["gemini_refinement_available"] = False
+        application.bot_data["gemini_refinement_unavailable_reason"] = str(exc)
+        application.bot_data["iraqi_training_context"] = None
+        logger.error(
+            "Gemini transcription refinement is unavailable; GPT-5.5 will be used temporarily: %s",
+            exc,
+        )
+    else:
+        application.bot_data["gemini_refinement_available"] = True
+        application.bot_data["gemini_refinement_unavailable_reason"] = None
+        application.bot_data["iraqi_training_context"] = training_context
+        logger.info(
+            "Iraqi Arabic training resources are ready: context_bytes=%d",
+            len(training_context.encode("utf-8")),
+        )
+
+    settings: Settings = application.bot_data["settings"]
+    transcriber, effective_refinement_model = create_effective_transcriber(application, settings)
+    application.bot_data["transcriber"] = transcriber
+    application.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
+    await start_media_downloader(application)
 
 
 async def start_media_downloader(application: Application) -> None:
@@ -394,11 +546,10 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     try:
-        transcriber = create_transcriber(
+        transcriber, effective_refinement_model = create_effective_transcriber(
+            context,
             settings,
-            model_key,
-            translation_model=get_runtime_translation_model(context, settings),
-            translation_prompt=get_runtime_translation_prompt(context),
+            model_key=model_key,
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
@@ -411,7 +562,72 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     context.bot_data["transcriber"] = transcriber
     context.bot_data["transcription_model"] = model_key
+    context.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
     await reply_to_source(message, f"Primary transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
+
+
+async def handle_transcription_refinement_model_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+
+    settings: Settings = context.bot_data["settings"]
+    user_id = update.effective_user.id if update.effective_user else None
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+
+    args = getattr(context, "args", None)
+    if not isinstance(args, list) or not args:
+        await reply_to_source(message, format_transcription_refinement_model_settings_message(context, settings))
+        return
+    if len(args) != 1:
+        await reply_to_source(message, format_unknown_transcription_refinement_model_message())
+        return
+
+    refinement_model = parse_transcription_refinement_model_command_arg(args[0])
+    if refinement_model is None:
+        await reply_to_source(message, format_unknown_transcription_refinement_model_message())
+        return
+    if (
+        refinement_model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL
+        and not gemini_refinement_is_available(context)
+    ):
+        reason = context.bot_data.get("gemini_refinement_unavailable_reason")
+        detail = f" ({reason})" if isinstance(reason, str) and reason.strip() else ""
+        await reply_to_source(
+            message,
+            "Gemini transcription refinement is unavailable because the Iraqi Arabic "
+            f"training resources could not be prepared at startup{detail}. GPT-5.5 remains active.",
+        )
+        return
+
+    try:
+        transcriber, effective_refinement_model = create_effective_transcriber(
+            context,
+            settings,
+            transcription_refinement_model=refinement_model,
+        )
+        persist_runtime_preferences(
+            context,
+            transcription_refinement_model=refinement_model,
+        )
+    except (ConfigError, RuntimeStateError) as exc:
+        await reply_to_source(message, str(exc))
+        return
+
+    context.bot_data["transcriber"] = transcriber
+    context.bot_data["transcription_refinement_model"] = refinement_model
+    context.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
+    option = next(
+        option
+        for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+        if option.model == refinement_model
+    )
+    await reply_to_source(message, f"Transcription refinement model set to {option.label}.")
 
 
 async def handle_translation_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -440,11 +656,10 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
 
     option = TRANSLATION_MODEL_OPTIONS[model_key]
     try:
-        transcriber = create_transcriber(
+        transcriber, effective_refinement_model = create_effective_transcriber(
+            context,
             settings,
-            get_runtime_model_key(context),
             translation_model=option.model,
-            translation_prompt=get_runtime_translation_prompt(context),
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
@@ -457,6 +672,7 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
         return
     context.bot_data["transcriber"] = transcriber
     context.bot_data["translation_model"] = option.model
+    context.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
     await reply_to_source(message, f"Translation model set to {option.label}.")
 
 
@@ -484,10 +700,9 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
         await reply_to_source(message, format_unknown_translation_prompt_message())
         return
     try:
-        transcriber = create_transcriber(
+        transcriber, effective_refinement_model = create_effective_transcriber(
+            context,
             settings,
-            get_runtime_model_key(context),
-            translation_model=get_runtime_translation_model(context, settings),
             translation_prompt=prompt_key,
         )
         persist_runtime_preferences(context, translation_prompt=prompt_key)
@@ -497,6 +712,7 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
 
     context.bot_data["transcriber"] = transcriber
     context.bot_data["translation_prompt"] = prompt_key
+    context.bot_data["effective_transcription_refinement_model"] = effective_refinement_model
     await reply_to_source(message, f"Translation prompt set to {prompt_key}.")
 
 
@@ -523,16 +739,18 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     audio_tempo = get_runtime_audio_tempo(context, settings)
     provider_name, model_name = get_runtime_transcriber_info(context, settings)
+    transcription_refinement_model = get_effective_transcription_refinement_model(context, settings)
     translation_model = get_runtime_translation_model(context, settings)
     job_id = uuid.uuid4().hex[:8]
     logger.info(
-        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s refine=%s refine_model=%s",
+        "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s transcription_refinement_model=%s translation_enabled=%s translation_model=%s",
         job_id,
         get_media_attachment_suffix(attachment),
         file_size,
         audio_tempo,
         provider_name,
         model_name,
+        transcription_refinement_model,
         settings.refine,
         translation_model,
     )
@@ -573,6 +791,8 @@ async def process_media_message(
     video_registry = context.bot_data.get("video_registry")
     incoming_file_name = getattr(attachment, "file_name", None)
     job_started = time.monotonic()
+    total_steps = 7 if settings.refine else 6
+    sending_step = 7 if settings.refine else 6
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -586,18 +806,20 @@ async def process_media_message(
         status_ref["message"] = status
 
         step_started = time.monotonic()
-        await edit_status_message(status, "Step 1/6: downloading media...", job_id=job_id)
+        await edit_status_message(status, f"Step 1/{total_steps}: downloading media...", job_id=job_id)
         logger.info(
-            "job %s step 1/6 downloading media: suffix=%s telegram_file_size=%s",
+            "job %s step 1/%d downloading media: suffix=%s telegram_file_size=%s",
             job_id,
+            total_steps,
             get_media_attachment_suffix(attachment),
             get_attachment_file_size(attachment),
         )
         await download_message_media(context, message, source_path)
         source_bytes = source_path.stat().st_size
         logger.info(
-            "job %s step 1/6 downloaded media: source_bytes=%d duration_ms=%d",
+            "job %s step 1/%d downloaded media: source_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             source_bytes,
             elapsed_ms(step_started),
         )
@@ -622,11 +844,16 @@ async def process_media_message(
             duplicate.first_sender if duplicate else None,
         )
 
-        await edit_status_message(status, f"Step 2/6: extracting lossless FLAC audio at {audio_tempo:g}x...", job_id=job_id)
+        await edit_status_message(
+            status,
+            f"Step 2/{total_steps}: extracting lossless FLAC audio at {audio_tempo:g}x...",
+            job_id=job_id,
+        )
         step_started = time.monotonic()
         logger.info(
-            "job %s step 2/6 extracting FLAC audio: source_bytes=%d audio_tempo=%g",
+            "job %s step 2/%d extracting FLAC audio: source_bytes=%d audio_tempo=%g",
             job_id,
+            total_steps,
             source_bytes,
             audio_tempo,
         )
@@ -638,17 +865,19 @@ async def process_media_message(
         )
         audio_bytes = audio_path.stat().st_size
         logger.info(
-            "job %s step 2/6 extracted FLAC audio: audio_bytes=%d duration_ms=%d",
+            "job %s step 2/%d extracted FLAC audio: audio_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             audio_bytes,
             elapsed_ms(step_started),
         )
 
-        await edit_status_message(status, "Step 3/6: preparing audio chunks...", job_id=job_id)
+        await edit_status_message(status, f"Step 3/{total_steps}: preparing audio chunks...", job_id=job_id)
         step_started = time.monotonic()
         logger.info(
-            "job %s step 3/6 preparing bounded transcription chunks: audio_bytes=%d",
+            "job %s step 3/%d preparing bounded transcription chunks: audio_bytes=%d",
             job_id,
+            total_steps,
             audio_bytes,
         )
         chunks = await asyncio.to_thread(
@@ -658,8 +887,9 @@ async def process_media_message(
         )
         chunk_sizes = [chunk.path.stat().st_size for chunk in chunks]
         logger.info(
-            "job %s step 3/6 prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
+            "job %s step 3/%d prepared chunks: chunk_count=%d total_chunk_bytes=%d min_chunk_bytes=%d max_chunk_bytes=%d duration_ms=%d",
             job_id,
+            total_steps,
             len(chunks),
             sum(chunk_sizes),
             min(chunk_sizes),
@@ -674,10 +904,15 @@ async def process_media_message(
             if event == "transcribing_chunk":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
-                await edit_status_message(status, f"Step 4/6: transcribing chunk {index}/{total}...", job_id=job_id)
+                await edit_status_message(
+                    status,
+                    f"Step 4/{total_steps}: transcribing chunk {index}/{total}...",
+                    job_id=job_id,
+                )
                 logger.info(
-                    "job %s step 4/6 transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
+                    "job %s step 4/%d transcribing chunk %s/%s: chunk_bytes=%s provider=%s model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("chunk_bytes"),
@@ -686,8 +921,9 @@ async def process_media_message(
                 )
             elif event == "chunk_transcribed":
                 logger.info(
-                    "job %s step 4/6 transcribed chunk %s/%s: raw_chars=%s",
+                    "job %s step 4/%d transcribed chunk %s/%s: raw_chars=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("index"),
                     progress_data.get("total"),
                     progress_data.get("raw_chars"),
@@ -704,8 +940,9 @@ async def process_media_message(
                     job_id=job_id,
                 )
                 logger.warning(
-                    "job %s step 4/6 provider fallback for chunk %s/%s: failed_provider=%s failed_model=%s next_provider=%s next_model=%s",
+                    "job %s step 4/%d provider fallback for chunk %s/%s: failed_provider=%s failed_model=%s next_provider=%s next_model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("failed_provider"),
@@ -713,13 +950,48 @@ async def process_media_message(
                     progress_data.get("next_provider"),
                     progress_data.get("next_model"),
                 )
-            elif event == "refining_transcript":
+            elif event == "refining_transcription":
+                await edit_status_message(
+                    status,
+                    f"Step 5/{total_steps}: refining Iraqi Arabic transcription...",
+                    job_id=job_id,
+                )
+                logger.info(
+                    "job %s step 5/%d refining Iraqi Arabic SRT: srt_chars=%s srt_bytes=%s model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("raw_chars"),
+                    progress_data.get("raw_bytes"),
+                    progress_data.get("model"),
+                )
+            elif event == "transcription_refinement_complete":
+                logger.info(
+                    "job %s step 5/%d refined Iraqi Arabic SRT: refined_srt_chars=%s refined_transcript_chars=%s model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("refined_srt_chars"),
+                    progress_data.get("refined_transcript_chars"),
+                    progress_data.get("model"),
+                )
+            elif event == "transcription_refinement_failed":
+                await edit_status_message(
+                    status,
+                    f"Step 5/{total_steps}: refinement failed; using original subtitles...",
+                    job_id=job_id,
+                )
+                logger.warning(
+                    "job %s step 5/%d Iraqi Arabic refinement failed; original subtitles will be used: model=%s",
+                    job_id,
+                    total_steps,
+                    progress_data.get("model"),
+                )
+            elif event == "translating_subtitles":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
                 if isinstance(total, int) and total > 1:
-                    status_text = f"Step 5/6: translating subtitle cue {index}/{total}..."
+                    status_text = f"Step 6/{total_steps}: translating subtitle cue {index}/{total}..."
                 else:
-                    status_text = "Step 5/6: translating subtitles..."
+                    status_text = f"Step 6/{total_steps}: translating subtitles..."
                 now = time.monotonic()
                 if (
                     last_translation_status_attempt_at is None
@@ -728,30 +1000,33 @@ async def process_media_message(
                     last_translation_status_attempt_at = now
                     await edit_status_message(status, status_text, job_id=job_id)
                 logger.info(
-                    "job %s step 5/6 translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
+                    "job %s step 6/%d translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
+                    total_steps,
                     index,
                     total,
                     progress_data.get("raw_chars"),
                     progress_data.get("raw_bytes"),
                     progress_data.get("model"),
                 )
-            elif event == "refinement_complete":
+            elif event == "translation_complete":
                 logger.info(
-                    "job %s step 5/6 translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
+                    "job %s step 6/%d translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("translated_srt_chars"),
                     progress_data.get("line_translated_transcript_chars"),
                 )
-            elif event == "refinement_failed":
+            elif event == "translation_failed":
                 await edit_status_message(
                     status,
-                    "Step 5/6: translation failed; preparing raw subtitles...",
+                    f"Step 6/{total_steps}: translation failed; preparing Arabic subtitles...",
                     job_id=job_id,
                 )
                 logger.warning(
-                    "job %s step 5/6 translation failed; raw subtitles will be delivered: model=%s",
+                    "job %s step 6/%d translation failed; Arabic subtitles will be delivered: model=%s",
                     job_id,
+                    total_steps,
                     progress_data.get("model"),
                 )
 
@@ -759,7 +1034,7 @@ async def process_media_message(
             await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
         )
 
-    raw_transcript = transcription_result.raw_transcript.strip() or "No speech was detected."
+    final_transcript = transcription_result.final_transcript.strip() or "No speech was detected."
     translated_srt = (
         transcription_result.translated_srt.strip() if transcription_result.translated_srt is not None else None
     )
@@ -769,19 +1044,25 @@ async def process_media_message(
         else None
     )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
-    await edit_status_message(status, "Step 6/6: sending transcript...", job_id=job_id)
+    await edit_status_message(
+        status,
+        f"Step {sending_step}/{total_steps}: sending transcript...",
+        job_id=job_id,
+    )
     logger.info(
-        "job %s step 6/6 sending transcript: raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d raw_delivery=%s",
+        "job %s step %d/%d sending transcript: final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d delivery=%s",
         job_id,
-        len(raw_transcript),
+        sending_step,
+        total_steps,
+        len(final_transcript),
         len(translated_srt) if translated_srt is not None else None,
         len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
-        "text" if should_send_as_text(raw_transcript) else "document",
+        "text" if should_send_as_text(final_transcript) else "document",
     )
     await send_transcript(
         message,
-        raw_transcript,
+        final_transcript,
         filename=f"{base_name}.transcription.txt",
         caption="Transcription",
     )
@@ -815,13 +1096,13 @@ async def process_media_message(
         file_name=incoming_file_name,
         sender_id=getattr(getattr(message, "from_user", None), "id", None),
         sender_username=get_sender_display_name(message),
-        transcript=raw_transcript,
+        transcript=final_transcript,
     )
     logger.info(
-        "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
+        "job %s completed: duration_ms=%d final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
         elapsed_ms(job_started),
-        len(raw_transcript),
+        len(final_transcript),
         len(translated_srt) if translated_srt is not None else None,
         len(line_translated_transcript) if line_translated_transcript is not None else None,
         len(transcription_result.subtitle_cues),
@@ -969,6 +1250,12 @@ def parse_translation_model_command_arg(raw: object) -> str | None:
     return TRANSLATION_MODEL_ALIASES.get(raw.strip().lower())
 
 
+def parse_transcription_refinement_model_command_arg(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    return TRANSCRIPTION_REFINEMENT_MODEL_ALIASES.get(raw.strip().lower())
+
+
 def get_runtime_model_key(context: ContextTypes.DEFAULT_TYPE) -> str:
     candidate = context.bot_data.get("transcription_model", DEFAULT_TRANSCRIPTION_MODEL_KEY)
     if isinstance(candidate, str) and candidate in TRANSCRIPTION_MODEL_OPTIONS:
@@ -981,6 +1268,40 @@ def get_runtime_translation_model(context: ContextTypes.DEFAULT_TYPE, settings: 
     if isinstance(candidate, str) and candidate.strip():
         return candidate.strip()
     return settings.openrouter_refine_model
+
+
+def get_runtime_transcription_refinement_model(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> str:
+    candidate = context.bot_data.get(
+        "transcription_refinement_model",
+        settings.openrouter_transcription_refinement_model,
+    )
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return settings.openrouter_transcription_refinement_model
+
+
+def gemini_refinement_is_available(context: ContextTypes.DEFAULT_TYPE | Application) -> bool:
+    training_context = context.bot_data.get("iraqi_training_context")
+    return (
+        context.bot_data.get("gemini_refinement_available") is True
+        and isinstance(training_context, str)
+        and bool(training_context.strip())
+    )
+
+
+def get_effective_transcription_refinement_model(
+    context: ContextTypes.DEFAULT_TYPE | Application,
+    settings: Settings,
+    *,
+    selected_model: str | None = None,
+) -> str:
+    selected = selected_model or get_runtime_transcription_refinement_model(context, settings)
+    if selected == DEFAULT_GEMINI_TRANSCRIPTION_MODEL and not gemini_refinement_is_available(context):
+        return DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL
+    return selected
 
 
 def get_runtime_translation_prompt(context: ContextTypes.DEFAULT_TYPE) -> str:
@@ -997,6 +1318,7 @@ def persist_runtime_preferences(
     *,
     audio_tempo: float | None = None,
     transcription_model: str | None = None,
+    transcription_refinement_model: str | None = None,
     translation_model: str | None = None,
     translation_prompt: str | None = None,
 ) -> None:
@@ -1008,6 +1330,10 @@ def persist_runtime_preferences(
         RuntimePreferences(
             audio_tempo=audio_tempo if audio_tempo is not None else get_runtime_audio_tempo(context, settings),
             transcription_model=transcription_model or get_runtime_model_key(context),
+            transcription_refinement_model=(
+                transcription_refinement_model
+                or get_runtime_transcription_refinement_model(context, settings)
+            ),
             translation_model=translation_model or get_runtime_translation_model(context, settings),
             translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
         )
@@ -1042,6 +1368,49 @@ def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: 
 def format_unknown_model_message() -> str:
     options = ", ".join(option.key for option in TRANSCRIPTION_MODEL_OPTIONS.values())
     return f"Unknown transcription model. Available models: {options}."
+
+
+def format_transcription_refinement_model_settings_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    settings: Settings,
+) -> str:
+    current_model = get_runtime_transcription_refinement_model(context, settings)
+    current_label = next(
+        (
+            option.label
+            for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+            if option.model == current_model
+        ),
+        current_model,
+    )
+    lines = [
+        f"Current transcription refinement model: {current_label}",
+    ]
+    effective_model = get_effective_transcription_refinement_model(context, settings)
+    if effective_model != current_model:
+        effective_label = next(
+            (
+                option.label
+                for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+                if option.model == effective_model
+            ),
+            effective_model,
+        )
+        lines.append(f"Effective model for this process: {effective_label} (temporary fallback)")
+    lines.extend(["", "Available models:"])
+    for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values():
+        availability = ""
+        if option.model == DEFAULT_GEMINI_TRANSCRIPTION_MODEL and not gemini_refinement_is_available(context):
+            availability = " (unavailable: training resources were not prepared at startup)"
+        lines.append(f"- {option.key}: {option.label}{availability}")
+    lines.append("")
+    lines.append("Use /refiner gpt or /refiner gemini.")
+    return "\n".join(lines)
+
+
+def format_unknown_transcription_refinement_model_message() -> str:
+    options = ", ".join(option.key for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values())
+    return f"Unknown transcription refinement model. Available models: {options}."
 
 
 def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
