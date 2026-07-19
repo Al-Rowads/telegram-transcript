@@ -39,6 +39,7 @@ class Settings:
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
     runtime_state_path: Path = Path("data/runtime-settings.json")
+    video_registry_path: Path = Path("data/videos.sqlite3")
 
     @property
     def max_video_bytes(self) -> int:
@@ -105,6 +106,10 @@ def load_settings(
         runtime_state_path=Path(
             source.get("RUNTIME_STATE_PATH", "data/runtime-settings.json").strip()
             or "data/runtime-settings.json"
+        ).expanduser(),
+        video_registry_path=Path(
+            source.get("VIDEO_REGISTRY_PATH", "data/videos.sqlite3").strip()
+            or "data/videos.sqlite3"
         ).expanduser(),
     )
 

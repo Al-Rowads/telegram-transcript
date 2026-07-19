@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import warnings
 from datetime import timedelta
 from pathlib import Path
@@ -32,6 +33,7 @@ from telegram_transcript.bot import (
 )
 from telegram_transcript.config import Settings
 from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
+from telegram_transcript.video_registry import VideoRegistry
 
 
 class FakeMessage:
@@ -47,6 +49,7 @@ class FakeMessage:
         message_id: int = 42,
         message_thread_id: int | None = None,
         status: "FakeStatus | None" = None,
+        from_user: SimpleNamespace | None = None,
     ) -> None:
         self.video = video
         self.audio = audio
@@ -62,6 +65,7 @@ class FakeMessage:
         self.document_replies: list[object] = []
         self.document_reply_kwargs: list[dict[str, object]] = []
         self.status = status
+        self.from_user = from_user
 
     async def reply_text(self, text: str, **kwargs: object) -> object:
         self.text_replies.append(text)
@@ -1315,3 +1319,148 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
         "Step 1/6: downloading media...",
         "Media is larger than the configured upload limit.",
     ]
+
+
+def install_dedup_pipeline_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
+        return func(*args, **kwargs)
+
+    def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
+        audio_path.write_bytes(b"audio")
+        return audio_path
+
+    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+        return [AudioChunk(path=audio_path)]
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+    monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
+    monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
+
+
+class DedupFakeTranscriber:
+    async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
+        return TranscriptionResult(raw_transcript="hello transcript")
+
+
+def make_dedup_attachment(file_name: str | None) -> object:
+    return SimpleNamespace(file_name=file_name, file_size=5, mime_type="video/mp4")
+
+
+async def run_dedup_pipeline(
+    registry: object,
+    *,
+    file_name: str | None,
+    media_bytes: bytes,
+    from_user: SimpleNamespace | None,
+) -> FakeMessage:
+    message = FakeMessage(from_user=from_user)
+    status_ref: dict[str, object] = {"message": None}
+    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
+    context = SimpleNamespace(
+        bot_data={
+            "transcriber": DedupFakeTranscriber(),
+            "media_downloader": FakeMediaDownloader(media_bytes),
+            "video_registry": registry,
+        }
+    )
+    await process_media_message(
+        message, make_dedup_attachment(file_name), settings, context, status_ref, "job1234", 1.0
+    )
+    return message
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_records_first_video_without_duplicate_notice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_dedup_pipeline_fakes(monkeypatch)
+    registry = VideoRegistry(tmp_path / "videos.sqlite3")
+
+    message = await run_dedup_pipeline(
+        registry,
+        file_name="clip.mp4",
+        media_bytes=b"first-video",
+        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
+    )
+
+    assert not any("Duplicate detected" in reply for reply in message.text_replies)
+    match = registry.find_duplicate("clip.mp4", "irrelevant-hash")
+    assert match is not None
+    assert match.first_sender == "@alice"
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_flags_duplicate_by_file_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_dedup_pipeline_fakes(monkeypatch)
+    registry = VideoRegistry(tmp_path / "videos.sqlite3")
+
+    await run_dedup_pipeline(
+        registry,
+        file_name="clip.mp4",
+        media_bytes=b"first-video",
+        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
+    )
+    second_message = await run_dedup_pipeline(
+        registry,
+        file_name="clip.mp4",
+        media_bytes=b"different-bytes",
+        from_user=SimpleNamespace(id=2, username="bob", full_name="Bob B"),
+    )
+
+    assert second_message.text_replies[-1] == (
+        "Duplicate detected: this video was first sent by @alice (matched by file name)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_flags_duplicate_by_content_hash(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    install_dedup_pipeline_fakes(monkeypatch)
+    registry = VideoRegistry(tmp_path / "videos.sqlite3")
+
+    await run_dedup_pipeline(
+        registry,
+        file_name="clip.mp4",
+        media_bytes=b"same-video-bytes",
+        from_user=SimpleNamespace(id=1, username=None, full_name="Alice A"),
+    )
+    second_message = await run_dedup_pipeline(
+        registry,
+        file_name=None,
+        media_bytes=b"same-video-bytes",
+        from_user=SimpleNamespace(id=2, username="bob", full_name="Bob B"),
+    )
+
+    assert second_message.text_replies[-1] == (
+        "Duplicate detected: this video was first sent by Alice A (matched by content hash)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_process_media_message_survives_registry_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_dedup_pipeline_fakes(monkeypatch)
+
+    class BrokenRegistry:
+        def find_duplicate(self, file_name: str | None, file_hash: str) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        def record_video(self, **kwargs: object) -> int:
+            raise sqlite3.OperationalError("database is locked")
+
+    message = await run_dedup_pipeline(
+        BrokenRegistry(),
+        file_name="clip.mp4",
+        media_bytes=b"first-video",
+        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
+    )
+
+    assert "hello transcript" in message.text_replies
+    assert not any("Duplicate detected" in reply for reply in message.text_replies)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import tempfile
 import time
 import uuid
@@ -24,6 +25,7 @@ from telegram_transcript.telegram_utils import (
     split_text_for_telegram,
 )
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
+from telegram_transcript.video_registry import DuplicateMatch, VideoRegistry, compute_file_sha256
 from telegram_transcript.transcriber import (
     CLAUDE_SONNET_TRANSLATION_MODEL,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
@@ -200,6 +202,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["runtime_preferences_store"] = runtime_store
     app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
     app.bot_data["audio_tempo"] = runtime_preferences.audio_tempo
+    app.bot_data["video_registry"] = VideoRegistry(settings.video_registry_path)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -302,6 +305,9 @@ async def stop_media_downloader(application: Application) -> None:
     downloader = application.bot_data.get("media_downloader")
     if isinstance(downloader, TelegramMediaDownloader):
         await downloader.close()
+    registry = application.bot_data.get("video_registry")
+    if isinstance(registry, VideoRegistry):
+        registry.close()
 
 
 def media_message_filter() -> filters.BaseFilter:
@@ -564,6 +570,8 @@ async def process_media_message(
 ) -> None:
     transcriber: SpeechTranscriber = context.bot_data["transcriber"]
     base_name = get_media_attachment_basename(attachment)
+    video_registry = context.bot_data.get("video_registry")
+    incoming_file_name = getattr(attachment, "file_name", None)
     job_started = time.monotonic()
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
@@ -602,6 +610,17 @@ async def process_media_message(
             )
             await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
             return
+
+        file_hash = await asyncio.to_thread(compute_file_sha256, source_path)
+        duplicate = await find_duplicate_media(video_registry, incoming_file_name, file_hash, job_id=job_id)
+        logger.info(
+            "job %s duplicate check: file_name=%r file_hash=%s matched_by=%s first_sender=%s",
+            job_id,
+            incoming_file_name,
+            file_hash,
+            duplicate.matched_by if duplicate else None,
+            duplicate.first_sender if duplicate else None,
+        )
 
         await edit_status_message(status, f"Step 2/6: extracting lossless FLAC audio at {audio_tempo:g}x...", job_id=job_id)
         step_started = time.monotonic()
@@ -785,6 +804,19 @@ async def process_media_message(
         await edit_status_message(status, "Transcript ready.", job_id=job_id)
     else:
         await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
+    if duplicate is not None:
+        await reply_to_source(message, duplicate_notice(duplicate))
+    # Record after the duplicate lookup so a video never matches itself and the
+    # earliest row always identifies the first sender.
+    await record_processed_media(
+        video_registry,
+        job_id=job_id,
+        file_hash=file_hash,
+        file_name=incoming_file_name,
+        sender_id=getattr(getattr(message, "from_user", None), "id", None),
+        sender_username=get_sender_display_name(message),
+        transcript=raw_transcript,
+    )
     logger.info(
         "job %s completed: duration_ms=%d raw_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
@@ -1185,6 +1217,64 @@ def get_media_kind_label(message: Message, attachment: Video | Audio | Voice | D
 def get_attachment_file_size(attachment: Video | Audio | Voice | Document) -> int | None:
     file_size = getattr(attachment, "file_size", None)
     return file_size if isinstance(file_size, int) else None
+
+
+def get_sender_display_name(message: Message) -> str:
+    user = getattr(message, "from_user", None)
+    username = getattr(user, "username", None)
+    if isinstance(username, str) and username.strip():
+        return f"@{username.strip()}"
+    full_name = getattr(user, "full_name", None)
+    if isinstance(full_name, str) and full_name.strip():
+        return full_name.strip()
+    user_id = getattr(user, "id", None)
+    return f"user {user_id}" if user_id is not None else "an unknown user"
+
+
+def duplicate_notice(match: DuplicateMatch) -> str:
+    matched_by = "file name" if match.matched_by == "file_name" else "content hash"
+    return f"Duplicate detected: this video was first sent by {match.first_sender} (matched by {matched_by})."
+
+
+async def find_duplicate_media(
+    registry: VideoRegistry | None,
+    file_name: str | None,
+    file_hash: str,
+    *,
+    job_id: str,
+) -> DuplicateMatch | None:
+    if registry is None:
+        return None
+    try:
+        return await asyncio.to_thread(registry.find_duplicate, file_name, file_hash)
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("job %s video registry duplicate lookup failed: %s", job_id, exc)
+        return None
+
+
+async def record_processed_media(
+    registry: VideoRegistry | None,
+    *,
+    job_id: str,
+    file_hash: str,
+    file_name: str | None,
+    sender_id: int | None,
+    sender_username: str,
+    transcript: str,
+) -> None:
+    if registry is None:
+        return
+    try:
+        await asyncio.to_thread(
+            registry.record_video,
+            file_hash=file_hash,
+            file_name=file_name,
+            sender_id=sender_id,
+            sender_username=sender_username,
+            transcript=transcript,
+        )
+    except (sqlite3.Error, OSError) as exc:
+        logger.warning("job %s video registry record failed: %s", job_id, exc)
 
 
 def elapsed_ms(started_at: float) -> int:
