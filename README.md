@@ -15,7 +15,7 @@ A Python Telegram bot that receives video or audio media, downloads it with Tele
 - Automatically retries only a failed chunk using the selected model first, then the remaining providers in Gemini, Deepgram, Whisper Large V3, OpenAI preference order.
 - Supports runtime primary-model selection with `/model`: OpenRouter Gemini 3.5 Flash, direct Deepgram Nova-3, OpenRouter `openai/whisper-large-v3`, or direct OpenAI `whisper-1`.
 - Supports runtime Iraqi transcription-refinement model selection with `/refiner`: GPT-5.5 or Gemini 3.5 Flash through OpenRouter.
-- Validates pinned IANLP and IA2D Iraqi-dialect resources at startup and supplies them as reference context only to Gemini transcription refinement.
+- Sends Iraqi transcription-refinement requests with only the system prompt and the current SRT input.
 - Supports a persistent bot-wide `/translate` toggle for Persian translation.
 - Supports runtime translation model selection with `/tmodel`: Gemini 3.5 Flash, GPT-5.5, or Claude Sonnet 4.6 through OpenRouter.
 - Supports `/translation natural` and `/translation literal`; legacy `v2` and `normal` aliases remain accepted.
@@ -52,7 +52,6 @@ Optional variables:
 - `DEEPGRAM_LANGUAGE`: defaults to Iraqi Arabic (`ar-IQ`).
 - `DEEPGRAM_KEYTERMS`: optional comma-separated Nova-3 keyterms for important names and terminology.
 - `OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL`: OpenRouter text model used to convert validated SRT into natural Iraqi Baghdadi Arabic. Defaults to `openai/gpt-5.5` and runs independently of Persian translation settings.
-- `IRAQI_TRAINING_RESOURCES_PATH`: persistent directory for pinned Iraqi Arabic reference resources. Defaults to `data/iraqi-training-resources`.
 - `OPENROUTER_REFINE_MODEL`: OpenRouter text model used to add Persian translations to SRT subtitles. Defaults to `openai/gpt-5.5`.
 - `REFINE`: initial default for Persian translation before a `/translate` preference has been persisted. Defaults to `false`.
 - `ALLOWED_TELEGRAM_USER_IDS`: comma-separated Telegram user IDs allowed to use the bot.
@@ -98,11 +97,7 @@ Use `/model` to show the primary transcription model and available providers. Us
 
 Use `/refiner` to show the active Iraqi transcription-refinement model. Use `/refiner gpt` for OpenRouter GPT-5.5 or `/refiner gemini` for OpenRouter Gemini 3.5 Flash. This selection affects future media and does not change the transcription or Persian translation model.
 
-At application startup, the bot validates pinned copies of the [Iraqi Arabic NLP Toolkit (IANLP), revision `206b0eb`](https://huggingface.co/datasets/hussainhadi/Iraqi-Arabic-NLP-Toolkit-IANLP/tree/206b0eb862808fadb3faea2ea7f12010e7897b66), and [Iraqi Arabic Dialect Dataset (IA2D), revision `7ac618d`](https://github.com/ebady/Iraqi-Arabic-Dialect-Dataset/tree/7ac618dd6663d9a52acac17acd0259cdb0eff398), under `IRAQI_TRAINING_RESOURCES_PATH`. Missing or corrupt Iraqi-dialect files are downloaded through revision-pinned HTTPS URLs and installed atomically. The large Modern Standard Arabic newspaper source files in IA2D are intentionally excluded. Docker's `/app/data` volume preserves the downloaded files across container recreation.
-
-When `/refiner gemini` is selected, the validated corpus is loaded once at startup and attached as reference-only context to every Gemini transcription-refinement request. It is not sent to speech transcription, low-confidence correction, candidate resolution, Persian translation, or GPT refinement. This is inference context rather than model training and increases Gemini input-token cost for every SRT refinement chunk. The supplied transcription-refinement system prompt remains unchanged.
-
-If the resources cannot be prepared, the bot still starts and temporarily uses GPT-5.5 for transcription refinement without changing the saved Gemini preference. `/refiner` shows the temporary fallback, and `/refiner gemini` remains unavailable until a later restart successfully prepares the resources.
+Gemini and GPT refinement use the same system-prompt-only request shape. The prompt contains the current SRT batch; no external Iraqi corpus is downloaded, loaded, or attached as additional context.
 
 Use `/translate` with no arguments to toggle Persian translation for future media. The setting is bot-wide and survives restarts. Media already being processed continues with the translation state captured when its job started.
 

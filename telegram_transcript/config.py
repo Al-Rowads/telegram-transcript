@@ -42,7 +42,6 @@ class Settings:
     max_concurrent_jobs: int = 1
     runtime_state_path: Path = Path("data/runtime-settings.json")
     video_registry_path: Path = Path("data/videos.sqlite3")
-    iraqi_training_resources_path: Path = Path("data/iraqi-training-resources")
 
     @property
     def max_video_bytes(self) -> int:
@@ -121,13 +120,6 @@ def load_settings(
         video_registry_path=Path(
             source.get("VIDEO_REGISTRY_PATH", "data/videos.sqlite3").strip()
             or "data/videos.sqlite3"
-        ).expanduser(),
-        iraqi_training_resources_path=Path(
-            source.get(
-                "IRAQI_TRAINING_RESOURCES_PATH",
-                "data/iraqi-training-resources",
-            ).strip()
-            or "data/iraqi-training-resources"
         ).expanduser(),
     )
 

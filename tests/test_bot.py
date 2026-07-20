@@ -239,52 +239,46 @@ def test_create_transcriber_uses_runtime_transcription_refinement_model() -> Non
             openrouter_api_key="openrouter-key",
         ),
         transcription_refinement_model="google/gemini-3.5-flash",
-        iraqi_training_context="SOURCE: IANLP\nهواية",
     )
 
     assert transcriber.transcription_refinement_model == "google/gemini-3.5-flash"
 
 
-def test_create_transcriber_attaches_training_context_only_to_gemini_refinement() -> None:
+def test_create_application_uses_selected_gemini_refiner_without_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     settings = Settings(
-        telegram_bot_token="token",
-        deepgram_api_key="deepgram-key",
-        openai_api_key="openai-key",
-        openrouter_api_key="openrouter-key",
+        telegram_bot_token="123:token",
+        openrouter_transcription_refinement_model="google/gemini-3.5-flash",
+        runtime_state_path=tmp_path / "runtime.json",
+        video_registry_path=tmp_path / "videos.sqlite3",
     )
+    captured: dict[str, object] = {}
+    fake_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
 
-    gemini_transcriber = bot_module.create_transcriber(
-        settings,
-        transcription_refinement_model="google/gemini-3.5-flash",
-        iraqi_training_context="SOURCE: IANLP\nهواية",
-    )
-    gpt_transcriber = bot_module.create_transcriber(
-        settings,
-        transcription_refinement_model="openai/gpt-5.5",
-        iraqi_training_context="SOURCE: IANLP\nهواية",
-    )
+    def fake_create_transcriber(
+        settings_arg: Settings,
+        model_key: str,
+        **kwargs: object,
+    ) -> object:
+        assert settings_arg is settings
+        captured.update(kwargs)
+        return fake_transcriber
 
-    assert gemini_transcriber.transcription_refiner.reference_context == "SOURCE: IANLP\nهواية"
-    assert gpt_transcriber.transcription_refiner.reference_context is None
+    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
 
-
-def test_create_transcriber_rejects_gemini_refinement_without_training_context() -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        deepgram_api_key="deepgram-key",
-        openai_api_key="openai-key",
-        openrouter_api_key="openrouter-key",
-    )
-
-    with pytest.raises(bot_module.ConfigError, match="training resources"):
-        bot_module.create_transcriber(
-            settings,
-            transcription_refinement_model="google/gemini-3.5-flash",
-        )
+    application = bot_module.create_application(settings)
+    try:
+        assert captured["transcription_refinement_model"] == "google/gemini-3.5-flash"
+        assert application.bot_data["transcriber"] is fake_transcriber
+        assert "effective_transcription_refinement_model" not in application.bot_data
+    finally:
+        application.bot_data["video_registry"].close()
 
 
 @pytest.mark.asyncio
-async def test_initialize_application_loads_context_for_selected_gemini_refinement(
+async def test_start_media_downloader_stores_started_downloader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = Settings(
@@ -293,10 +287,6 @@ async def test_initialize_application_loads_context_for_selected_gemini_refineme
         openai_api_key="openai-key",
         openrouter_api_key="openrouter-key",
     )
-
-    class ResourceManager:
-        async def ensure_available(self) -> str:
-            return "SOURCE: IANLP\nهواية"
 
     class Downloader:
         def __init__(self, settings_arg: Settings) -> None:
@@ -306,110 +296,15 @@ async def test_initialize_application_loads_context_for_selected_gemini_refineme
         async def start(self) -> None:
             self.started = True
 
-    calls: list[tuple[str | None, str | None]] = []
-    replacement_transcriber = SimpleNamespace(provider_name="gemini", model="gemini")
-
-    def fake_create_transcriber(
-        settings_arg: Settings,
-        model_key: str,
-        translation_enabled: bool | None = None,
-        translation_model: str | None = None,
-        translation_prompt: str = "natural",
-        transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
-    ) -> object:
-        assert settings_arg is settings
-        calls.append((transcription_refinement_model, iraqi_training_context))
-        return replacement_transcriber
-
-    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
     monkeypatch.setattr(bot_module, "TelegramMediaDownloader", Downloader)
-    application = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "transcription_model": "gemini",
-            "transcription_refinement_model": "google/gemini-3.5-flash",
-            "translation_model": "openai/gpt-5.5",
-            "translation_prompt": "natural",
-            "iraqi_training_resource_manager": ResourceManager(),
-            "gemini_refinement_available": False,
-        }
-    )
+    application = SimpleNamespace(bot_data={"settings": settings})
 
-    await bot_module.initialize_application(application)
+    await bot_module.start_media_downloader(application)
 
-    assert calls == [("google/gemini-3.5-flash", "SOURCE: IANLP\nهواية")]
-    assert application.bot_data["gemini_refinement_available"] is True
-    assert application.bot_data["effective_transcription_refinement_model"] == "google/gemini-3.5-flash"
-    assert application.bot_data["transcriber"] is replacement_transcriber
     assert application.bot_data["media_downloader"].started is True
 
 
-@pytest.mark.asyncio
-async def test_initialize_application_temporarily_falls_back_to_gpt_when_resources_fail(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    settings = Settings(
-        telegram_bot_token="token",
-        deepgram_api_key="deepgram-key",
-        openai_api_key="openai-key",
-        openrouter_api_key="openrouter-key",
-        openrouter_transcription_refinement_model="google/gemini-3.5-flash",
-        runtime_state_path=tmp_path / "runtime.json",
-    )
-    store = bot_module.create_runtime_preferences_store(settings)
-
-    class ResourceManager:
-        async def ensure_available(self) -> str:
-            raise bot_module.TrainingResourceError("dataset host unavailable")
-
-    class Downloader:
-        def __init__(self, settings_arg: Settings) -> None:
-            pass
-
-        async def start(self) -> None:
-            pass
-
-    calls: list[tuple[str | None, str | None]] = []
-
-    def fake_create_transcriber(
-        settings_arg: Settings,
-        model_key: str,
-        translation_enabled: bool | None = None,
-        translation_model: str | None = None,
-        translation_prompt: str = "natural",
-        transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
-    ) -> object:
-        calls.append((transcription_refinement_model, iraqi_training_context))
-        return SimpleNamespace(provider_name="gemini", model="gemini")
-
-    monkeypatch.setattr(bot_module, "create_transcriber", fake_create_transcriber)
-    monkeypatch.setattr(bot_module, "TelegramMediaDownloader", Downloader)
-    application = SimpleNamespace(
-        bot_data={
-            "settings": settings,
-            "transcription_model": "gemini",
-            "transcription_refinement_model": "google/gemini-3.5-flash",
-            "translation_model": "openai/gpt-5.5",
-            "translation_prompt": "natural",
-            "runtime_preferences_store": store,
-            "iraqi_training_resource_manager": ResourceManager(),
-            "gemini_refinement_available": False,
-        }
-    )
-
-    await bot_module.initialize_application(application)
-
-    assert calls == [("openai/gpt-5.5", None)]
-    assert application.bot_data["transcription_refinement_model"] == "google/gemini-3.5-flash"
-    assert application.bot_data["effective_transcription_refinement_model"] == "openai/gpt-5.5"
-    assert application.bot_data["gemini_refinement_available"] is False
-    assert store.load().transcription_refinement_model == "google/gemini-3.5-flash"
-
-
-def test_unrelated_runtime_save_preserves_selected_gemini_during_temporary_fallback(
+def test_unrelated_runtime_save_preserves_selected_gemini(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -421,8 +316,6 @@ def test_unrelated_runtime_save_preserves_selected_gemini_during_temporary_fallb
         bot_data={
             "settings": settings,
             "transcription_refinement_model": "google/gemini-3.5-flash",
-            "effective_transcription_refinement_model": "openai/gpt-5.5",
-            "gemini_refinement_available": False,
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         }
     )
@@ -797,8 +690,6 @@ async def test_handle_model_command_switches_runtime_transcriber(
             "settings": settings,
             "transcription_refinement_model": "google/gemini-3.5-flash",
             "translation_model": "anthropic/claude-sonnet-4.6",
-            "gemini_refinement_available": True,
-            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
@@ -812,7 +703,6 @@ async def test_handle_model_command_switches_runtime_transcriber(
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
     ) -> object:
         calls.append(
             (settings_arg, model_key, translation_model, transcription_refinement_model)
@@ -895,8 +785,6 @@ async def test_handle_transcription_refinement_model_command_lists_current_model
                 openrouter_api_key="openrouter-key",
             ),
             "transcription_refinement_model": "google/gemini-3.5-flash",
-            "gemini_refinement_available": True,
-            "iraqi_training_context": "SOURCE: IANLP\nهواية",
         },
     )
 
@@ -907,34 +795,6 @@ async def test_handle_transcription_refinement_model_command_lists_current_model
     assert "gpt: OpenRouter GPT-5.5" in reply
     assert "gemini: OpenRouter Gemini 3.5 Flash" in reply
     assert "Use /refiner gpt or /refiner gemini." in reply
-
-
-@pytest.mark.asyncio
-async def test_refiner_command_reports_temporary_fallback_and_rejects_unavailable_gemini() -> None:
-    message = FakeMessage()
-    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(
-        args=[],
-        bot_data={
-            "settings": Settings(telegram_bot_token="token", openrouter_api_key="key"),
-            "transcription_refinement_model": "google/gemini-3.5-flash",
-            "effective_transcription_refinement_model": "openai/gpt-5.5",
-            "gemini_refinement_available": False,
-            "gemini_refinement_unavailable_reason": "dataset host unavailable",
-        },
-    )
-
-    await handle_transcription_refinement_model_command(update, context)
-
-    reply = message.text_replies[-1]
-    assert "Effective model for this process: OpenRouter GPT-5.5 (temporary fallback)" in reply
-    assert "gemini: OpenRouter Gemini 3.5 Flash (unavailable" in reply
-
-    context.args = ["gemini"]
-    await handle_transcription_refinement_model_command(update, context)
-
-    assert "dataset host unavailable" in message.text_replies[-1]
-    assert context.bot_data["transcription_refinement_model"] == "google/gemini-3.5-flash"
 
 
 @pytest.mark.asyncio
@@ -968,8 +828,6 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
             "transcription_model": "deepgram",
             "translation_model": "anthropic/claude-sonnet-4.6",
             "translation_prompt": "literal",
-            "gemini_refinement_available": True,
-            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
@@ -983,7 +841,6 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
     ) -> object:
         assert settings_arg is settings
         calls.append(
@@ -1081,8 +938,6 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
             "settings": settings,
             "transcriber": active_transcriber,
             "transcription_refinement_model": "openai/gpt-5.5",
-            "gemini_refinement_available": True,
-            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": store,
         },
     )
@@ -1142,7 +997,6 @@ async def test_handle_translation_toggle_command_switches_and_persists(
         translation_model: str | None = None,
         translation_prompt: str = "natural",
         transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
     ) -> object:
         assert settings_arg is settings
         calls.append(translation_enabled)
@@ -1308,8 +1162,6 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
             "settings": settings,
             "transcription_model": "deepgram",
             "transcription_refinement_model": "google/gemini-3.5-flash",
-            "gemini_refinement_available": True,
-            "iraqi_training_context": "SOURCE: IANLP\nهواية",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
@@ -1323,7 +1175,6 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
     ) -> object:
         calls.append(
             (settings_arg, model_key, translation_model, transcription_refinement_model)
@@ -1425,7 +1276,6 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
-        iraqi_training_context: str | None = None,
     ) -> object:
         calls.append(
             (
