@@ -80,14 +80,9 @@ class TranscriptionResult:
 
     @property
     def final_transcript(self) -> str:
-        """Return the authoritative, audio-grounded transcript.
-
-        ``refined_transcript`` remains available as a compatibility alias for
-        callers that need the derived reading version, but it is never the
-        source of truth.
-        """
-        return self.raw_transcript
+        """Return refined Iraqi Arabic when available, otherwise the raw transcript."""
+        return self.cleaned_transcript or self.refined_transcript or self.raw_transcript
 
     @property
     def reading_transcript(self) -> str:
-        return self.cleaned_transcript or self.refined_transcript or self.raw_transcript
+        return self.final_transcript

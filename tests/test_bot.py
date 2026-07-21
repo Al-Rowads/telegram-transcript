@@ -1543,10 +1543,10 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
     assert message.text_replies == [
         "Video received. Starting transcription...",
-        "هاي خام",
         "هاي منقحة",
         "این خام است",
     ]
+    assert "هاي خام" not in message.text_replies
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     assert [document.filename for document, _ in message.document_replies] == ["clip.srt"]
     status = message.status_replies[0]

@@ -8,17 +8,17 @@ A Telegram bot for faithful Iraqi Arabic transcription and Persian translation o
 2. `ffmpeg` extracts mono 16 kHz lossless FLAC. Optional tempo changes preserve pitch, and all output timestamps are mapped back to the original media timeline.
 3. Audio is split near silence boundaries into provider-safe chunks with overlap ownership boundaries.
 4. A timestamp-capable provider transcribes each chunk. The selected provider is tried first; only configured alternatives are used for failed chunks.
-5. The validated provider transcript remains the authoritative Arabic record. A separate structured-output pass produces an optional cleaned Iraqi/Baghdadi reading version without changing source timestamps or numbers.
-6. Validated source cues are translated to Persian. Translation must preserve cue identity and numeric values.
-7. The bot delivers the faithful Arabic transcript, the distinct cleaned Iraqi reading version, a bilingual Arabic/Persian SRT, and a Persian-only transcript.
+5. A structured-output pass refines the validated provider cues into Iraqi/Baghdadi Arabic without changing timestamps or numbers. Successful refinement becomes the Arabic delivery source; the raw provider transcript is retained only for fallback.
+6. The refined cues are translated to Persian. Translation must preserve cue identity and numeric values.
+7. The bot delivers the refined Arabic transcript, a bilingual refined-Arabic/Persian SRT, and a Persian-only transcript. If Iraqi refinement fails, it falls back atomically to the raw Arabic transcript and subtitles with a warning.
 
 Supported transcription providers are OpenRouter Gemini, Deepgram Nova-3 with `ar-IQ`, OpenRouter Whisper Large V3, and direct OpenAI `whisper-1`. Provider credentials are optional individually; at least the selected provider and OpenRouter cleaning/translation path must be configured.
 
 ## Correctness and privacy properties
 
 - Provider text is never interpolated into a system instruction. Cleaning uses a static system policy plus untrusted, structured user data.
-- Provider cues are immutable source artifacts. Cleaned Iraqi text and Persian text are stored in separate result fields.
-- Structured responses must preserve cue IDs and numbers. Malformed cleaning or translation output is retried in smaller batches, then discarded atomically.
+- Raw provider cues remain available as fallback artifacts. Successfully refined Iraqi cues become the source for delivered Arabic, SRT rendering, and Persian translation.
+- Structured responses must preserve cue IDs and numbers. Malformed cleaning output falls back atomically to raw Arabic with a warning; malformed translation output falls back to refined Arabic subtitles.
 - Subtitle cues are normalized for readability, chunk overlap is assigned to one owner, and tempo-adjusted timestamps are rescaled to the original video.
 - Jobs capture an immutable settings snapshot when queued, so later commands cannot change in-flight work.
 - Preferences are isolated per private user or group. Only group administrators can mutate group settings.

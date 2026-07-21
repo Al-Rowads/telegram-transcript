@@ -1088,9 +1088,10 @@ class SpeechTranscriber:
             )
 
         refined_transcript: str | None = None
-        source_subtitle_cues = tuple(subtitle_cues)
+        raw_subtitle_cues = tuple(subtitle_cues)
+        delivery_subtitle_cues = raw_subtitle_cues
         if self.transcription_refiner is not None:
-            raw_srt = render_srt(source_subtitle_cues)
+            raw_srt = render_srt(raw_subtitle_cues)
             if progress_callback is not None:
                 await progress_callback(
                     "refining_transcription",
@@ -1107,6 +1108,7 @@ class SpeechTranscriber:
                     provider_name="Iraqi Arabic refinement",
                 )
                 refined_transcript = refined_result.transcript
+                delivery_subtitle_cues = refined_result.subtitle_cues
             except (OpenAIError, TranscriptionError) as exc:
                 logger.warning(
                     "Iraqi Arabic transcription refinement failed; retaining original subtitles.",
@@ -1134,12 +1136,12 @@ class SpeechTranscriber:
                 raw_transcript=transcript,
                 refined_transcript=refined_transcript,
                 cleaned_transcript=refined_transcript,
-                subtitle_cues=source_subtitle_cues,
+                subtitle_cues=delivery_subtitle_cues,
                 words=tuple(transcript_words),
                 warnings=tuple(dict.fromkeys(warnings)),
             )
 
-        source_srt_blocks = parse_srt_blocks(render_srt(source_subtitle_cues))
+        source_srt_blocks = parse_srt_blocks(render_srt(delivery_subtitle_cues))
         translated_blocks = []
         persian_lines: list[str] = []
         translation_context: list[tuple[SrtBlock, str]] = []
@@ -1180,7 +1182,7 @@ class SpeechTranscriber:
                     raw_transcript=transcript,
                     refined_transcript=refined_transcript,
                     cleaned_transcript=refined_transcript,
-                    subtitle_cues=source_subtitle_cues,
+                    subtitle_cues=delivery_subtitle_cues,
                     words=tuple(transcript_words),
                     warnings=tuple(dict.fromkeys(warnings)),
                 )
@@ -1204,7 +1206,7 @@ class SpeechTranscriber:
             refined_transcript=refined_transcript,
             cleaned_transcript=refined_transcript,
             persian_transcript=persian_transcript,
-            subtitle_cues=source_subtitle_cues,
+            subtitle_cues=delivery_subtitle_cues,
             translated_srt=translated_srt,
             line_translated_transcript=line_translated_transcript,
             words=tuple(transcript_words),

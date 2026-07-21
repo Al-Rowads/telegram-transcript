@@ -1224,11 +1224,7 @@ async def process_media_message(
             await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
         )
 
-    raw_transcript = transcription_result.raw_transcript.strip() or "No speech was detected."
-    cleaned_transcript = (
-        transcription_result.cleaned_transcript or transcription_result.refined_transcript or ""
-    ).strip()
-    final_transcript = raw_transcript
+    final_transcript = transcription_result.final_transcript.strip() or "No speech was detected."
     translated_srt = (
         transcription_result.translated_srt.strip() if transcription_result.translated_srt is not None else None
     )
@@ -1265,13 +1261,6 @@ async def process_media_message(
         filename=f"{base_name}.transcription.txt",
         caption="Transcription",
     )
-    if cleaned_transcript and cleaned_transcript != raw_transcript:
-        await send_transcript(
-            message,
-            cleaned_transcript,
-            filename=f"{base_name}.iraqi-clean.txt",
-            caption="Cleaned Iraqi reading version",
-        )
     if srt:
         await send_srt(message, srt, filename=f"{base_name}.srt")
     if persian_transcript:

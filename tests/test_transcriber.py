@@ -891,11 +891,12 @@ async def test_transcribe_chunks_refines_before_translation(tmp_path: Path) -> N
 
     assert result.raw_transcript == "قال أقدر"
     assert result.refined_transcript == "كال أكدر"
-    assert result.final_transcript == "قال أقدر"
+    assert result.final_transcript == "كال أكدر"
     assert result.reading_transcript == "كال أكدر"
-    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "قال أقدر"),)
-    assert translator.source_texts == [("قال أقدر",)]
-    assert result.translated_srt is not None and "قال أقدر" in result.translated_srt
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "كال أكدر"),)
+    assert translator.source_texts == [("كال أكدر",)]
+    assert result.translated_srt is not None and "كال أكدر" in result.translated_srt
+    assert "قال أقدر" not in result.translated_srt
     assert events == [
         "transcribing_chunk",
         "chunk_transcribed",
@@ -934,9 +935,9 @@ async def test_transcribe_chunks_refines_when_translation_is_disabled(tmp_path: 
 
     assert result.raw_transcript == "قال"
     assert result.refined_transcript == "كال"
-    assert result.final_transcript == "قال"
+    assert result.final_transcript == "كال"
     assert result.reading_transcript == "كال"
-    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "قال"),)
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "كال"),)
     assert result.translated_srt is None
 
 
@@ -989,7 +990,7 @@ async def test_transcribe_chunks_falls_back_atomically_when_refinement_fails(tmp
 
 
 @pytest.mark.asyncio
-async def test_transcribe_chunks_keeps_raw_srt_when_translation_fails(tmp_path: Path) -> None:
+async def test_transcribe_chunks_keeps_refined_srt_when_translation_fails(tmp_path: Path) -> None:
     audio = tmp_path / "audio.flac"
     audio.write_bytes(b"audio")
 
@@ -1009,6 +1010,12 @@ async def test_transcribe_chunks_keeps_raw_srt_when_translation_fails(tmp_path: 
         def translate_srt_blocks(self, *args: object, **kwargs: object) -> tuple[str, ...]:
             raise TranscriptionError("translation failed")
 
+    class ArabicRefiner:
+        model = "arabic-refinement-model"
+
+        def refine_srt(self, srt: str) -> str:
+            return srt.replace("raw", "refined")
+
     events: list[str] = []
 
     async def record_progress(event: str, data: object) -> None:
@@ -1016,6 +1023,7 @@ async def test_transcribe_chunks_keeps_raw_srt_when_translation_fails(tmp_path: 
 
     result = await SpeechTranscriber(
         speech_to_text_provider=Provider(),
+        transcription_refiner=ArabicRefiner(),
         refiner=FailingRefiner(),
     ).transcribe_chunks_async(
         (AudioChunk(audio, duration_seconds=10.0),),
@@ -1023,9 +1031,11 @@ async def test_transcribe_chunks_keeps_raw_srt_when_translation_fails(tmp_path: 
     )
 
     assert result.raw_transcript == "raw"
-    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "raw"),)
+    assert result.final_transcript == "refined"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "refined"),)
     assert result.translated_srt is None
     assert result.warnings == (TRANSLATION_FAILURE_WARNING,)
+    assert "transcription_refinement_complete" in events
     assert "translation_failed" in events
 
 
