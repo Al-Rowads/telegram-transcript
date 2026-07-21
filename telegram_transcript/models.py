@@ -77,6 +77,7 @@ class TranscriptionResult:
     line_translated_transcript: str | None = None
     words: tuple[TranscriptWord, ...] = ()
     warnings: tuple[str, ...] = ()
+    translation_warnings: tuple[str, ...] = ()
 
     @property
     def final_transcript(self) -> str:

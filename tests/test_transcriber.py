@@ -19,6 +19,8 @@ from telegram_transcript.transcriber import (
     CORRECTION_FAILURE_WARNING,
     IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT,
     MAX_SRT_REFINEMENT_CHUNK_BYTES,
+    PERSIAN_TRANSLATION_NUMBER_WARNING,
+    PERSIAN_TRANSLATION_SCRIPT_WARNING,
     TRANSCRIPTION_REFINEMENT_FAILURE_WARNING,
     TRANSCRIPTION_REFINEMENT_PLACEHOLDER,
     TRANSLATION_FAILURE_WARNING,
@@ -1040,6 +1042,58 @@ async def test_transcribe_chunks_keeps_refined_srt_when_translation_fails(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_transcribe_chunks_delivers_translation_with_advisory_warnings(tmp_path: Path) -> None:
+    audio = tmp_path / "audio.flac"
+    audio.write_bytes(b"audio")
+
+    class Provider:
+        provider_name = "gemini"
+        model = "gemini-model"
+
+        def transcribe_file_result(self, audio_path: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
+            return FileTranscriptionResult(
+                transcript="رقم 12\n\nمرحبا\n\nرقم 20",
+                subtitle_cues=(
+                    SubtitleCue(0.0, 1.0, "رقم 12"),
+                    SubtitleCue(1.0, 2.0, "مرحبا"),
+                    SubtitleCue(2.0, 3.0, "رقم 20"),
+                ),
+            )
+
+    class Translator:
+        model = "translation-model"
+
+        def translate_srt_blocks(self, *args: object, **kwargs: object) -> tuple[str, ...]:
+            return ("شماره ۱۳", "hello", "شماره ۲۱")
+
+    events: list[str] = []
+
+    async def record_progress(event: str, data: object) -> None:
+        del data
+        events.append(event)
+
+    result = await SpeechTranscriber(
+        speech_to_text_provider=Provider(),
+        refiner=Translator(),
+    ).transcribe_chunks_async(
+        (AudioChunk(audio, duration_seconds=3.0),),
+        progress_callback=record_progress,
+    )
+
+    assert result.persian_transcript == "شماره ۱۳\nhello\nشماره ۲۱"
+    assert result.translated_srt is not None
+    assert "شماره ۱۳" in result.translated_srt
+    assert "hello" in result.translated_srt
+    assert "شماره ۲۱" in result.translated_srt
+    assert result.translation_warnings == (
+        PERSIAN_TRANSLATION_NUMBER_WARNING,
+        PERSIAN_TRANSLATION_SCRIPT_WARNING,
+    )
+    assert "translation_complete" in events
+    assert "translation_failed" not in events
+
+
+@pytest.mark.asyncio
 async def test_transcribe_chunks_keeps_deepgram_result_when_confidence_correction_fails(tmp_path: Path) -> None:
     audio = tmp_path / "audio.flac"
     audio.write_bytes(b"audio")
@@ -1442,6 +1496,31 @@ def test_transcript_refiner_rejects_empty_translation() -> None:
 
     with pytest.raises(TranscriptionError, match="empty"):
         refiner.refine_transcript("1\n00:00:00,000 --> 00:00:01,000\nهاي\n")
+
+
+def test_transcript_refiner_does_not_retry_changed_number() -> None:
+    class FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **_: object) -> object:
+            self.calls += 1
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"translations":[{"index":"1","translation":"شماره ۱۳"}]}'
+                )))]
+            )
+
+    completions = FakeCompletions()
+    refiner = TranscriptRefiner(
+        api_key="key",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    assert refiner.translate_srt_blocks(
+        parse_srt_blocks("1\n00:00:00,000 --> 00:00:01,000\nرقم 12\n")
+    ) == ("شماره ۱۳",)
+    assert completions.calls == 1
 
 
 def test_refinement_input_uses_delimited_raw_transcript() -> None:

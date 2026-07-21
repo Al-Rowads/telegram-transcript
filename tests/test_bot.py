@@ -34,6 +34,7 @@ from telegram_transcript.bot import (
 )
 from telegram_transcript.config import Settings
 from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
+from telegram_transcript.transcriber import PERSIAN_TRANSLATION_NUMBER_WARNING
 
 
 class FakeMessage:
@@ -1514,6 +1515,7 @@ async def test_process_video_message_reports_step_by_step_flow(
                     '<font color="green">این خام است</font>\n'
                 ),
                 line_translated_transcript="هاي منقحة\nاین خام است\n",
+                translation_warnings=(PERSIAN_TRANSLATION_NUMBER_WARNING,),
             )
 
     def fake_extract_audio(video_path: Path, audio_path: Path, *, audio_tempo: float) -> Path:
@@ -1545,6 +1547,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         "Video received. Starting transcription...",
         "هاي منقحة",
         "این خام است",
+        "Warning: " + PERSIAN_TRANSLATION_NUMBER_WARNING,
     ]
     assert "هاي خام" not in message.text_replies
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]

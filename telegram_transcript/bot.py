@@ -1270,6 +1270,11 @@ async def process_media_message(
             filename=f"{base_name}.fa.txt",
             caption="Persian translation",
         )
+    if transcription_result.translation_warnings:
+        await reply_to_source(
+            message,
+            "Warning: " + " ".join(transcription_result.translation_warnings),
+        )
     if transcription_result.warnings:
         await edit_status_message(
             status,

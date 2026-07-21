@@ -50,6 +50,13 @@ TRANSCRIPTION_REQUEST_TIMEOUT_SECONDS = 300.0
 TRANSCRIPTION_MAX_RETRIES = 2
 SUBTITLE_CUE_DURATION_TOLERANCE_SECONDS = 2.0
 TRANSLATION_FAILURE_WARNING = "Persian translation failed; Arabic subtitles were sent."
+PERSIAN_TRANSLATION_NUMBER_WARNING = (
+    "The Persian translation may have changed or omitted one or more numbers; "
+    "please review numeric values."
+)
+PERSIAN_TRANSLATION_SCRIPT_WARNING = (
+    "Part of the Persian translation did not contain Persian-script text; please review it."
+)
 TRANSCRIPTION_REFINEMENT_FAILURE_WARNING = (
     "Iraqi Arabic transcription refinement failed; original subtitles were used."
 )
@@ -927,10 +934,7 @@ class TranscriptRefiner:
             extract_chat_completion_text(response),
             expected_indexes=tuple(block.index for block in blocks),
         )
-        ordered = tuple(translations[block.index] for block in blocks)
-        for block, translation in zip(blocks, ordered, strict=True):
-            validate_persian_translation(" ".join(block.text_lines), translation)
-        return ordered
+        return tuple(translations[block.index] for block in blocks)
 
 
 class SpeechTranscriber:
@@ -1145,6 +1149,7 @@ class SpeechTranscriber:
         translated_blocks = []
         persian_lines: list[str] = []
         translation_context: list[tuple[SrtBlock, str]] = []
+        translation_warnings: list[str] = []
         for batch_start in range(0, len(source_srt_blocks), TRANSLATION_BATCH_CUES):
             target_blocks = source_srt_blocks[batch_start : batch_start + TRANSLATION_BATCH_CUES]
             following_blocks = source_srt_blocks[
@@ -1187,6 +1192,18 @@ class SpeechTranscriber:
                     warnings=tuple(dict.fromkeys(warnings)),
                 )
             for source_srt_block, translation in zip(target_blocks, translations, strict=True):
+                cue_warnings = get_persian_translation_warnings(
+                    " ".join(source_srt_block.text_lines),
+                    translation,
+                )
+                if cue_warnings:
+                    logger.warning(
+                        "Persian translation content check raised an advisory warning; "
+                        "delivering cue %s unchanged: checks=%s",
+                        source_srt_block.index,
+                        len(cue_warnings),
+                    )
+                    translation_warnings.extend(cue_warnings)
                 translated_blocks.append(render_translated_srt_block(source_srt_block, translation))
                 translation_context.append((source_srt_block, translation))
                 persian_lines.append(normalize_persian_translation_line(translation))
@@ -1211,6 +1228,7 @@ class SpeechTranscriber:
             line_translated_transcript=line_translated_transcript,
             words=tuple(transcript_words),
             warnings=tuple(dict.fromkeys(warnings)),
+            translation_warnings=tuple(dict.fromkeys(translation_warnings)),
         )
 
     async def _transcribe_chunk_with_fallback(
@@ -2140,12 +2158,14 @@ def normalize_persian_translation_line(translation: str) -> str:
     return " ".join(translation.strip().split())
 
 
-def validate_persian_translation(source_text: str, translation: str) -> None:
+def get_persian_translation_warnings(source_text: str, translation: str) -> tuple[str, ...]:
     normalized = normalize_persian_translation_line(translation)
+    warnings = []
     if not re.search(r"[\u0600-\u06ff]", normalized):
-        raise TranscriptionError("Translation response did not contain Persian-script text.")
+        warnings.append(PERSIAN_TRANSLATION_SCRIPT_WARNING)
     if canonical_number_tokens(source_text) != canonical_number_tokens(normalized):
-        raise TranscriptionError("Translation response changed a number.")
+        warnings.append(PERSIAN_TRANSLATION_NUMBER_WARNING)
+    return tuple(warnings)
 
 
 def build_refinement_input(
