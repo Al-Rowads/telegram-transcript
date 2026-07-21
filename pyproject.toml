@@ -5,12 +5,11 @@ build-backend = "hatchling.build"
 [project]
 name = "telegram-transcript"
 version = "0.1.0"
-description = "Telegram bot that transcribes media through OpenRouter with a Deepgram fallback."
+description = "Telegram bot for Iraqi Arabic transcription and Persian translation."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "deepgram-sdk>=5.3,<6",
-  "httpx>=0.27,<1",
   "openai>=2.41.0,<3",
   "python-dotenv>=1.0.1,<2",
   "python-telegram-bot>=21.6,<23",

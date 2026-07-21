@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import warnings
 from datetime import timedelta
 from pathlib import Path
@@ -35,7 +34,6 @@ from telegram_transcript.bot import (
 )
 from telegram_transcript.config import Settings
 from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
-from telegram_transcript.video_registry import VideoRegistry
 
 
 class FakeMessage:
@@ -105,6 +103,12 @@ class FakeMediaDownloader:
         self.downloads.append((chat_id, message_id, target_path))
         target_path.write_bytes(self.media_bytes)
         return target_path
+
+
+class FakeAdminBot:
+    async def get_chat_member(self, chat_id: int, user_id: int) -> object:
+        del chat_id, user_id
+        return SimpleNamespace(status="administrator")
 
 
 def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
@@ -274,7 +278,7 @@ def test_create_application_uses_selected_gemini_refiner_without_context(
         assert application.bot_data["transcriber"] is fake_transcriber
         assert "effective_transcription_refinement_model" not in application.bot_data
     finally:
-        application.bot_data["video_registry"].close()
+        application.bot_data["scoped_state_store"].close()
 
 
 @pytest.mark.asyncio
@@ -403,7 +407,7 @@ def test_get_media_attachment_basename_falls_back_for_blank_stem() -> None:
 @pytest.mark.asyncio
 async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: pytest.MonkeyPatch) -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
-    update = SimpleNamespace(effective_message=message)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     scheduled: list[tuple[object, object, str]] = []
 
     async def skip_sleep(delay_seconds: float) -> None:
@@ -544,6 +548,7 @@ async def test_handle_tempo_command_updates_runtime_tempo_in_group(tmp_path: Pat
     message = FakeMessage(chat_type=ChatType.SUPERGROUP, message_id=123, message_thread_id=8)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
     context = SimpleNamespace(
+        bot=FakeAdminBot(),
         args=["1.2"],
         bot_data={
             "audio_tempo": 1.0,
@@ -613,7 +618,7 @@ async def test_handle_tempo_command_keeps_memory_unchanged_when_persistence_fail
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     message = FakeMessage(chat_type=ChatType.GROUP)
-    update = SimpleNamespace(effective_message=message)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     settings = Settings(
         telegram_bot_token="token",
         runtime_state_path=tmp_path / "runtime.json",
@@ -625,6 +630,7 @@ async def test_handle_tempo_command_keeps_memory_unchanged_when_persistence_fail
 
     monkeypatch.setattr(store, "save", fail_save)
     context = SimpleNamespace(
+        bot=FakeAdminBot(),
         args=["1.2"],
         bot_data={
             "audio_tempo": 1.0,
@@ -685,6 +691,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
         runtime_state_path=tmp_path / "runtime.json",
     )
     context = SimpleNamespace(
+        bot=FakeAdminBot(),
         args=["Whisper"],
         bot_data={
             "settings": settings,
@@ -732,6 +739,7 @@ async def test_handle_model_command_rejects_missing_provider_credentials() -> No
     message = FakeMessage(chat_type=ChatType.SUPERGROUP)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     context = SimpleNamespace(
+        bot=FakeAdminBot(),
         args=["openai"],
         bot_data={"settings": Settings(telegram_bot_token="token", deepgram_api_key="deepgram-key")},
     )
@@ -747,6 +755,7 @@ async def test_handle_model_command_requires_openrouter_for_whisper() -> None:
     message = FakeMessage(chat_type=ChatType.SUPERGROUP)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
     context = SimpleNamespace(
+        bot=FakeAdminBot(),
         args=["whisper"],
         bot_data={"settings": Settings(telegram_bot_token="token", deepgram_api_key="deepgram-key")},
     )
@@ -1406,26 +1415,18 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
     context = SimpleNamespace(
         bot_data={
             "settings": settings,
-            "job_semaphore": asyncio.Semaphore(1),
+            "media_job_queue": asyncio.Queue(),
             "audio_tempo": 1.4,
         }
     )
-    processed = False
-
-    async def fake_process_media_message(*args: object) -> None:
-        nonlocal processed
-        processed = True
-        assert args[0] is message
-        assert args[1] is attachment
-        assert args[6] == 1.4
-        context.bot_data["audio_tempo"] = 2.0
-
-    monkeypatch.setattr(bot_module, "process_media_message", fake_process_media_message)
 
     await handle_video_upload(update, context)
 
-    assert processed
-    assert message.text_replies == []
+    queued_job = context.bot_data["media_job_queue"].get_nowait()
+    assert queued_job.message is message
+    assert queued_job.attachment is attachment
+    assert queued_job.audio_tempo == 1.4
+    assert message.text_replies == ["Video queued for transcription..."]
 
 
 @pytest.mark.asyncio
@@ -1503,6 +1504,8 @@ async def test_process_video_message_reports_step_by_step_flow(
             return TranscriptionResult(
                 raw_transcript="هاي خام",
                 refined_transcript="هاي منقحة",
+                cleaned_transcript="هاي منقحة",
+                persian_transcript="این خام است",
                 subtitle_cues=(SubtitleCue(0.0, 1.25, "هاي منقحة"),),
                 translated_srt=(
                     "1\n"
@@ -1519,7 +1522,9 @@ async def test_process_video_message_reports_step_by_step_flow(
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         assert audio_path.name == "audio.flac"
         assert chunks_dir.name == "chunks"
         return [AudioChunk(path=audio_path)]
@@ -1538,8 +1543,9 @@ async def test_process_video_message_reports_step_by_step_flow(
     assert downloader.downloads and downloader.downloads[0][:2] == (100, 42)
     assert message.text_replies == [
         "Video received. Starting transcription...",
+        "هاي خام",
         "هاي منقحة",
-        "هاي منقحة\nاین خام است",
+        "این خام است",
     ]
     assert [caption for _, caption in message.document_replies] == ["SRT subtitles"]
     assert [document.filename for document, _ in message.document_replies] == ["clip.srt"]
@@ -1604,7 +1610,9 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
@@ -1661,7 +1669,9 @@ async def test_process_video_message_reports_translation_progress_after_throttle
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
@@ -1702,7 +1712,9 @@ async def test_process_video_message_skips_srt_when_timestamps_are_unavailable(
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
@@ -1743,7 +1755,9 @@ async def test_process_video_message_continues_when_status_edit_hits_retry_after
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
@@ -1785,7 +1799,9 @@ async def test_process_media_message_accepts_voice_note(
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(bot_module, "extract_audio", fake_extract_audio)
@@ -1836,7 +1852,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     ]
 
 
-def install_dedup_pipeline_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+def install_privacy_pipeline_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run_inline(func: object, /, *args: object, **kwargs: object) -> object:
         return func(*args, **kwargs)
 
@@ -1844,7 +1860,9 @@ def install_dedup_pipeline_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
         audio_path.write_bytes(b"audio")
         return audio_path
 
-    def fake_split_audio_to_timed_chunks(audio_path: Path, chunks_dir: Path) -> list[AudioChunk]:
+    def fake_split_audio_to_timed_chunks(
+        audio_path: Path, chunks_dir: Path, *, time_scale: float = 1.0
+    ) -> list[AudioChunk]:
         return [AudioChunk(path=audio_path)]
 
     monkeypatch.setattr(asyncio, "to_thread", run_inline)
@@ -1852,130 +1870,41 @@ def install_dedup_pipeline_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(bot_module, "split_audio_to_timed_chunks", fake_split_audio_to_timed_chunks)
 
 
-class DedupFakeTranscriber:
+class PrivacyFakeTranscriber:
     async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
         return TranscriptionResult(raw_transcript="hello transcript")
 
 
-def make_dedup_attachment(file_name: str | None) -> object:
-    return SimpleNamespace(file_name=file_name, file_size=5, mime_type="video/mp4")
-
-
-async def run_dedup_pipeline(
-    registry: object,
-    *,
-    file_name: str | None,
-    media_bytes: bytes,
-    from_user: SimpleNamespace | None,
-) -> FakeMessage:
-    message = FakeMessage(from_user=from_user)
-    status_ref: dict[str, object] = {"message": None}
-    settings = Settings(telegram_bot_token="token", openrouter_api_key="key")
-    context = SimpleNamespace(
-        bot_data={
-            "transcriber": DedupFakeTranscriber(),
-            "media_downloader": FakeMediaDownloader(media_bytes),
-            "video_registry": registry,
-        }
-    )
-    await process_media_message(
-        message, make_dedup_attachment(file_name), settings, context, status_ref, "job1234", 1.0
-    )
-    return message
-
-
 @pytest.mark.asyncio
-async def test_process_media_message_records_first_video_without_duplicate_notice(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    install_dedup_pipeline_fakes(monkeypatch)
-    registry = VideoRegistry(tmp_path / "videos.sqlite3")
-
-    message = await run_dedup_pipeline(
-        registry,
-        file_name="clip.mp4",
-        media_bytes=b"first-video",
-        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
-    )
-
-    assert not any("Duplicate detected" in reply for reply in message.text_replies)
-    match = registry.find_duplicate("clip.mp4", "irrelevant-hash")
-    assert match is not None
-    assert match.first_sender == "@alice"
-
-
-@pytest.mark.asyncio
-async def test_process_media_message_flags_duplicate_by_file_name(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    install_dedup_pipeline_fakes(monkeypatch)
-    registry = VideoRegistry(tmp_path / "videos.sqlite3")
-
-    await run_dedup_pipeline(
-        registry,
-        file_name="clip.mp4",
-        media_bytes=b"first-video",
-        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
-    )
-    second_message = await run_dedup_pipeline(
-        registry,
-        file_name="clip.mp4",
-        media_bytes=b"different-bytes",
-        from_user=SimpleNamespace(id=2, username="bob", full_name="Bob B"),
-    )
-
-    assert second_message.text_replies[-1] == (
-        "Duplicate detected: this video was first sent by @alice (matched by file name)."
-    )
-
-
-@pytest.mark.asyncio
-async def test_process_media_message_flags_duplicate_by_content_hash(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    install_dedup_pipeline_fakes(monkeypatch)
-    registry = VideoRegistry(tmp_path / "videos.sqlite3")
-
-    await run_dedup_pipeline(
-        registry,
-        file_name="clip.mp4",
-        media_bytes=b"same-video-bytes",
-        from_user=SimpleNamespace(id=1, username=None, full_name="Alice A"),
-    )
-    second_message = await run_dedup_pipeline(
-        registry,
-        file_name=None,
-        media_bytes=b"same-video-bytes",
-        from_user=SimpleNamespace(id=2, username="bob", full_name="Bob B"),
-    )
-
-    assert second_message.text_replies[-1] == (
-        "Duplicate detected: this video was first sent by Alice A (matched by content hash)."
-    )
-
-
-@pytest.mark.asyncio
-async def test_process_media_message_survives_registry_errors(
+async def test_process_media_message_does_not_read_or_write_legacy_registry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    install_dedup_pipeline_fakes(monkeypatch)
+    install_privacy_pipeline_fakes(monkeypatch)
 
     class BrokenRegistry:
         def find_duplicate(self, file_name: str | None, file_hash: str) -> None:
-            raise sqlite3.OperationalError("database is locked")
+            raise AssertionError("legacy registry must not be read")
 
         def record_video(self, **kwargs: object) -> int:
-            raise sqlite3.OperationalError("database is locked")
+            raise AssertionError("legacy registry must not be written")
 
-    message = await run_dedup_pipeline(
-        BrokenRegistry(),
-        file_name="clip.mp4",
-        media_bytes=b"first-video",
-        from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"),
+    attachment = SimpleNamespace(file_name="clip.mp4", file_size=5, mime_type="video/mp4")
+    message = FakeMessage(from_user=SimpleNamespace(id=1, username="alice", full_name="Alice A"))
+    context = SimpleNamespace(
+        bot_data={
+            "transcriber": PrivacyFakeTranscriber(),
+            "media_downloader": FakeMediaDownloader(b"first-video"),
+            "video_registry": BrokenRegistry(),
+        }
+    )
+    await process_media_message(
+        message,
+        attachment,
+        Settings(telegram_bot_token="token", openrouter_api_key="key"),
+        context,
+        {"message": None},
+        "job1234",
+        1.0,
     )
 
     assert "hello transcript" in message.text_replies
-    assert not any("Duplicate detected" in reply for reply in message.text_replies)

@@ -68,7 +68,14 @@ def test_split_audio_to_timed_chunks_returns_original_audio_when_under_420_secon
 
     chunks = ffmpeg.split_audio_to_timed_chunks(audio_path, tmp_path / "chunks")
 
-    assert chunks == [ffmpeg.AudioChunk(path=audio_path, duration_seconds=420)]
+    assert chunks == [
+        ffmpeg.AudioChunk(
+            path=audio_path,
+            duration_seconds=420,
+            owned_start_seconds=0.0,
+            owned_end_seconds=420,
+        )
+    ]
 
 
 def test_split_audio_to_timed_chunks_uses_silence_boundaries_and_overlap(
@@ -158,7 +165,14 @@ def test_prepare_audio_chunks_returns_single_audio_when_under_420_seconds(
 
     chunks = ffmpeg.prepare_audio_chunks(video_path, tmp_path)
 
-    assert chunks == [ffmpeg.AudioChunk(path=tmp_path / "audio.flac", duration_seconds=42)]
+    assert chunks == [
+        ffmpeg.AudioChunk(
+            path=tmp_path / "audio.flac",
+            duration_seconds=42,
+            owned_start_seconds=0.0,
+            owned_end_seconds=42,
+        )
+    ]
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")

@@ -42,6 +42,7 @@ class Settings:
     max_concurrent_jobs: int = 1
     runtime_state_path: Path = Path("data/runtime-settings.json")
     video_registry_path: Path = Path("data/videos.sqlite3")
+    scoped_state_path: Path = Path("data/bot-state.sqlite3")
 
     @property
     def max_video_bytes(self) -> int:
@@ -60,11 +61,9 @@ def load_settings(
     telegram_bot_token = require_value(source, "TELEGRAM_BOT_TOKEN")
     telegram_api_id = parse_positive_int(require_value(source, "TELEGRAM_API_ID"), "TELEGRAM_API_ID", 0)
     telegram_api_hash = require_value(source, "TELEGRAM_API_HASH")
-    refine = parse_bool(source.get("REFINE"), "REFINE", False)
+    refine = parse_bool(source.get("REFINE"), "REFINE", True)
 
     deepgram_api_key = source.get("DEEPGRAM_API_KEY", "").strip()
-    if not deepgram_api_key:
-        raise ConfigError("DEEPGRAM_API_KEY is required.")
     deepgram_model = (
         source.get("DEEPGRAM_TRANSCRIBE_MODEL", DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL).strip()
         or DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL
@@ -75,7 +74,7 @@ def load_settings(
         raise ConfigError("DEEPGRAM_KEYTERMS supports at most 100 unique terms.")
 
     openrouter_api_key = require_value(source, "OPENROUTER_API_KEY")
-    openai_api_key = require_value(source, "OPENAI_API_KEY")
+    openai_api_key = source.get("OPENAI_API_KEY", "").strip()
     refine_model = (
         source.get("OPENROUTER_REFINE_MODEL", DEFAULT_REFINEMENT_MODEL).strip()
         or DEFAULT_REFINEMENT_MODEL
@@ -120,6 +119,10 @@ def load_settings(
         video_registry_path=Path(
             source.get("VIDEO_REGISTRY_PATH", "data/videos.sqlite3").strip()
             or "data/videos.sqlite3"
+        ).expanduser(),
+        scoped_state_path=Path(
+            source.get("SCOPED_STATE_PATH", "data/bot-state.sqlite3").strip()
+            or "data/bot-state.sqlite3"
         ).expanduser(),
     )
 

@@ -9,6 +9,9 @@ class AudioChunk:
     path: Path
     start_seconds: float = 0.0
     duration_seconds: float | None = None
+    time_scale: float = 1.0
+    owned_start_seconds: float | None = None
+    owned_end_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -22,6 +25,14 @@ class TranscriptWord:
         return TranscriptWord(
             start_seconds=self.start_seconds + offset_seconds,
             end_seconds=self.end_seconds + offset_seconds,
+            text=self.text,
+            confidence=self.confidence,
+        )
+
+    def scaled(self, factor: float) -> TranscriptWord:
+        return TranscriptWord(
+            start_seconds=self.start_seconds * factor,
+            end_seconds=self.end_seconds * factor,
             text=self.text,
             confidence=self.confidence,
         )
@@ -40,6 +51,13 @@ class SubtitleCue:
             text=self.text,
         )
 
+    def scaled(self, factor: float) -> SubtitleCue:
+        return SubtitleCue(
+            start_seconds=self.start_seconds * factor,
+            end_seconds=self.end_seconds * factor,
+            text=self.text,
+        )
+
 
 @dataclass(frozen=True)
 class FileTranscriptionResult:
@@ -52,6 +70,8 @@ class FileTranscriptionResult:
 class TranscriptionResult:
     raw_transcript: str
     refined_transcript: str | None = None
+    cleaned_transcript: str | None = None
+    persian_transcript: str | None = None
     subtitle_cues: tuple[SubtitleCue, ...] = ()
     translated_srt: str | None = None
     line_translated_transcript: str | None = None
@@ -60,4 +80,14 @@ class TranscriptionResult:
 
     @property
     def final_transcript(self) -> str:
-        return self.refined_transcript if self.refined_transcript is not None else self.raw_transcript
+        """Return the authoritative, audio-grounded transcript.
+
+        ``refined_transcript`` remains available as a compatibility alias for
+        callers that need the derived reading version, but it is never the
+        source of truth.
+        """
+        return self.raw_transcript
+
+    @property
+    def reading_transcript(self) -> str:
+        return self.cleaned_transcript or self.refined_transcript or self.raw_transcript

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import sqlite3
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
 
@@ -19,13 +20,13 @@ from telegram_transcript.config import ConfigError, Settings, load_settings, par
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
 from telegram_transcript.runtime_state import RuntimePreferences, RuntimePreferencesStore, RuntimeStateError
+from telegram_transcript.scoped_state import ScopedStateStore
 from telegram_transcript.telegram_utils import (
     format_transcript_for_delivery,
     should_send_as_text,
     split_text_for_telegram,
 )
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
-from telegram_transcript.video_registry import DuplicateMatch, VideoRegistry, compute_file_sha256
 from telegram_transcript.transcriber import (
     CLAUDE_SONNET_TRANSLATION_MODEL,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
@@ -72,6 +73,8 @@ DEFAULT_OUTPUT_BASENAME = "transcript"
 DEFAULT_TRANSCRIPTION_MODEL_KEY = "gemini"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 HELP_MESSAGE_DELETE_DELAY_SECONDS = 20.0
+MINIMUM_TEMPORARY_FREE_BYTES = 512 * 1024 * 1024
+TEMPORARY_SPACE_MULTIPLIER = 3
 HELP_MESSAGE = """Available commands:
 /help - Show this help message (deleted after 20 seconds).
 /start - Start the bot (currently no additional setup is required).
@@ -81,6 +84,8 @@ HELP_MESSAGE = """Available commands:
 /translate - Toggle Persian translation for future media.
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
+/privacy - Show data handling and retention information.
+/forget - Delete your scope's retained preferences and job metadata.
 
 Send a video, audio file, or voice note to create a transcript."""
 
@@ -105,6 +110,19 @@ class TranscriptionRefinementModelOption:
     key: str
     model: str
     label: str
+
+
+@dataclass(frozen=True)
+class QueuedMediaJob:
+    message: Message
+    attachment: Video | Audio | Voice | Document
+    settings: Settings
+    context: ContextTypes.DEFAULT_TYPE
+    status_ref: dict[str, Message | None]
+    job_id: str
+    audio_tempo: float
+    transcriber: SpeechTranscriber
+    translation_enabled: bool
 
 
 TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
@@ -244,9 +262,14 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["translation_model"] = runtime_preferences.translation_model
     app.bot_data["translation_prompt"] = translation_prompt
     app.bot_data["runtime_preferences_store"] = runtime_store
-    app.bot_data["job_semaphore"] = asyncio.Semaphore(settings.max_concurrent_jobs)
+    app.bot_data["media_job_queue"] = asyncio.Queue(
+        maxsize=max(10, settings.max_concurrent_jobs * 10)
+    )
     app.bot_data["audio_tempo"] = runtime_preferences.audio_tempo
-    app.bot_data["video_registry"] = VideoRegistry(settings.video_registry_path)
+    app.bot_data["scoped_state_store"] = ScopedStateStore(
+        settings.scoped_state_path,
+        defaults=runtime_preferences,
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -256,7 +279,9 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("translate", handle_translation_toggle_command))
     app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
     app.add_handler(CommandHandler("translation", handle_translation_prompt_command))
-    app.add_handler(MessageHandler(media_message_filter(), handle_media_upload))
+    app.add_handler(CommandHandler("privacy", handle_privacy_command))
+    app.add_handler(CommandHandler("forget", handle_forget_command))
+    app.add_handler(MessageHandler(media_message_filter(), handle_media_upload, block=False))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_non_media))
     return app
 
@@ -269,10 +294,21 @@ def create_transcriber(
     transcription_refinement_model: str | None = None,
     translation_enabled: bool | None = None,
 ) -> SpeechTranscriber:
+    if not settings.openrouter_api_key:
+        raise ConfigError(
+            "OPENROUTER_API_KEY is required for Iraqi Arabic cleaning and Persian translation."
+        )
     model_order = get_transcription_model_order(model_key)
+    configured_model_order = tuple(
+        ordered_model_key
+        for ordered_model_key in model_order
+        if is_model_option_configured(TRANSCRIPTION_MODEL_OPTIONS[ordered_model_key], settings)
+    )
+    if not configured_model_order:
+        raise ConfigError("At least one transcription provider must be configured.")
     speech_to_text_providers = [
         create_speech_to_text_provider(settings, ordered_model_key)
-        for ordered_model_key in model_order
+        for ordered_model_key in configured_model_order
     ]
     canonical_prompt = canonicalize_translation_prompt_key(translation_prompt)
     effective_translation_enabled = settings.refine if translation_enabled is None else translation_enabled
@@ -383,15 +419,81 @@ async def start_media_downloader(application: Application) -> None:
     downloader = TelegramMediaDownloader(settings)
     await downloader.start()
     application.bot_data["media_downloader"] = downloader
+    scoped_store = application.bot_data.get("scoped_state_store")
+    if isinstance(scoped_store, ScopedStateStore):
+        interrupted = await asyncio.to_thread(scoped_store.fail_incomplete_jobs)
+        await asyncio.to_thread(scoped_store.purge_expired_jobs)
+        if interrupted:
+            logger.warning("marked %d interrupted jobs as failed during startup", interrupted)
+    queue = application.bot_data.get("media_job_queue")
+    if isinstance(queue, asyncio.Queue):
+        application.bot_data["media_job_workers"] = [
+            asyncio.create_task(media_job_worker(application, worker_index), name=f"media-job-{worker_index}")
+            for worker_index in range(settings.max_concurrent_jobs)
+        ]
 
 
 async def stop_media_downloader(application: Application) -> None:
+    workers = application.bot_data.get("media_job_workers", [])
+    for worker in workers:
+        worker.cancel()
+    if workers:
+        await asyncio.gather(*workers, return_exceptions=True)
     downloader = application.bot_data.get("media_downloader")
     if isinstance(downloader, TelegramMediaDownloader):
         await downloader.close()
-    registry = application.bot_data.get("video_registry")
-    if isinstance(registry, VideoRegistry):
-        registry.close()
+    scoped_store = application.bot_data.get("scoped_state_store")
+    if isinstance(scoped_store, ScopedStateStore):
+        await asyncio.to_thread(scoped_store.fail_incomplete_jobs)
+        scoped_store.close()
+
+
+async def media_job_worker(application: Application, worker_index: int) -> None:
+    queue = application.bot_data["media_job_queue"]
+    scoped_store = application.bot_data.get("scoped_state_store")
+    while True:
+        job: QueuedMediaJob = await queue.get()
+        try:
+            logger.info("job %s started by worker %d", job.job_id, worker_index)
+            if isinstance(scoped_store, ScopedStateStore):
+                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "running")
+            await process_media_message(
+                job.message,
+                job.attachment,
+                job.settings,
+                job.context,
+                job.status_ref,
+                job.job_id,
+                job.audio_tempo,
+                transcriber_override=job.transcriber,
+                translation_enabled_override=job.translation_enabled,
+            )
+            if isinstance(scoped_store, ScopedStateStore):
+                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "completed")
+        except asyncio.CancelledError:
+            if isinstance(scoped_store, ScopedStateStore):
+                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
+            raise
+        except (FfmpegError, TelegramDownloadError, TranscriptionError) as exc:
+            logger.exception("job %s media transcription failed", job.job_id)
+            status = job.status_ref["message"]
+            if status is not None:
+                await edit_status_message(status, f"Transcription failed: {exc}", job_id=job.job_id)
+            if isinstance(scoped_store, ScopedStateStore):
+                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
+        except Exception:
+            logger.exception("job %s unexpected media transcription failure", job.job_id)
+            status = job.status_ref["message"]
+            if status is not None:
+                await edit_status_message(
+                    status,
+                    "Transcription failed because of an unexpected error.",
+                    job_id=job.job_id,
+                )
+            if isinstance(scoped_store, ScopedStateStore):
+                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
+        finally:
+            queue.task_done()
 
 
 def media_message_filter() -> filters.BaseFilter:
@@ -435,6 +537,36 @@ async def handle_non_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await handle_non_media(update, context)
 
 
+async def handle_privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+    await reply_to_source(
+        message,
+        "Media is processed temporarily and sent to configured transcription and translation providers. "
+        "The bot does not retain media, transcripts, or sender names after delivery. Scoped job metadata "
+        "and hashed Telegram file identifiers are retained for seven days for idempotency. Use /forget "
+        "to delete your scope metadata sooner.",
+    )
+
+
+async def handle_forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+    user_id = get_update_user_id(update)
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can delete group metadata.")
+        return
+    store = context.bot_data.get("scoped_state_store")
+    if not isinstance(store, ScopedStateStore):
+        await reply_to_source(message, "Scoped metadata storage is unavailable.")
+        return
+    scope_key = get_preference_scope(message, user_id)
+    await asyncio.to_thread(store.delete_scope, scope_key)
+    await reply_to_source(message, "Your scoped preferences and retained job metadata were deleted.")
+
+
 async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None or get_chat_type(message) not in GROUP_CHAT_TYPES:
@@ -443,13 +575,17 @@ async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYP
     audio_tempo = parse_tempo_command_args(getattr(context, "args", None))
     if audio_tempo is None:
         return
+    user_id = get_update_user_id(update)
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
 
     try:
-        persist_runtime_preferences(context, audio_tempo=audio_tempo)
+        preferences = get_scoped_preferences(context, message, user_id)
+        save_scoped_preferences(context, message, user_id, replace(preferences, audio_tempo=audio_tempo))
     except RuntimeStateError as exc:
         await reply_to_source(message, str(exc))
         return
-    context.bot_data["audio_tempo"] = audio_tempo
     await reply_to_source(message, f"Tempo set to {audio_tempo:g}x.")
 
 
@@ -459,14 +595,15 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
+    preferences = get_scoped_preferences(context, message, user_id)
 
     args = getattr(context, "args", None)
     if not isinstance(args, list) or not args:
-        await reply_to_source(message, format_model_settings_message(context, settings))
+        await reply_to_source(message, format_model_preferences_message(preferences, settings))
         return
     if len(args) != 1:
         await reply_to_source(message, format_unknown_model_message())
@@ -476,24 +613,39 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if model_key is None:
         await reply_to_source(message, format_unknown_model_message())
         return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
+
+    selected_option = TRANSCRIPTION_MODEL_OPTIONS[model_key]
+    if not is_model_option_configured(selected_option, settings):
+        await reply_to_source(message, missing_model_credential_message(selected_option))
+        return
 
     try:
-        transcriber = create_runtime_transcriber(
-            context,
+        replacement_transcriber = create_transcriber(
             settings,
-            model_key=model_key,
+            model_key,
+            translation_enabled=preferences.translation_enabled,
+            transcription_refinement_model=preferences.transcription_refinement_model,
+            translation_model=preferences.translation_model,
+            translation_prompt=preferences.translation_prompt,
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
         return
 
     try:
-        persist_runtime_preferences(context, transcription_model=model_key)
+        save_scoped_preferences(
+            context,
+            message,
+            user_id,
+            replace(preferences, transcription_model=model_key),
+        )
+        activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except RuntimeStateError as exc:
         await reply_to_source(message, str(exc))
         return
-    context.bot_data["transcriber"] = transcriber
-    context.bot_data["transcription_model"] = model_key
     await reply_to_source(message, f"Primary transcription model set to {TRANSCRIPTION_MODEL_OPTIONS[model_key].label}.")
 
 
@@ -506,14 +658,18 @@ async def handle_transcription_refinement_model_command(
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
+    preferences = get_scoped_preferences(context, message, user_id)
 
     args = getattr(context, "args", None)
     if not isinstance(args, list) or not args:
-        await reply_to_source(message, format_transcription_refinement_model_settings_message(context, settings))
+        await reply_to_source(
+            message,
+            format_transcription_refinement_preferences_message(preferences),
+        )
         return
     if len(args) != 1:
         await reply_to_source(message, format_unknown_transcription_refinement_model_message())
@@ -523,22 +679,29 @@ async def handle_transcription_refinement_model_command(
     if refinement_model is None:
         await reply_to_source(message, format_unknown_transcription_refinement_model_message())
         return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
     try:
-        transcriber = create_runtime_transcriber(
-            context,
+        replacement_transcriber = create_transcriber(
             settings,
+            preferences.transcription_model,
+            translation_enabled=preferences.translation_enabled,
             transcription_refinement_model=refinement_model,
+            translation_model=preferences.translation_model,
+            translation_prompt=preferences.translation_prompt,
         )
-        persist_runtime_preferences(
+        save_scoped_preferences(
             context,
-            transcription_refinement_model=refinement_model,
+            message,
+            user_id,
+            replace(preferences, transcription_refinement_model=refinement_model),
         )
+        activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except (ConfigError, RuntimeStateError) as exc:
         await reply_to_source(message, str(exc))
         return
 
-    context.bot_data["transcriber"] = transcriber
-    context.bot_data["transcription_refinement_model"] = refinement_model
     option = next(
         option
         for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
@@ -553,30 +716,41 @@ async def handle_translation_toggle_command(update: Update, context: ContextType
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
+    preferences = get_scoped_preferences(context, message, user_id)
 
     args = getattr(context, "args", None)
     if not isinstance(args, list) or args:
         await reply_to_source(message, "Usage: /translate")
         return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
 
-    translation_enabled = not get_runtime_translation_enabled(context, settings)
+    translation_enabled = not preferences.translation_enabled
     try:
-        transcriber = create_runtime_transcriber(
-            context,
+        replacement_transcriber = create_transcriber(
             settings,
+            preferences.transcription_model,
             translation_enabled=translation_enabled,
+            transcription_refinement_model=preferences.transcription_refinement_model,
+            translation_model=preferences.translation_model,
+            translation_prompt=preferences.translation_prompt,
         )
-        persist_runtime_preferences(context, translation_enabled=translation_enabled)
+        save_scoped_preferences(
+            context,
+            message,
+            user_id,
+            replace(preferences, translation_enabled=translation_enabled),
+        )
+        activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except (ConfigError, RuntimeStateError) as exc:
         await reply_to_source(message, str(exc))
         return
 
-    context.bot_data["transcriber"] = transcriber
-    context.bot_data["translation_enabled"] = translation_enabled
     state = "enabled" if translation_enabled else "disabled"
     await reply_to_source(message, f"Translation {state}.")
 
@@ -587,14 +761,15 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
+    preferences = get_scoped_preferences(context, message, user_id)
 
     args = getattr(context, "args", None)
     if not isinstance(args, list) or not args:
-        await reply_to_source(message, format_translation_model_settings_message(context, settings))
+        await reply_to_source(message, format_translation_preferences_message(preferences))
         return
     if len(args) != 1:
         await reply_to_source(message, format_unknown_translation_model_message())
@@ -604,25 +779,35 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
     if model_key is None:
         await reply_to_source(message, format_unknown_translation_model_message())
         return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
 
     option = TRANSLATION_MODEL_OPTIONS[model_key]
     try:
-        transcriber = create_runtime_transcriber(
-            context,
+        replacement_transcriber = create_transcriber(
             settings,
+            preferences.transcription_model,
+            translation_enabled=preferences.translation_enabled,
+            transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=option.model,
+            translation_prompt=preferences.translation_prompt,
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
         return
 
     try:
-        persist_runtime_preferences(context, translation_model=option.model)
+        save_scoped_preferences(
+            context,
+            message,
+            user_id,
+            replace(preferences, translation_model=option.model),
+        )
+        activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except RuntimeStateError as exc:
         await reply_to_source(message, str(exc))
         return
-    context.bot_data["transcriber"] = transcriber
-    context.bot_data["translation_model"] = option.model
     await reply_to_source(message, f"Translation model set to {option.label}.")
 
 
@@ -632,14 +817,15 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
+    preferences = get_scoped_preferences(context, message, user_id)
 
     args = getattr(context, "args", None)
     if not isinstance(args, list) or not args:
-        await reply_to_source(message, format_translation_prompt_settings_message(context))
+        await reply_to_source(message, format_translation_prompt_preferences_message(preferences))
         return
     if len(args) != 1:
         await reply_to_source(message, format_unknown_translation_prompt_message())
@@ -649,19 +835,29 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
     if prompt_key is None:
         await reply_to_source(message, format_unknown_translation_prompt_message())
         return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
     try:
-        transcriber = create_runtime_transcriber(
-            context,
+        replacement_transcriber = create_transcriber(
             settings,
+            preferences.transcription_model,
+            translation_enabled=preferences.translation_enabled,
+            transcription_refinement_model=preferences.transcription_refinement_model,
+            translation_model=preferences.translation_model,
             translation_prompt=prompt_key,
         )
-        persist_runtime_preferences(context, translation_prompt=prompt_key)
+        save_scoped_preferences(
+            context,
+            message,
+            user_id,
+            replace(preferences, translation_prompt=prompt_key),
+        )
+        activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except (ConfigError, RuntimeStateError) as exc:
         await reply_to_source(message, str(exc))
         return
 
-    context.bot_data["transcriber"] = transcriber
-    context.bot_data["translation_prompt"] = prompt_key
     await reply_to_source(message, f"Translation prompt set to {prompt_key}.")
 
 
@@ -673,7 +869,7 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     settings: Settings = context.bot_data["settings"]
-    user_id = update.effective_user.id if update.effective_user else None
+    user_id = get_update_user_id(update)
     if not is_authorized(settings, user_id):
         await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
         return
@@ -686,12 +882,42 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     if file_size is not None and file_size > settings.max_video_bytes:
         return
 
-    audio_tempo = get_runtime_audio_tempo(context, settings)
-    provider_name, model_name = get_runtime_transcriber_info(context, settings)
-    transcription_refinement_model = get_runtime_transcription_refinement_model(context, settings)
-    translation_enabled = get_runtime_translation_enabled(context, settings)
-    translation_model = get_runtime_translation_model(context, settings)
+    preferences = get_scoped_preferences(context, message, user_id)
+    audio_tempo = preferences.audio_tempo
+    try:
+        transcriber = create_transcriber(
+            settings,
+            preferences.transcription_model,
+            translation_enabled=preferences.translation_enabled,
+            transcription_refinement_model=preferences.transcription_refinement_model,
+            translation_model=preferences.translation_model,
+            translation_prompt=preferences.translation_prompt,
+        )
+    except ConfigError as exc:
+        await reply_to_source(message, f"Transcription configuration is unavailable: {exc}")
+        return
+    provider_name, model_name = transcriber.provider_name, transcriber.model
+    transcription_refinement_model = preferences.transcription_refinement_model
+    translation_enabled = preferences.translation_enabled
+    translation_model = preferences.translation_model
     job_id = uuid.uuid4().hex[:8]
+    scoped_store = context.bot_data.get("scoped_state_store")
+    if isinstance(scoped_store, ScopedStateStore):
+        chat_id = get_message_chat_id(message)
+        message_id = getattr(message, "message_id", None)
+        if chat_id is not None and isinstance(message_id, int):
+            inserted = await asyncio.to_thread(
+                scoped_store.record_job,
+                job_id=job_id,
+                scope_key=get_preference_scope(message, user_id),
+                chat_id=chat_id,
+                message_id=message_id,
+                file_unique_id=getattr(attachment, "file_unique_id", None),
+            )
+            if not inserted:
+                await reply_to_source(message, "This Telegram message is already queued or was processed recently.")
+                return
+            await asyncio.to_thread(scoped_store.purge_expired_jobs)
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s transcription_refinement_model=%s translation_enabled=%s translation_model=%s",
         job_id,
@@ -705,22 +931,35 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         translation_model,
     )
 
-    semaphore: asyncio.Semaphore = context.bot_data["job_semaphore"]
-    status_ref: dict[str, Message | None] = {"message": None}
-    async with semaphore:
-        try:
-            logger.info("job %s started", job_id)
-            await process_media_message(message, attachment, settings, context, status_ref, job_id, audio_tempo)
-        except (FfmpegError, TelegramDownloadError, TranscriptionError) as exc:
-            logger.exception("job %s media transcription failed", job_id)
-            status = status_ref["message"]
-            if status is not None:
-                await edit_status_message(status, f"Transcription failed: {exc}", job_id=job_id)
-        except Exception:
-            logger.exception("job %s unexpected media transcription failure", job_id)
-            status = status_ref["message"]
-            if status is not None:
-                await edit_status_message(status, "Transcription failed because of an unexpected error.", job_id=job_id)
+    status = await reply_to_source(
+        message,
+        f"{get_media_kind_label(message, attachment)} queued for transcription...",
+    )
+    status_ref: dict[str, Message | None] = {"message": status}
+    queue = context.bot_data.get("media_job_queue")
+    if not isinstance(queue, asyncio.Queue):
+        raise RuntimeError("Media job queue is not initialized.")
+    job = QueuedMediaJob(
+        message=message,
+        attachment=attachment,
+        settings=settings,
+        context=context,
+        status_ref=status_ref,
+        job_id=job_id,
+        audio_tempo=audio_tempo,
+        transcriber=transcriber,
+        translation_enabled=translation_enabled,
+    )
+    try:
+        queue.put_nowait(job)
+    except asyncio.QueueFull:
+        if isinstance(scoped_store, ScopedStateStore):
+            await asyncio.to_thread(scoped_store.set_job_status, job_id, "failed")
+        await edit_status_message(
+            status,
+            "The transcription queue is temporarily full. Please resend this media later.",
+            job_id=job_id,
+        )
 
 
 async def handle_video_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -735,12 +974,17 @@ async def process_media_message(
     status_ref: dict[str, Message | None],
     job_id: str,
     audio_tempo: float,
+    *,
+    transcriber_override: SpeechTranscriber | None = None,
+    translation_enabled_override: bool | None = None,
 ) -> None:
-    transcriber: SpeechTranscriber = context.bot_data["transcriber"]
-    translation_enabled = get_runtime_translation_enabled(context, settings)
+    transcriber: SpeechTranscriber = transcriber_override or context.bot_data["transcriber"]
+    translation_enabled = (
+        get_runtime_translation_enabled(context, settings)
+        if translation_enabled_override is None
+        else translation_enabled_override
+    )
     base_name = get_media_attachment_basename(attachment)
-    video_registry = context.bot_data.get("video_registry")
-    incoming_file_name = getattr(attachment, "file_name", None)
     job_started = time.monotonic()
     total_steps = 7 if translation_enabled else 6
     sending_step = 7 if translation_enabled else 6
@@ -750,11 +994,15 @@ async def process_media_message(
         source_path = work_dir / f"source{get_media_attachment_suffix(attachment)}"
         audio_path = work_dir / "audio.flac"
 
-        status = await reply_to_source(
-            message,
-            f"{get_media_kind_label(message, attachment)} received. Starting transcription...",
-        )
+        status = status_ref.get("message")
+        if status is None:
+            status = await reply_to_source(
+                message,
+                f"{get_media_kind_label(message, attachment)} received. Starting transcription...",
+            )
         status_ref["message"] = status
+
+        ensure_temporary_space(get_attachment_file_size(attachment))
 
         step_started = time.monotonic()
         await edit_status_message(status, f"Step 1/{total_steps}: downloading media...", job_id=job_id)
@@ -783,17 +1031,7 @@ async def process_media_message(
             )
             await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
             return
-
-        file_hash = await asyncio.to_thread(compute_file_sha256, source_path)
-        duplicate = await find_duplicate_media(video_registry, incoming_file_name, file_hash, job_id=job_id)
-        logger.info(
-            "job %s duplicate check: file_name=%r file_hash=%s matched_by=%s first_sender=%s",
-            job_id,
-            incoming_file_name,
-            file_hash,
-            duplicate.matched_by if duplicate else None,
-            duplicate.first_sender if duplicate else None,
-        )
+        ensure_temporary_space(source_bytes)
 
         await edit_status_message(
             status,
@@ -835,6 +1073,7 @@ async def process_media_message(
             split_audio_to_timed_chunks,
             audio_path,
             work_dir / "chunks",
+            time_scale=audio_tempo,
         )
         chunk_sizes = [chunk.path.stat().st_size for chunk in chunks]
         logger.info(
@@ -985,13 +1224,22 @@ async def process_media_message(
             await transcriber.transcribe_chunks_async(chunks, progress_callback=report_progress)
         )
 
-    final_transcript = transcription_result.final_transcript.strip() or "No speech was detected."
+    raw_transcript = transcription_result.raw_transcript.strip() or "No speech was detected."
+    cleaned_transcript = (
+        transcription_result.cleaned_transcript or transcription_result.refined_transcript or ""
+    ).strip()
+    final_transcript = raw_transcript
     translated_srt = (
         transcription_result.translated_srt.strip() if transcription_result.translated_srt is not None else None
     )
     line_translated_transcript = (
         transcription_result.line_translated_transcript.strip()
         if transcription_result.line_translated_transcript is not None
+        else None
+    )
+    persian_transcript = (
+        transcription_result.persian_transcript.strip()
+        if transcription_result.persian_transcript is not None
         else None
     )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
@@ -1017,14 +1265,21 @@ async def process_media_message(
         filename=f"{base_name}.transcription.txt",
         caption="Transcription",
     )
-    if srt:
-        await send_srt(message, srt, filename=f"{base_name}.srt")
-    if line_translated_transcript:
+    if cleaned_transcript and cleaned_transcript != raw_transcript:
         await send_transcript(
             message,
-            line_translated_transcript,
-            filename=f"{base_name}.translation.txt",
-            caption="Line-by-line translation",
+            cleaned_transcript,
+            filename=f"{base_name}.iraqi-clean.txt",
+            caption="Cleaned Iraqi reading version",
+        )
+    if srt:
+        await send_srt(message, srt, filename=f"{base_name}.srt")
+    if persian_transcript:
+        await send_transcript(
+            message,
+            persian_transcript,
+            filename=f"{base_name}.fa.txt",
+            caption="Persian translation",
         )
     if transcription_result.warnings:
         await edit_status_message(
@@ -1036,19 +1291,6 @@ async def process_media_message(
         await edit_status_message(status, "Transcript ready.", job_id=job_id)
     else:
         await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
-    if duplicate is not None:
-        await reply_to_source(message, duplicate_notice(duplicate))
-    # Record after the duplicate lookup so a video never matches itself and the
-    # earliest row always identifies the first sender.
-    await record_processed_media(
-        video_registry,
-        job_id=job_id,
-        file_hash=file_hash,
-        file_name=incoming_file_name,
-        sender_id=getattr(getattr(message, "from_user", None), "id", None),
-        sender_username=get_sender_display_name(message),
-        transcript=final_transcript,
-    )
     logger.info(
         "job %s completed: duration_ms=%d final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
@@ -1181,6 +1423,108 @@ def parse_tempo_command_args(args: object) -> float | None:
         return None
 
 
+def get_update_user_id(update: Update) -> int | None:
+    user = getattr(update, "effective_user", None)
+    user_id = getattr(user, "id", None)
+    return user_id if isinstance(user_id, int) else None
+
+
+def get_preference_scope(message: Message, user_id: int | None) -> str:
+    chat_type = get_chat_type(message)
+    chat_id = get_message_chat_id(message)
+    if chat_type in GROUP_CHAT_TYPES and chat_id is not None:
+        return f"chat:{chat_id}"
+    if user_id is not None:
+        return f"user:{user_id}"
+    if chat_id is not None:
+        return f"chat:{chat_id}"
+    raise RuntimeStateError("Unable to determine a preference scope for this message.")
+
+
+def get_scoped_preferences(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    user_id: int | None,
+) -> RuntimePreferences:
+    store = context.bot_data.get("scoped_state_store")
+    if isinstance(store, ScopedStateStore):
+        return store.load_preferences(get_preference_scope(message, user_id))
+    settings: Settings = context.bot_data["settings"]
+    return RuntimePreferences(
+        audio_tempo=get_runtime_audio_tempo(context, settings),
+        transcription_model=get_runtime_model_key(context),
+        transcription_refinement_model=get_runtime_transcription_refinement_model(context, settings),
+        translation_enabled=get_runtime_translation_enabled(context, settings),
+        translation_model=get_runtime_translation_model(context, settings),
+        translation_prompt=get_runtime_translation_prompt(context),
+    )
+
+
+def save_scoped_preferences(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    user_id: int | None,
+    preferences: RuntimePreferences,
+) -> None:
+    store = context.bot_data.get("scoped_state_store")
+    if isinstance(store, ScopedStateStore):
+        try:
+            store.save_preferences(get_preference_scope(message, user_id), preferences)
+        except (OSError, sqlite3.Error) as exc:
+            raise RuntimeStateError(f"Unable to save scoped settings: {exc}") from exc
+        return
+    persist_runtime_preferences(
+        context,
+        audio_tempo=preferences.audio_tempo,
+        transcription_model=preferences.transcription_model,
+        transcription_refinement_model=preferences.transcription_refinement_model,
+        translation_enabled=preferences.translation_enabled,
+        translation_model=preferences.translation_model,
+        translation_prompt=preferences.translation_prompt,
+    )
+    context.bot_data.update(
+        {
+            "audio_tempo": preferences.audio_tempo,
+            "transcription_model": preferences.transcription_model,
+            "transcription_refinement_model": preferences.transcription_refinement_model,
+            "translation_enabled": preferences.translation_enabled,
+            "translation_model": preferences.translation_model,
+            "translation_prompt": preferences.translation_prompt,
+        }
+    )
+
+
+def activate_legacy_runtime_transcriber(
+    context: ContextTypes.DEFAULT_TYPE,
+    transcriber: SpeechTranscriber,
+) -> None:
+    if not isinstance(context.bot_data.get("scoped_state_store"), ScopedStateStore):
+        context.bot_data["transcriber"] = transcriber
+
+
+async def can_change_scope_preferences(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    user_id: int | None,
+) -> bool:
+    if get_chat_type(message) not in GROUP_CHAT_TYPES:
+        return True
+    if user_id is None:
+        return False
+    bot = getattr(context, "bot", None)
+    get_chat_member = getattr(bot, "get_chat_member", None)
+    chat_id = get_message_chat_id(message)
+    if not callable(get_chat_member) or chat_id is None:
+        return False
+    try:
+        member = await get_chat_member(chat_id, user_id)
+    except TelegramError:
+        logger.warning("Unable to verify group administrator for chat %s", chat_id)
+        return False
+    status = getattr(member, "status", None)
+    return status in {"administrator", "creator", "owner"}
+
+
 def get_runtime_audio_tempo(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> float:
     candidate = context.bot_data.get("audio_tempo", settings.audio_tempo)
     try:
@@ -1309,6 +1653,19 @@ def format_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: 
     return "\n".join(lines)
 
 
+def format_model_preferences_message(preferences: RuntimePreferences, settings: Settings) -> str:
+    lines = [
+        f"Current primary transcription model: {TRANSCRIPTION_MODEL_OPTIONS[preferences.transcription_model].label}",
+        "",
+        "Available models:",
+    ]
+    for option in TRANSCRIPTION_MODEL_OPTIONS.values():
+        availability = "available" if is_model_option_configured(option, settings) else "missing credentials"
+        lines.append(f"- {option.key}: {option.label} ({availability})")
+    lines.extend(("", "Use /model gemini, /model deepgram, /model whisper, or /model openai."))
+    return "\n".join(lines)
+
+
 def format_unknown_model_message() -> str:
     options = ", ".join(option.key for option in TRANSCRIPTION_MODEL_OPTIONS.values())
     return f"Unknown transcription model. Available models: {options}."
@@ -1332,6 +1689,21 @@ def format_transcription_refinement_model_settings_message(
         lines.append(f"- {option.key}: {option.label}")
     lines.append("")
     lines.append("Use /refiner gpt or /refiner gemini.")
+    return "\n".join(lines)
+
+
+def format_transcription_refinement_preferences_message(preferences: RuntimePreferences) -> str:
+    current_label = next(
+        (
+            option.label
+            for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
+            if option.model == preferences.transcription_refinement_model
+        ),
+        preferences.transcription_refinement_model,
+    )
+    lines = [f"Current transcription refinement model: {current_label}", "", "Available models:"]
+    lines.extend(f"- {option.key}: {option.label}" for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values())
+    lines.extend(("", "Use /refiner gpt or /refiner gemini."))
     return "\n".join(lines)
 
 
@@ -1359,6 +1731,22 @@ def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE
     return "\n".join(lines)
 
 
+def format_translation_preferences_message(preferences: RuntimePreferences) -> str:
+    current_label = next(
+        (option.label for option in TRANSLATION_MODEL_OPTIONS.values() if option.model == preferences.translation_model),
+        preferences.translation_model,
+    )
+    lines = [
+        f"Current translation model: {current_label}",
+        f"Translation: {'enabled' if preferences.translation_enabled else 'disabled'}",
+        "",
+        "Available models:",
+    ]
+    lines.extend(f"- {option.key}: {option.label}" for option in TRANSLATION_MODEL_OPTIONS.values())
+    lines.extend(("", "Use /tmodel gemini, /tmodel gpt, or /tmodel claude."))
+    return "\n".join(lines)
+
+
 def format_unknown_translation_model_message() -> str:
     options = ", ".join(option.key for option in TRANSLATION_MODEL_OPTIONS.values())
     return f"Unknown translation model. Available models: {options}."
@@ -1368,6 +1756,14 @@ def format_translation_prompt_settings_message(context: ContextTypes.DEFAULT_TYP
     current_prompt = get_runtime_translation_prompt(context)
     return (
         f"Current translation prompt: {current_prompt}\n\n"
+        "Available prompts:\n- natural\n- literal\n\n"
+        "Use /translation natural or /translation literal. Legacy aliases v2 and normal remain accepted."
+    )
+
+
+def format_translation_prompt_preferences_message(preferences: RuntimePreferences) -> str:
+    return (
+        f"Current translation prompt: {preferences.translation_prompt}\n\n"
         "Available prompts:\n- natural\n- literal\n\n"
         "Use /translation natural or /translation literal. Legacy aliases v2 and normal remain accepted."
     )
@@ -1385,6 +1781,16 @@ def is_model_option_configured(option: TranscriptionModelOption, settings: Setti
     if option.provider in {"gemini", "whisper"}:
         return bool(settings.openrouter_api_key)
     return False
+
+
+def missing_model_credential_message(option: TranscriptionModelOption) -> str:
+    if option.provider == "deepgram":
+        return "DEEPGRAM_API_KEY is required for Deepgram transcription."
+    if option.provider == "openai":
+        return "OPENAI_API_KEY is required for direct OpenAI transcription."
+    if option.provider == "whisper":
+        return "OPENROUTER_API_KEY is required for OpenRouter Whisper transcription."
+    return "OPENROUTER_API_KEY is required for OpenRouter transcription."
 
 
 def is_authorized(settings: Settings, user_id: int | None) -> bool:
@@ -1515,62 +1921,20 @@ def get_attachment_file_size(attachment: Video | Audio | Voice | Document) -> in
     return file_size if isinstance(file_size, int) else None
 
 
-def get_sender_display_name(message: Message) -> str:
-    user = getattr(message, "from_user", None)
-    username = getattr(user, "username", None)
-    if isinstance(username, str) and username.strip():
-        return f"@{username.strip()}"
-    full_name = getattr(user, "full_name", None)
-    if isinstance(full_name, str) and full_name.strip():
-        return full_name.strip()
-    user_id = getattr(user, "id", None)
-    return f"user {user_id}" if user_id is not None else "an unknown user"
-
-
-def duplicate_notice(match: DuplicateMatch) -> str:
-    matched_by = "file name" if match.matched_by == "file_name" else "content hash"
-    return f"Duplicate detected: this video was first sent by {match.first_sender} (matched by {matched_by})."
-
-
-async def find_duplicate_media(
-    registry: VideoRegistry | None,
-    file_name: str | None,
-    file_hash: str,
-    *,
-    job_id: str,
-) -> DuplicateMatch | None:
-    if registry is None:
-        return None
-    try:
-        return await asyncio.to_thread(registry.find_duplicate, file_name, file_hash)
-    except (sqlite3.Error, OSError) as exc:
-        logger.warning("job %s video registry duplicate lookup failed: %s", job_id, exc)
-        return None
-
-
-async def record_processed_media(
-    registry: VideoRegistry | None,
-    *,
-    job_id: str,
-    file_hash: str,
-    file_name: str | None,
-    sender_id: int | None,
-    sender_username: str,
-    transcript: str,
-) -> None:
-    if registry is None:
-        return
-    try:
-        await asyncio.to_thread(
-            registry.record_video,
-            file_hash=file_hash,
-            file_name=file_name,
-            sender_id=sender_id,
-            sender_username=sender_username,
-            transcript=transcript,
+def ensure_temporary_space(media_bytes: int | None) -> None:
+    """Reject work that cannot fit its source, extracted audio, and chunk copies."""
+    required_bytes = max(
+        MINIMUM_TEMPORARY_FREE_BYTES,
+        (media_bytes or 0) * TEMPORARY_SPACE_MULTIPLIER,
+    )
+    free_bytes = shutil.disk_usage(tempfile.gettempdir()).free
+    if free_bytes < required_bytes:
+        required_gib = required_bytes / (1024**3)
+        free_gib = free_bytes / (1024**3)
+        raise FfmpegError(
+            f"Insufficient temporary disk space: {free_gib:.1f} GiB free, "
+            f"at least {required_gib:.1f} GiB required."
         )
-    except (sqlite3.Error, OSError) as exc:
-        logger.warning("job %s video registry record failed: %s", job_id, exc)
 
 
 def elapsed_ms(started_at: float) -> int:

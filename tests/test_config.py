@@ -35,12 +35,13 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.openrouter_api_key == "openrouter-key"
     assert settings.openrouter_refine_model == "openai/gpt-5.5"
     assert settings.openrouter_transcription_refinement_model == "openai/gpt-5.5"
-    assert settings.refine is False
+    assert settings.refine is True
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
     assert settings.runtime_state_path.as_posix() == "data/runtime-settings.json"
     assert settings.video_registry_path.as_posix() == "data/videos.sqlite3"
+    assert settings.scoped_state_path.as_posix() == "data/bot-state.sqlite3"
 
 
 def test_load_settings_parses_optional_values() -> None:
@@ -125,30 +126,34 @@ def test_load_settings_rejects_invalid_telegram_api_id(api_id: str) -> None:
         load_settings({**BASE_ENV, "TELEGRAM_API_ID": api_id}, load_dotenv_file=False)
 
 
-def test_deepgram_provider_requires_deepgram_api_key() -> None:
-    with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY"):
-        load_settings(
-            {
-                "TELEGRAM_BOT_TOKEN": "telegram-token",
-                "TELEGRAM_API_ID": "12345",
-                "TELEGRAM_API_HASH": "telegram-api-hash",
-            },
-            load_dotenv_file=False,
-        )
+def test_deepgram_provider_is_optional() -> None:
+    settings = load_settings(
+        {
+            "TELEGRAM_BOT_TOKEN": "telegram-token",
+            "TELEGRAM_API_ID": "12345",
+            "TELEGRAM_API_HASH": "telegram-api-hash",
+            "OPENROUTER_API_KEY": "openrouter-key",
+        },
+        load_dotenv_file=False,
+    )
+
+    assert settings.deepgram_api_key == ""
 
 
 def test_legacy_provider_setting_does_not_replace_deepgram() -> None:
-    with pytest.raises(ConfigError, match="DEEPGRAM_API_KEY"):
-        load_settings(
-            {
-                "TELEGRAM_BOT_TOKEN": "telegram-token",
-                "TELEGRAM_API_ID": "12345",
-                "TELEGRAM_API_HASH": "telegram-api-hash",
-                "SPEECH_TO_TEXT_PROVIDER": "openai",
-                "OPENAI_API_KEY": "openai-key",
-            },
-            load_dotenv_file=False,
-        )
+    settings = load_settings(
+        {
+            "TELEGRAM_BOT_TOKEN": "telegram-token",
+            "TELEGRAM_API_ID": "12345",
+            "TELEGRAM_API_HASH": "telegram-api-hash",
+            "SPEECH_TO_TEXT_PROVIDER": "openai",
+            "OPENAI_API_KEY": "openai-key",
+            "OPENROUTER_API_KEY": "openrouter-key",
+        },
+        load_dotenv_file=False,
+    )
+
+    assert settings.deepgram_api_key == ""
 
 
 def test_openrouter_api_key_is_required() -> None:
@@ -157,10 +162,9 @@ def test_openrouter_api_key_is_required() -> None:
         load_settings(env, load_dotenv_file=False)
 
 
-def test_openai_api_key_is_required() -> None:
+def test_openai_api_key_is_optional() -> None:
     env = {key: value for key, value in BASE_ENV.items() if key != "OPENAI_API_KEY"}
-    with pytest.raises(ConfigError, match="OPENAI_API_KEY"):
-        load_settings(env, load_dotenv_file=False)
+    assert load_settings(env, load_dotenv_file=False).openai_api_key == ""
 
 
 def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:

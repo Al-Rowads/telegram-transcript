@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -890,10 +891,11 @@ async def test_transcribe_chunks_refines_before_translation(tmp_path: Path) -> N
 
     assert result.raw_transcript == "قال أقدر"
     assert result.refined_transcript == "كال أكدر"
-    assert result.final_transcript == "كال أكدر"
-    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "كال أكدر"),)
-    assert translator.source_texts == [("كال أكدر",)]
-    assert result.translated_srt is not None and "كال أكدر" in result.translated_srt
+    assert result.final_transcript == "قال أقدر"
+    assert result.reading_transcript == "كال أكدر"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "قال أقدر"),)
+    assert translator.source_texts == [("قال أقدر",)]
+    assert result.translated_srt is not None and "قال أقدر" in result.translated_srt
     assert events == [
         "transcribing_chunk",
         "chunk_transcribed",
@@ -932,8 +934,9 @@ async def test_transcribe_chunks_refines_when_translation_is_disabled(tmp_path: 
 
     assert result.raw_transcript == "قال"
     assert result.refined_transcript == "كال"
-    assert result.final_transcript == "كال"
-    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "كال"),)
+    assert result.final_transcript == "قال"
+    assert result.reading_transcript == "كال"
+    assert result.subtitle_cues == (SubtitleCue(0.0, 1.0, "قال"),)
     assert result.translated_srt is None
 
 
@@ -1172,13 +1175,11 @@ async def test_transcribe_chunks_async_collapses_multiline_persian_translation(
     assert result.translated_srt == (
         "1\n"
         "00:00:00,000 --> 00:00:01,000\n"
-        "first\n"
-        "second\n"
+        "first second\n"
         '<font color="yellow">ترجمه خط اول ترجمه خط دوم</font>\n'
     )
     assert result.line_translated_transcript == (
-        "first\n"
-        "second\n"
+        "first second\n"
         "ترجمه خط اول ترجمه خط دوم\n"
     )
 
@@ -1194,7 +1195,9 @@ def test_iraqi_refiner_uses_exact_system_prompt_and_preserves_srt_identity() -> 
         def create(self, **kwargs: object) -> object:
             self.calls.append(kwargs)
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=refined_srt))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"cues":[{"index":"1","text":"كال أكدر"}]}'
+                )))]
             )
 
     completions = FakeCompletions()
@@ -1207,14 +1210,13 @@ def test_iraqi_refiner_uses_exact_system_prompt_and_preserves_srt_identity() -> 
     assert len(completions.calls) == 1
     call = completions.calls[0]
     assert call["model"] == DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL
-    assert call["messages"] == [{
+    assert call["messages"][0] == {
         "role": "system",
-        "content": IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT.replace(
-            TRANSCRIPTION_REFINEMENT_PLACEHOLDER,
-            raw_srt.strip(),
-            1,
-        ),
-    }]
+        "content": IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT,
+    }
+    assert raw_srt.strip() not in call["messages"][0]["content"]
+    assert json.loads(call["messages"][1]["content"])["cues"][0]["text"] == "قال أقدر"
+    assert call["response_format"]["type"] == "json_schema"
     assert call["extra_body"] == {"provider": {"require_parameters": True}}
 
 
@@ -1229,7 +1231,9 @@ def test_gemini_iraqi_refiner_uses_only_the_system_prompt() -> None:
         def create(self, **kwargs: object) -> object:
             self.call = kwargs
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=refined_srt))]
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '{"cues":[{"index":"1","text":"كال أكدر"}]}'
+                )))]
             )
 
     completions = FakeCompletions()
@@ -1241,14 +1245,10 @@ def test_gemini_iraqi_refiner_uses_only_the_system_prompt() -> None:
 
     assert refiner.refine_srt(raw_srt) == refined_srt
     assert completions.call is not None
-    assert completions.call["messages"] == [{
-        "role": "system",
-        "content": IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT.replace(
-            TRANSCRIPTION_REFINEMENT_PLACEHOLDER,
-            raw_srt.strip(),
-            1,
-        ),
-    }]
+    assert completions.call["messages"][0]["content"] == (
+        IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT
+    )
+    assert json.loads(completions.call["messages"][1]["content"])["cues"][0]["text"] == "قال أقدر"
 
 
 @pytest.mark.parametrize(
@@ -1280,21 +1280,25 @@ def test_iraqi_refiner_splits_oversized_cue_without_exceeding_byte_limit() -> No
         + ("كلمة " * 5000).strip()
         + "\n"
     )
-    prefix = IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT.partition(
-        TRANSCRIPTION_REFINEMENT_PLACEHOLDER
-    )[0]
-
     class EchoCompletions:
         def __init__(self) -> None:
             self.srt_byte_sizes: list[int] = []
 
         def create(self, **kwargs: object) -> object:
             messages = kwargs["messages"]
-            content = messages[0]["content"]
-            source_srt = content.removeprefix(prefix)
-            self.srt_byte_sizes.append(len(source_srt.encode("utf-8")))
+            content = messages[1]["content"]
+            payload = json.loads(content)
+            self.srt_byte_sizes.append(len(content.encode("utf-8")))
+            response_payload = {
+                "cues": [
+                    {"index": cue["index"], "text": cue["text"]}
+                    for cue in payload["cues"]
+                ]
+            }
             return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=source_srt))]
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=json.dumps(response_payload, ensure_ascii=False)
+                ))]
             )
 
     completions = EchoCompletions()
@@ -1328,16 +1332,13 @@ def test_split_text_by_utf8_byte_limit_rejects_limit_smaller_than_one_character(
         split_text_by_utf8_byte_limit("ه", max_bytes=1)
 
 
-def test_build_transcription_refinement_system_prompt_replaces_only_placeholder() -> None:
+def test_build_transcription_refinement_system_prompt_never_interpolates_source() -> None:
     raw_srt = "1\n00:00:00,000 --> 00:00:01,000\nهاي\n"
 
     prompt = build_transcription_refinement_system_prompt(raw_srt)
 
-    assert prompt == IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT.replace(
-        TRANSCRIPTION_REFINEMENT_PLACEHOLDER,
-        raw_srt.strip(),
-        1,
-    )
+    assert prompt == IRAQI_ARABIC_TRANSCRIPTION_REFINEMENT_SYSTEM_PROMPT
+    assert raw_srt.strip() not in prompt
     assert TRANSCRIPTION_REFINEMENT_PLACEHOLDER not in prompt
 
 
@@ -1386,7 +1387,7 @@ def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
             self.calls.append(kwargs)
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content=(
-                    '{"translations":[{"index":"7","translation":"هفتم"}]}'
+                    '{"translations":[{"index":"7","translation":"هفتم ۷"}]}'
                 )))]
             )
 

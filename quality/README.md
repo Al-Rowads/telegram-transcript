@@ -1,18 +1,27 @@
-# Private Quality Evaluation
+# Private Iraqi Arabic quality evaluation
 
-Place at least 20 representative Iraqi/Baghdadi clips and their human-reviewed references in this directory. Media and manifests in this directory are ignored by Git because they may contain private Telegram content.
+Use at least 20 consented, representative Iraqi/Baghdadi clips covering fast speech, noise, code-switching, names, negation, dates, prices, and telephone numbers. Media and manifests under this directory are ignored by Git.
 
-Create `manifest.json` as a JSON array. Each object must contain these string fields:
+Create `manifest.json` as a JSON array:
 
-- `id`: stable clip identifier.
-- `reference_arabic`: manually corrected Arabic transcript.
-- `current_transcript`: output from the current Gemini production path.
-- `candidate_transcript`: output from the proposed Deepgram `ar-IQ` pipeline.
+```json
+[
+  {
+    "id": "clip-001",
+    "reference_arabic": "human-reviewed faithful transcript",
+    "current_transcript": "production pipeline output",
+    "candidate_transcript": "candidate pipeline output",
+    "critical_terms": ["Iraqi term", "person name"]
+  }
+]
+```
 
-Evaluate transcription accuracy with:
+Run:
 
 ```bash
 python -m telegram_transcript.quality quality/manifest.json
 ```
 
-The candidate passes the automatic model-change gate only when relative WER improves by at least 10%. Also record latency, provider cost, omissions, and a blind 1–5 Persian adequacy/naturalness review outside this manifest; do not change the production default if negation, numbers, or identities regress.
+The report uses corpus-weighted WER/CER rather than averaging clips equally. The automatic gate requires at least 10% relative WER improvement and no regression in critical-term recall or exact numeric-token preservation.
+
+Before changing the production default, also compare end-to-end latency and provider cost, review the worst per-clip regressions, and perform a blind 1–5 human review of the Persian output for adequacy and naturalness. Automatic character metrics cannot establish translation quality.

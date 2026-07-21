@@ -245,6 +245,7 @@ def prepare_audio_chunks(
         work_dir / "chunks",
         executable=executable,
         probe_executable=probe_executable,
+        time_scale=audio_tempo,
     )
 
 
@@ -277,10 +278,21 @@ def split_audio_to_timed_chunks(
     chunk_seconds: int = TRANSCRIPTION_CHUNK_SECONDS,
     overlap_seconds: float = CHUNK_OVERLAP_SECONDS,
     max_chunk_bytes: int = MAX_AUDIO_CHUNK_BYTES,
+    time_scale: float = 1.0,
 ) -> list[AudioChunk]:
+    if time_scale <= 0:
+        raise ValueError("time_scale must be greater than zero.")
     duration_seconds = probe_audio_duration_seconds(audio_path, executable=probe_executable)
     if duration_seconds <= chunk_seconds and audio_path.stat().st_size <= max_chunk_bytes:
-        return [AudioChunk(path=audio_path, duration_seconds=duration_seconds)]
+        return [
+            AudioChunk(
+                path=audio_path,
+                duration_seconds=duration_seconds,
+                time_scale=time_scale,
+                owned_start_seconds=0.0,
+                owned_end_seconds=duration_seconds,
+            )
+        ]
 
     if max_chunk_bytes <= 0:
         raise ValueError("max_chunk_bytes must be greater than zero.")
@@ -317,6 +329,7 @@ def split_audio_to_timed_chunks(
                     path=chunk_path,
                     start_seconds=start_seconds,
                     duration_seconds=end_seconds - start_seconds,
+                    time_scale=time_scale,
                 )
             )
             return
@@ -330,7 +343,22 @@ def split_audio_to_timed_chunks(
 
     for start_seconds, end_seconds in ranges:
         extract_bounded_range(start_seconds, end_seconds)
-    return chunks
+    ownership_boundaries = [0.0]
+    for current, following in zip(chunks, chunks[1:]):
+        current_end = current.start_seconds + (current.duration_seconds or 0.0)
+        ownership_boundaries.append((current_end + following.start_seconds) / 2)
+    ownership_boundaries.append(duration_seconds)
+    return [
+        AudioChunk(
+            path=chunk.path,
+            start_seconds=chunk.start_seconds,
+            duration_seconds=chunk.duration_seconds,
+            time_scale=chunk.time_scale,
+            owned_start_seconds=ownership_boundaries[index],
+            owned_end_seconds=ownership_boundaries[index + 1],
+        )
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 def choose_size_split_boundary(
