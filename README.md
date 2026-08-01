@@ -22,8 +22,10 @@ Supported transcription providers are OpenRouter Gemini, Deepgram Nova-3 with `a
 - Subtitle cues are normalized for readability, chunk overlap is assigned to one owner, and tempo-adjusted timestamps are rescaled to the original video.
 - Jobs capture an immutable settings snapshot when queued, so later commands cannot change in-flight work.
 - Preferences are isolated per private user or group. Only group administrators can mutate group settings.
-- The SQLite state database stores preferences plus content-free job metadata and hashed Telegram file identifiers for seven days. It does not store media, transcripts, cleaned text, translations, filenames, or sender names.
-- `/forget` removes the caller's private scope, or the group scope when invoked by an administrator.
+- The SQLite state database stores preferences only. The bot does not persist per-media jobs, Telegram message or file identifiers, filenames, sender names, transcripts, or translations.
+- Downloaded media, extracted audio, chunks, delivery buffers, and queued object references are released on success, failure, cancellation, rejection, and shutdown.
+- Logs may retain random job IDs and anonymous sizes, timings, counts, and provider/model names. They exclude Telegram identifiers, filenames, sender data, transcript content, and provider response payloads.
+- `/forget` removes the caller's private preferences, or the group preferences when invoked by an administrator.
 
 Telegram and the configured AI providers still receive data as necessary to process a request. Use `/privacy` for the in-bot summary.
 
@@ -45,10 +47,10 @@ Optional:
 - `MAX_VIDEO_MB` defaults to Telegram's 2048 MiB media limit.
 - `AUDIO_TEMPO` accepts `0.5`–`2.0` and defaults to `1.0`.
 - `MAX_CONCURRENT_JOBS` defaults to `1`. The application maintains a bounded worker queue and keeps command handling responsive.
-- `SCOPED_STATE_PATH` defaults to `data/bot-state.sqlite3`.
+- `SCOPED_STATE_PATH` defaults to `data/bot-state.sqlite3` and stores scoped preferences only.
 - `ALLOWED_TELEGRAM_USER_IDS` optionally restricts access.
 
-`RUNTIME_STATE_PATH` and `VIDEO_REGISTRY_PATH` remain accepted only to support migration from older deployments. New runtime preferences and job metadata use `SCOPED_STATE_PATH`.
+`RUNTIME_STATE_PATH` remains accepted for older global preferences. `VIDEO_REGISTRY_PATH` identifies a legacy media registry; startup purges that database and its SQLite sidecars automatically before accepting work. It must not overlap `RUNTIME_STATE_PATH`.
 
 ## Commands
 
@@ -82,17 +84,17 @@ Or run the container:
 docker compose up --build
 ```
 
-The Compose data volume retains scoped preferences and short-lived job metadata. Temporary media and outputs are deleted when each job finishes.
+The Compose data volume retains scoped preferences only. Temporary media, derived files, and in-memory output buffers are released for every terminal job outcome.
 
 ## Legacy privacy migration
 
-Older releases may have a `data/videos.sqlite3` registry containing filenames, sender names, or transcripts. The bot no longer reads or writes that registry. Deletion is deliberately explicit:
+Older releases may have a `data/videos.sqlite3` registry containing filenames, sender names, or transcripts. The bot no longer reads or writes that registry and deletes the configured registry plus SQLite sidecars automatically during startup. The standalone migration command remains available for offline cleanup:
 
 ```bash
 python -m telegram_transcript.privacy_migrate data/videos.sqlite3 --confirm-delete
 ```
 
-Back up or inspect the database first if retention is required. The command permanently drops the legacy content table; it is never run automatically.
+The command permanently drops and compacts a legacy content table while preserving unrelated tables. Startup fails before processing media if the configured legacy registry cannot be purged.
 
 ## Quality gate
 

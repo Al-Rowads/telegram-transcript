@@ -32,7 +32,7 @@ from telegram_transcript.bot import (
     process_video_message,
     send_transcript,
 )
-from telegram_transcript.config import Settings
+from telegram_transcript.config import ConfigError, Settings
 from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
 from telegram_transcript.transcriber import PERSIAN_TRANSLATION_NUMBER_WARNING
 
@@ -282,6 +282,92 @@ def test_create_application_uses_selected_gemini_refiner_without_context(
         application.bot_data["scoped_state_store"].close()
 
 
+def test_create_application_automatically_deletes_legacy_registry(tmp_path: Path) -> None:
+    registry = tmp_path / "videos.sqlite3"
+    Path(f"{registry}-wal").write_bytes(b"legacy wal")
+    registry.write_bytes(b"legacy registry")
+    settings = Settings(
+        telegram_bot_token="123:token",
+        openrouter_api_key="key",
+        runtime_state_path=tmp_path / "runtime.json",
+        video_registry_path=registry,
+        scoped_state_path=tmp_path / "state.sqlite3",
+    )
+
+    application = bot_module.create_application(settings)
+    try:
+        assert not registry.exists()
+        assert not Path(f"{registry}-wal").exists()
+    finally:
+        application.bot_data["scoped_state_store"].close()
+
+
+def test_purge_configured_legacy_registry_preserves_shared_preferences(tmp_path: Path) -> None:
+    database = tmp_path / "shared.sqlite3"
+    connection = bot_module.sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE videos (transcript TEXT)")
+        connection.execute("INSERT INTO videos VALUES ('private transcript')")
+        connection.execute("CREATE TABLE retained_preferences (value TEXT)")
+        connection.execute("INSERT INTO retained_preferences VALUES ('keep')")
+        connection.commit()
+    finally:
+        connection.close()
+    settings = Settings(
+        telegram_bot_token="token",
+        runtime_state_path=tmp_path / "runtime.json",
+        video_registry_path=database,
+        scoped_state_path=database,
+    )
+
+    bot_module.purge_configured_legacy_registry(settings)
+
+    connection = bot_module.sqlite3.connect(database)
+    try:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'videos'"
+        ).fetchone() is None
+        assert connection.execute("SELECT value FROM retained_preferences").fetchone() == ("keep",)
+    finally:
+        connection.close()
+    assert b"private transcript" not in database.read_bytes()
+
+
+def test_purge_configured_legacy_registry_rejects_runtime_state_overlap(tmp_path: Path) -> None:
+    shared_path = tmp_path / "shared-state"
+    settings = Settings(
+        telegram_bot_token="token",
+        runtime_state_path=shared_path,
+        video_registry_path=shared_path,
+        scoped_state_path=tmp_path / "scoped.sqlite3",
+    )
+
+    with pytest.raises(ConfigError, match="must not overlap"):
+        bot_module.purge_configured_legacy_registry(settings)
+
+
+def test_purge_configured_legacy_registry_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def deny_delete(path: Path) -> bool:
+        del path
+        raise PermissionError("private path details")
+
+    monkeypatch.setattr(bot_module, "delete_legacy_registry_files", deny_delete)
+    settings = Settings(
+        telegram_bot_token="token",
+        runtime_state_path=tmp_path / "runtime.json",
+        video_registry_path=tmp_path / "videos.sqlite3",
+        scoped_state_path=tmp_path / "state.sqlite3",
+    )
+
+    with pytest.raises(ConfigError, match="Unable to purge") as error:
+        bot_module.purge_configured_legacy_registry(settings)
+
+    assert isinstance(error.value.__cause__, PermissionError)
+
+
 @pytest.mark.asyncio
 async def test_start_media_downloader_stores_started_downloader(
     monkeypatch: pytest.MonkeyPatch,
@@ -307,6 +393,76 @@ async def test_start_media_downloader_stores_started_downloader(
     await bot_module.start_media_downloader(application)
 
     assert application.bot_data["media_downloader"].started is True
+
+
+@pytest.mark.asyncio
+async def test_media_worker_releases_job_references_and_sanitizes_failure_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_error = "private-provider-response-sentinel"
+
+    async def fail_processing(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise bot_module.TranscriptionError(sensitive_error)
+
+    monkeypatch.setattr(bot_module, "process_media_message", fail_processing)
+    caplog.set_level("ERROR", logger="telegram_transcript.bot")
+    queue: asyncio.Queue[bot_module.QueuedMediaJob] = asyncio.Queue()
+    status = FakeStatus()
+    status_ref = {"message": status}
+    settings = Settings(telegram_bot_token="token")
+    job = bot_module.QueuedMediaJob(
+        message=FakeMessage(),
+        attachment=SimpleNamespace(),
+        settings=settings,
+        context=SimpleNamespace(),
+        status_ref=status_ref,
+        job_id="anonymous-job",
+        audio_tempo=1.0,
+        transcriber=SimpleNamespace(),
+        translation_enabled=False,
+    )
+    application = SimpleNamespace(bot_data={"media_job_queue": queue})
+    worker = asyncio.create_task(bot_module.media_job_worker(application, 0))
+    await queue.put(job)
+
+    await asyncio.wait_for(queue.join(), timeout=1)
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+    assert status_ref["message"] is None
+    assert status.edits == [f"Transcription failed: {sensitive_error}"]
+    assert "error_type=TranscriptionError" in caplog.text
+    assert sensitive_error not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_discard_queued_media_jobs_releases_pending_status_references() -> None:
+    queue: asyncio.Queue[bot_module.QueuedMediaJob] = asyncio.Queue()
+    status_refs: list[dict[str, object | None]] = []
+    for index in range(2):
+        status_ref: dict[str, object | None] = {"message": FakeStatus()}
+        status_refs.append(status_ref)
+        await queue.put(
+            bot_module.QueuedMediaJob(
+                message=FakeMessage(),
+                attachment=SimpleNamespace(),
+                settings=Settings(telegram_bot_token="token"),
+                context=SimpleNamespace(),
+                status_ref=status_ref,  # type: ignore[arg-type]
+                job_id=f"job-{index}",
+                audio_tempo=1.0,
+                transcriber=SimpleNamespace(),
+                translation_enabled=False,
+            )
+        )
+
+    assert bot_module.discard_queued_media_jobs(queue) == 2
+    await asyncio.wait_for(queue.join(), timeout=1)
+
+    assert all(status_ref["message"] is None for status_ref in status_refs)
+    assert queue.empty()
 
 
 def test_unrelated_runtime_save_preserves_selected_gemini(
@@ -508,7 +664,8 @@ async def test_send_transcript_sends_long_text_as_document() -> None:
 @pytest.mark.asyncio
 async def test_send_transcript_formats_long_document_text(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeInputFile:
-        def __init__(self, file: object, *, filename: str) -> None:
+        def __init__(self, file: object, *, filename: str, read_file_handle: bool) -> None:
+            assert read_file_handle is True
             self.filename = filename
             self.content = file.getvalue()
 
@@ -525,6 +682,23 @@ async def test_send_transcript_formats_long_document_text(monkeypatch: pytest.Mo
 
 
 @pytest.mark.asyncio
+async def test_document_delivery_closes_transient_output_buffers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeInputFile:
+        def __init__(self, file: object, *, filename: str, read_file_handle: bool) -> None:
+            assert read_file_handle is True
+            self.file = file
+            self.filename = filename
+
+    monkeypatch.setattr(bot_module, "InputFile", FakeInputFile)
+    message = FakeMessage()
+
+    await send_transcript(message, "x" * 4000)
+    await bot_module.send_srt(message, "1\n00:00:00,000 --> 00:00:01,000\ntext\n")
+
+    assert all(document.file.closed for document, _ in message.document_replies)
+
+
+@pytest.mark.asyncio
 async def test_handle_non_video_ignores_group_messages() -> None:
     message = FakeMessage(chat_type=ChatType.GROUP)
     update = SimpleNamespace(effective_message=message)
@@ -532,6 +706,47 @@ async def test_handle_non_video_ignores_group_messages() -> None:
     await handle_non_video(update, SimpleNamespace())
 
     assert message.text_replies == []
+
+
+@pytest.mark.asyncio
+async def test_privacy_command_describes_preference_only_storage() -> None:
+    message = FakeMessage()
+    update = SimpleNamespace(effective_message=message)
+
+    await bot_module.handle_privacy_command(update, SimpleNamespace())
+
+    assert len(message.text_replies) == 1
+    privacy_text = message.text_replies[0]
+    assert "does not retain media" in privacy_text
+    assert "job metadata" in privacy_text
+    assert "Anonymous operational metrics" in privacy_text
+    assert "seven days" not in privacy_text
+
+
+@pytest.mark.asyncio
+async def test_forget_command_deletes_only_scoped_preferences(tmp_path: Path) -> None:
+    settings = Settings(telegram_bot_token="token")
+    defaults = bot_module.create_runtime_preferences_store(settings).defaults
+    store = bot_module.ScopedStateStore(tmp_path / "state.sqlite3", defaults=defaults)
+    store.save_preferences("user:123", defaults)
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_message=message,
+        effective_user=SimpleNamespace(id=123),
+    )
+    context = SimpleNamespace(bot_data={"scoped_state_store": store})
+
+    try:
+        await bot_module.handle_forget_command(update, context)
+        connection = bot_module.sqlite3.connect(store.path)
+        try:
+            assert connection.execute("SELECT COUNT(*) FROM scope_preferences").fetchone() == (0,)
+        finally:
+            connection.close()
+    finally:
+        store.close()
+
+    assert message.text_replies == ["Your scoped preferences were deleted."]
 
 
 @pytest.mark.asyncio
@@ -1848,6 +2063,8 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     assert status_ref["message"] is not None
+    downloaded_path = context.bot_data["media_downloader"].downloads[0][2]
+    assert not downloaded_path.exists()
     assert message.text_replies == ["Video received. Starting transcription..."]
     assert message.status_replies[0].edits == [
         "Step 1/6: downloading media...",
@@ -1911,3 +2128,5 @@ async def test_process_media_message_does_not_read_or_write_legacy_registry(
     )
 
     assert "hello transcript" in message.text_replies
+    downloaded_path = context.bot_data["media_downloader"].downloads[0][2]
+    assert not downloaded_path.exists()

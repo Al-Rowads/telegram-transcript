@@ -19,6 +19,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
 from telegram_transcript.models import TranscriptionResult
+from telegram_transcript.privacy_migrate import delete_legacy_registry_data, delete_legacy_registry_files
 from telegram_transcript.runtime_state import RuntimePreferences, RuntimePreferencesStore, RuntimeStateError
 from telegram_transcript.scoped_state import ScopedStateStore
 from telegram_transcript.telegram_utils import (
@@ -85,7 +86,7 @@ HELP_MESSAGE = """Available commands:
 /tmodel [gemini|gpt|claude] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 /privacy - Show data handling and retention information.
-/forget - Delete your scope's retained preferences and job metadata.
+/forget - Delete your scope's retained preferences.
 
 Send a video, audio file, or voice note to create a transcript."""
 
@@ -232,8 +233,27 @@ def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesSt
     )
 
 
+def purge_configured_legacy_registry(settings: Settings) -> None:
+    registry_path = settings.video_registry_path.resolve(strict=False)
+    scoped_state_path = settings.scoped_state_path.resolve(strict=False)
+    runtime_state_path = settings.runtime_state_path.resolve(strict=False)
+    if registry_path == runtime_state_path:
+        raise ConfigError("VIDEO_REGISTRY_PATH must not overlap RUNTIME_STATE_PATH.")
+
+    try:
+        if registry_path == scoped_state_path:
+            removed = delete_legacy_registry_data(registry_path)
+        else:
+            removed = delete_legacy_registry_files(registry_path)
+    except (OSError, sqlite3.Error) as exc:
+        raise ConfigError("Unable to purge the configured legacy video registry.") from exc
+    if removed:
+        logger.info("Purged configured legacy video registry data.")
+
+
 def create_application(settings: Settings | None = None) -> Application:
     settings = settings or load_settings()
+    purge_configured_legacy_registry(settings)
     runtime_store = create_runtime_preferences_store(settings)
     runtime_preferences = runtime_store.load()
     translation_prompt = canonicalize_translation_prompt_key(runtime_preferences.translation_prompt)
@@ -419,12 +439,6 @@ async def start_media_downloader(application: Application) -> None:
     downloader = TelegramMediaDownloader(settings)
     await downloader.start()
     application.bot_data["media_downloader"] = downloader
-    scoped_store = application.bot_data.get("scoped_state_store")
-    if isinstance(scoped_store, ScopedStateStore):
-        interrupted = await asyncio.to_thread(scoped_store.fail_incomplete_jobs)
-        await asyncio.to_thread(scoped_store.purge_expired_jobs)
-        if interrupted:
-            logger.warning("marked %d interrupted jobs as failed during startup", interrupted)
     queue = application.bot_data.get("media_job_queue")
     if isinstance(queue, asyncio.Queue):
         application.bot_data["media_job_workers"] = [
@@ -439,24 +453,23 @@ async def stop_media_downloader(application: Application) -> None:
         worker.cancel()
     if workers:
         await asyncio.gather(*workers, return_exceptions=True)
+    queue = application.bot_data.get("media_job_queue")
+    if isinstance(queue, asyncio.Queue):
+        discard_queued_media_jobs(queue)
     downloader = application.bot_data.get("media_downloader")
     if isinstance(downloader, TelegramMediaDownloader):
         await downloader.close()
     scoped_store = application.bot_data.get("scoped_state_store")
     if isinstance(scoped_store, ScopedStateStore):
-        await asyncio.to_thread(scoped_store.fail_incomplete_jobs)
         scoped_store.close()
 
 
 async def media_job_worker(application: Application, worker_index: int) -> None:
     queue = application.bot_data["media_job_queue"]
-    scoped_store = application.bot_data.get("scoped_state_store")
     while True:
         job: QueuedMediaJob = await queue.get()
         try:
             logger.info("job %s started by worker %d", job.job_id, worker_index)
-            if isinstance(scoped_store, ScopedStateStore):
-                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "running")
             await process_media_message(
                 job.message,
                 job.attachment,
@@ -468,21 +481,23 @@ async def media_job_worker(application: Application, worker_index: int) -> None:
                 transcriber_override=job.transcriber,
                 translation_enabled_override=job.translation_enabled,
             )
-            if isinstance(scoped_store, ScopedStateStore):
-                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "completed")
         except asyncio.CancelledError:
-            if isinstance(scoped_store, ScopedStateStore):
-                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
             raise
         except (FfmpegError, TelegramDownloadError, TranscriptionError) as exc:
-            logger.exception("job %s media transcription failed", job.job_id)
+            logger.error(
+                "job %s media transcription failed: error_type=%s",
+                job.job_id,
+                type(exc).__name__,
+            )
             status = job.status_ref["message"]
             if status is not None:
                 await edit_status_message(status, f"Transcription failed: {exc}", job_id=job.job_id)
-            if isinstance(scoped_store, ScopedStateStore):
-                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
-        except Exception:
-            logger.exception("job %s unexpected media transcription failure", job.job_id)
+        except Exception as exc:
+            logger.error(
+                "job %s unexpected media transcription failure: error_type=%s",
+                job.job_id,
+                type(exc).__name__,
+            )
             status = job.status_ref["message"]
             if status is not None:
                 await edit_status_message(
@@ -490,10 +505,22 @@ async def media_job_worker(application: Application, worker_index: int) -> None:
                     "Transcription failed because of an unexpected error.",
                     job_id=job.job_id,
                 )
-            if isinstance(scoped_store, ScopedStateStore):
-                await asyncio.to_thread(scoped_store.set_job_status, job.job_id, "failed")
         finally:
+            job.status_ref["message"] = None
             queue.task_done()
+            del job
+
+
+def discard_queued_media_jobs(queue: asyncio.Queue[QueuedMediaJob]) -> int:
+    discarded = 0
+    while True:
+        try:
+            job = queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return discarded
+        job.status_ref["message"] = None
+        queue.task_done()
+        discarded += 1
 
 
 def media_message_filter() -> filters.BaseFilter:
@@ -544,9 +571,9 @@ async def handle_privacy_command(update: Update, context: ContextTypes.DEFAULT_T
     await reply_to_source(
         message,
         "Media is processed temporarily and sent to configured transcription and translation providers. "
-        "The bot does not retain media, transcripts, or sender names after delivery. Scoped job metadata "
-        "and hashed Telegram file identifiers are retained for seven days for idempotency. Use /forget "
-        "to delete your scope metadata sooner.",
+        "The bot does not retain media, transcripts, sender names, Telegram file identifiers, or job "
+        "metadata after processing. Anonymous operational metrics may be logged without message content "
+        "or Telegram identifiers. Use /forget to delete your retained scope preferences.",
     )
 
 
@@ -556,15 +583,15 @@ async def handle_forget_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     user_id = get_update_user_id(update)
     if not await can_change_scope_preferences(context, message, user_id):
-        await reply_to_source(message, "Only chat administrators can delete group metadata.")
+        await reply_to_source(message, "Only chat administrators can delete group preferences.")
         return
     store = context.bot_data.get("scoped_state_store")
     if not isinstance(store, ScopedStateStore):
-        await reply_to_source(message, "Scoped metadata storage is unavailable.")
+        await reply_to_source(message, "Scoped preference storage is unavailable.")
         return
     scope_key = get_preference_scope(message, user_id)
     await asyncio.to_thread(store.delete_scope, scope_key)
-    await reply_to_source(message, "Your scoped preferences and retained job metadata were deleted.")
+    await reply_to_source(message, "Your scoped preferences were deleted.")
 
 
 async def handle_tempo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -901,23 +928,6 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     translation_enabled = preferences.translation_enabled
     translation_model = preferences.translation_model
     job_id = uuid.uuid4().hex[:8]
-    scoped_store = context.bot_data.get("scoped_state_store")
-    if isinstance(scoped_store, ScopedStateStore):
-        chat_id = get_message_chat_id(message)
-        message_id = getattr(message, "message_id", None)
-        if chat_id is not None and isinstance(message_id, int):
-            inserted = await asyncio.to_thread(
-                scoped_store.record_job,
-                job_id=job_id,
-                scope_key=get_preference_scope(message, user_id),
-                chat_id=chat_id,
-                message_id=message_id,
-                file_unique_id=getattr(attachment, "file_unique_id", None),
-            )
-            if not inserted:
-                await reply_to_source(message, "This Telegram message is already queued or was processed recently.")
-                return
-            await asyncio.to_thread(scoped_store.purge_expired_jobs)
     logger.info(
         "job %s queued: suffix=%s telegram_file_size=%s audio_tempo=%g stt_provider=%s transcribe_model=%s transcription_refinement_model=%s translation_enabled=%s translation_model=%s",
         job_id,
@@ -953,8 +963,6 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         queue.put_nowait(job)
     except asyncio.QueueFull:
-        if isinstance(scoped_store, ScopedStateStore):
-            await asyncio.to_thread(scoped_store.set_job_status, job_id, "failed")
         await edit_status_message(
             status,
             "The transcription queue is temporarily full. Please resend this media later.",
@@ -1321,25 +1329,25 @@ async def send_transcript(
             await reply_to_source(message, chunk)
         return
 
-    transcript_file = BytesIO(formatted_transcript.encode("utf-8"))
-    transcript_file.name = filename
-    transcript_file.seek(0)
-    await message.reply_document(
-        document=InputFile(transcript_file, filename=filename),
-        caption=caption,
-        **source_reply_kwargs(message),
-    )
+    with BytesIO(formatted_transcript.encode("utf-8")) as transcript_file:
+        transcript_file.name = filename
+        transcript_file.seek(0)
+        await message.reply_document(
+            document=InputFile(transcript_file, filename=filename, read_file_handle=True),
+            caption=caption,
+            **source_reply_kwargs(message),
+        )
 
 
 async def send_srt(message: Message, srt: str, *, filename: str = "transcript.srt") -> None:
-    srt_file = BytesIO(srt.encode("utf-8"))
-    srt_file.name = filename
-    srt_file.seek(0)
-    await message.reply_document(
-        document=InputFile(srt_file, filename=filename),
-        caption="SRT subtitles",
-        **source_reply_kwargs(message),
-    )
+    with BytesIO(srt.encode("utf-8")) as srt_file:
+        srt_file.name = filename
+        srt_file.seek(0)
+        await message.reply_document(
+            document=InputFile(srt_file, filename=filename, read_file_handle=True),
+            caption="SRT subtitles",
+            **source_reply_kwargs(message),
+        )
 
 
 def normalize_transcription_result(result: object) -> TranscriptionResult:

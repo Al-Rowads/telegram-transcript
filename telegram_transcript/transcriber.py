@@ -1115,8 +1115,9 @@ class SpeechTranscriber:
                 delivery_subtitle_cues = refined_result.subtitle_cues
             except (OpenAIError, TranscriptionError) as exc:
                 logger.warning(
-                    "Iraqi Arabic transcription refinement failed; retaining original subtitles.",
-                    exc_info=exc,
+                    "Iraqi Arabic transcription refinement failed; retaining original subtitles: "
+                    "error_type=%s",
+                    type(exc).__name__,
                 )
                 warnings.append(TRANSCRIPTION_REFINEMENT_FAILURE_WARNING)
                 if progress_callback is not None:
@@ -1176,7 +1177,10 @@ class SpeechTranscriber:
                     following_blocks,
                 )
             except (TranscriptionError, OpenAIError) as exc:
-                logger.warning("Persian subtitle translation failed; returning Arabic subtitles.", exc_info=exc)
+                logger.warning(
+                    "Persian subtitle translation failed; returning Arabic subtitles: error_type=%s",
+                    type(exc).__name__,
+                )
                 warnings.append(TRANSLATION_FAILURE_WARNING)
                 if progress_callback is not None:
                     await progress_callback(
@@ -1277,8 +1281,9 @@ class SpeechTranscriber:
                             ) or validated_result
                         except (FfmpegError, OpenAIError, TranscriptionError) as exc:
                             logger.warning(
-                                "Deepgram confidence correction failed; retaining the original subtitles.",
-                                exc_info=exc,
+                                "Deepgram confidence correction failed; retaining the original subtitles: "
+                                "error_type=%s",
+                                type(exc).__name__,
                             )
                             warnings.append(CORRECTION_FAILURE_WARNING)
                     return validated_result, provider, tuple(warnings)
@@ -1286,12 +1291,12 @@ class SpeechTranscriber:
                 failure = exc
                 failure_reason = str(exc)
                 logger.warning(
-                    "Transcription provider failed for chunk %d/%d: provider=%s model=%s",
+                    "Transcription provider failed for chunk %d/%d: provider=%s model=%s error_type=%s",
                     chunk_index,
                     total_chunks,
                     provider.provider_name,
                     provider.model,
-                    exc_info=exc,
+                    type(exc).__name__,
                 )
 
             next_attempt_index = attempt_index + 1

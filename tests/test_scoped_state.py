@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 from pathlib import Path
 
@@ -39,57 +38,75 @@ def test_scoped_preferences_are_isolated(tmp_path: Path) -> None:
         store.close()
 
 
-def test_job_metadata_is_content_free_hashed_and_idempotent(tmp_path: Path) -> None:
+def test_state_database_does_not_create_media_job_storage(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = ScopedStateStore(database, defaults=default_preferences())
+    store.close()
+
+    connection = sqlite3.connect(database)
     try:
-        assert store.record_job(
-            job_id="job-1",
-            scope_key="user:1",
-            chat_id=1,
-            message_id=2,
-            file_unique_id="telegram-secret-id",
-        )
-        assert not store.record_job(
-            job_id="job-2",
-            scope_key="user:1",
-            chat_id=1,
-            message_id=2,
-            file_unique_id="telegram-secret-id",
-        )
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+
+    assert tables == {"scope_preferences"}
+
+
+def test_opening_state_database_purges_legacy_jobs_and_preserves_preferences(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    changed = RuntimePreferences(
+        audio_tempo=0.9,
+        transcription_model="whisper",
+        transcription_refinement_model="openai/gpt-5.5",
+        translation_enabled=False,
+        translation_model="openai/gpt-5.5",
+        translation_prompt="literal",
+    )
+    store = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        store.save_preferences("user:1", changed)
+    finally:
+        store.close()
+
+    sentinel = "legacy-media-metadata-sentinel"
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE jobs (metadata TEXT NOT NULL)")
+        connection.execute("INSERT INTO jobs VALUES (?)", (sentinel,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        assert store.load_preferences("user:1") == changed
     finally:
         store.close()
 
     connection = sqlite3.connect(database)
     try:
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
-        row = connection.execute("SELECT file_unique_hash, status FROM jobs").fetchone()
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'jobs'"
+        ).fetchone() is None
     finally:
         connection.close()
+    assert sentinel.encode() not in database.read_bytes()
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{database}{suffix}")
+        assert not sidecar.exists() or sentinel.encode() not in sidecar.read_bytes()
 
-    assert not {"transcript", "translation", "file_name", "sender_name"} & columns
-    assert row == (hashlib.sha256(b"telegram-secret-id").hexdigest(), "queued")
 
-
-def test_restart_marks_incomplete_jobs_failed_and_forget_deletes_scope(tmp_path: Path) -> None:
-    store = ScopedStateStore(tmp_path / "state.sqlite3", defaults=default_preferences())
+def test_delete_scope_removes_only_preferences(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = ScopedStateStore(database, defaults=default_preferences())
     try:
         store.save_preferences("user:1", default_preferences())
-        store.record_job(
-            job_id="job-1",
-            scope_key="user:1",
-            chat_id=1,
-            message_id=2,
-            file_unique_id=None,
-        )
-        assert store.fail_incomplete_jobs() == 1
         store.delete_scope("user:1")
+        assert store.load_preferences("user:1") == default_preferences()
     finally:
         store.close()
-
-    connection = sqlite3.connect(tmp_path / "state.sqlite3")
-    try:
-        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone() == (0,)
-        assert connection.execute("SELECT COUNT(*) FROM scope_preferences").fetchone() == (0,)
-    finally:
-        connection.close()
