@@ -39,6 +39,8 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0
     assert settings.max_concurrent_jobs == 1
+    assert settings.telegram_request_timeout_seconds == 30.0
+    assert settings.telegram_media_write_timeout_seconds == 120.0
     assert settings.runtime_state_path.as_posix() == "data/runtime-settings.json"
     assert settings.video_registry_path.as_posix() == "data/videos.sqlite3"
     assert settings.scoped_state_path.as_posix() == "data/bot-state.sqlite3"
@@ -57,6 +59,8 @@ def test_load_settings_parses_optional_values() -> None:
             "MAX_VIDEO_MB": "25.5",
             "AUDIO_TEMPO": "1",
             "MAX_CONCURRENT_JOBS": "3",
+            "TELEGRAM_REQUEST_TIMEOUT_SECONDS": "45",
+            "TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS": "180",
             "RUNTIME_STATE_PATH": "~/telegram-state.json",
             "VIDEO_REGISTRY_PATH": "~/telegram-videos.sqlite3",
         },
@@ -73,6 +77,8 @@ def test_load_settings_parses_optional_values() -> None:
     assert settings.max_video_mb == 25.5
     assert settings.audio_tempo == 1
     assert settings.max_concurrent_jobs == 3
+    assert settings.telegram_request_timeout_seconds == 45.0
+    assert settings.telegram_media_write_timeout_seconds == 180.0
     assert settings.runtime_state_path.name == "telegram-state.json"
     assert settings.video_registry_path.name == "telegram-videos.sqlite3"
 
@@ -175,6 +181,18 @@ def test_audio_tempo_must_stay_in_ffmpeg_range() -> None:
 def test_max_video_limit_cannot_exceed_telegram_two_gib_limit() -> None:
     with pytest.raises(ConfigError, match="2048 MB"):
         load_settings({**BASE_ENV, "MAX_VIDEO_MB": "2049"}, load_dotenv_file=False)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "0"),
+        ("TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS", "not-a-number"),
+    ],
+)
+def test_telegram_timeouts_must_be_positive_numbers(name: str, value: str) -> None:
+    with pytest.raises(ConfigError, match=name):
+        load_settings({**BASE_ENV, name: value}, load_dotenv_file=False)
 
 
 def test_parse_user_ids_rejects_invalid_values() -> None:

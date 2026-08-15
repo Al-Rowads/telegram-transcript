@@ -16,6 +16,8 @@ from telegram_transcript.transcriber import (
 )
 
 MAX_TELEGRAM_MEDIA_MB = 2048.0
+DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS = 30.0
+DEFAULT_TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS = 120.0
 
 
 class ConfigError(RuntimeError):
@@ -40,6 +42,8 @@ class Settings:
     max_video_mb: float = MAX_TELEGRAM_MEDIA_MB
     audio_tempo: float = DEFAULT_AUDIO_TEMPO
     max_concurrent_jobs: int = 1
+    telegram_request_timeout_seconds: float = DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS
+    telegram_media_write_timeout_seconds: float = DEFAULT_TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS
     runtime_state_path: Path = Path("data/runtime-settings.json")
     video_registry_path: Path = Path("data/videos.sqlite3")
     scoped_state_path: Path = Path("data/bot-state.sqlite3")
@@ -111,6 +115,16 @@ def load_settings(
             source.get("MAX_CONCURRENT_JOBS"),
             "MAX_CONCURRENT_JOBS",
             1,
+        ),
+        telegram_request_timeout_seconds=parse_positive_float(
+            source.get("TELEGRAM_REQUEST_TIMEOUT_SECONDS"),
+            "TELEGRAM_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_TELEGRAM_REQUEST_TIMEOUT_SECONDS,
+        ),
+        telegram_media_write_timeout_seconds=parse_positive_float(
+            source.get("TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS"),
+            "TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS",
+            DEFAULT_TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS,
         ),
         runtime_state_path=Path(
             source.get("RUNTIME_STATE_PATH", "data/runtime-settings.json").strip()

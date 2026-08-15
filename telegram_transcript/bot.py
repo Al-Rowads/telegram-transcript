@@ -7,13 +7,15 @@ import sqlite3
 import tempfile
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path
+from typing import TypeVar
 
 from telegram import Audio, Document, InputFile, Message, Update, Video, Voice
 from telegram.constants import ChatType
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import RetryAfter, TelegramError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
@@ -74,6 +76,8 @@ DEFAULT_OUTPUT_BASENAME = "transcript"
 DEFAULT_TRANSCRIPTION_MODEL_KEY = "gemini"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 HELP_MESSAGE_DELETE_DELAY_SECONDS = 20.0
+TELEGRAM_REQUEST_MAX_ATTEMPTS = 3
+TELEGRAM_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 MINIMUM_TEMPORARY_FREE_BYTES = 512 * 1024 * 1024
 TEMPORARY_SPACE_MULTIPLIER = 3
 HELP_MESSAGE = """Available commands:
@@ -89,6 +93,8 @@ HELP_MESSAGE = """Available commands:
 /forget - Delete your scope's retained preferences.
 
 Send a video, audio file, or voice note to create a transcript."""
+
+TelegramResult = TypeVar("TelegramResult")
 
 
 @dataclass(frozen=True)
@@ -270,6 +276,11 @@ def create_application(settings: Settings | None = None) -> Application:
     app = (
         Application.builder()
         .token(settings.telegram_bot_token)
+        .connect_timeout(settings.telegram_request_timeout_seconds)
+        .read_timeout(settings.telegram_request_timeout_seconds)
+        .write_timeout(settings.telegram_request_timeout_seconds)
+        .pool_timeout(settings.telegram_request_timeout_seconds)
+        .media_write_timeout(settings.telegram_media_write_timeout_seconds)
         .post_init(start_media_downloader)
         .post_shutdown(stop_media_downloader)
         .build()
@@ -489,22 +500,24 @@ async def media_job_worker(application: Application, worker_index: int) -> None:
                 job.job_id,
                 type(exc).__name__,
             )
-            status = job.status_ref["message"]
-            if status is not None:
-                await edit_status_message(status, f"Transcription failed: {exc}", job_id=job.job_id)
+            await update_status_message(
+                job.message,
+                job.status_ref,
+                f"Transcription failed: {exc}",
+                job_id=job.job_id,
+            )
         except Exception as exc:
             logger.error(
                 "job %s unexpected media transcription failure: error_type=%s",
                 job.job_id,
                 type(exc).__name__,
             )
-            status = job.status_ref["message"]
-            if status is not None:
-                await edit_status_message(
-                    status,
-                    "Transcription failed because of an unexpected error.",
-                    job_id=job.job_id,
-                )
+            await update_status_message(
+                job.message,
+                job.status_ref,
+                "Transcription failed because of an unexpected error.",
+                job_id=job.job_id,
+            )
         finally:
             job.status_ref["message"] = None
             queue.task_done()
@@ -941,11 +954,13 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         translation_model,
     )
 
-    status = await reply_to_source(
+    status_ref: dict[str, Message | None] = {"message": None}
+    await update_status_message(
         message,
+        status_ref,
         f"{get_media_kind_label(message, attachment)} queued for transcription...",
+        job_id=job_id,
     )
-    status_ref: dict[str, Message | None] = {"message": status}
     queue = context.bot_data.get("media_job_queue")
     if not isinstance(queue, asyncio.Queue):
         raise RuntimeError("Media job queue is not initialized.")
@@ -963,8 +978,9 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         queue.put_nowait(job)
     except asyncio.QueueFull:
-        await edit_status_message(
-            status,
+        await update_status_message(
+            message,
+            status_ref,
             "The transcription queue is temporarily full. Please resend this media later.",
             job_id=job_id,
         )
@@ -1002,18 +1018,23 @@ async def process_media_message(
         source_path = work_dir / f"source{get_media_attachment_suffix(attachment)}"
         audio_path = work_dir / "audio.flac"
 
-        status = status_ref.get("message")
-        if status is None:
-            status = await reply_to_source(
+        if status_ref.get("message") is None:
+            await update_status_message(
                 message,
+                status_ref,
                 f"{get_media_kind_label(message, attachment)} received. Starting transcription...",
+                job_id=job_id,
             )
-        status_ref["message"] = status
 
         ensure_temporary_space(get_attachment_file_size(attachment))
 
         step_started = time.monotonic()
-        await edit_status_message(status, f"Step 1/{total_steps}: downloading media...", job_id=job_id)
+        await update_status_message(
+            message,
+            status_ref,
+            f"Step 1/{total_steps}: downloading media...",
+            job_id=job_id,
+        )
         logger.info(
             "job %s step 1/%d downloading media: suffix=%s telegram_file_size=%s",
             job_id,
@@ -1037,12 +1058,18 @@ async def process_media_message(
                 source_bytes,
                 settings.max_video_bytes,
             )
-            await edit_status_message(status, "Media is larger than the configured upload limit.", job_id=job_id)
+            await update_status_message(
+                message,
+                status_ref,
+                "Media is larger than the configured upload limit.",
+                job_id=job_id,
+            )
             return
         ensure_temporary_space(source_bytes)
 
-        await edit_status_message(
-            status,
+        await update_status_message(
+            message,
+            status_ref,
             f"Step 2/{total_steps}: extracting lossless FLAC audio at {audio_tempo:g}x...",
             job_id=job_id,
         )
@@ -1069,7 +1096,12 @@ async def process_media_message(
             elapsed_ms(step_started),
         )
 
-        await edit_status_message(status, f"Step 3/{total_steps}: preparing audio chunks...", job_id=job_id)
+        await update_status_message(
+            message,
+            status_ref,
+            f"Step 3/{total_steps}: preparing audio chunks...",
+            job_id=job_id,
+        )
         step_started = time.monotonic()
         logger.info(
             "job %s step 3/%d preparing bounded transcription chunks: audio_bytes=%d",
@@ -1102,8 +1134,9 @@ async def process_media_message(
             if event == "transcribing_chunk":
                 index = progress_data.get("index")
                 total = progress_data.get("total")
-                await edit_status_message(
-                    status,
+                await update_status_message(
+                    message,
+                    status_ref,
                     f"Step 4/{total_steps}: transcribing chunk {index}/{total}...",
                     job_id=job_id,
                 )
@@ -1131,8 +1164,9 @@ async def process_media_message(
                 total = progress_data.get("total")
                 failed_provider = format_provider_name(progress_data.get("failed_provider"))
                 next_provider = format_provider_name(progress_data.get("next_provider"))
-                await edit_status_message(
-                    status,
+                await update_status_message(
+                    message,
+                    status_ref,
                     f"{failed_provider} could not produce valid SRT; "
                     f"retrying chunk {index}/{total} with {next_provider}...",
                     job_id=job_id,
@@ -1149,8 +1183,9 @@ async def process_media_message(
                     progress_data.get("next_model"),
                 )
             elif event == "refining_transcription":
-                await edit_status_message(
-                    status,
+                await update_status_message(
+                    message,
+                    status_ref,
                     f"Step 5/{total_steps}: refining Iraqi Arabic transcription...",
                     job_id=job_id,
                 )
@@ -1172,8 +1207,9 @@ async def process_media_message(
                     progress_data.get("model"),
                 )
             elif event == "transcription_refinement_failed":
-                await edit_status_message(
-                    status,
+                await update_status_message(
+                    message,
+                    status_ref,
                     f"Step 5/{total_steps}: refinement failed; using original subtitles...",
                     job_id=job_id,
                 )
@@ -1196,7 +1232,12 @@ async def process_media_message(
                     or now - last_translation_status_attempt_at >= STATUS_PROGRESS_EDIT_INTERVAL_SECONDS
                 ):
                     last_translation_status_attempt_at = now
-                    await edit_status_message(status, status_text, job_id=job_id)
+                    await update_status_message(
+                        message,
+                        status_ref,
+                        status_text,
+                        job_id=job_id,
+                    )
                 logger.info(
                     "job %s step 6/%d translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
@@ -1216,8 +1257,9 @@ async def process_media_message(
                     progress_data.get("line_translated_transcript_chars"),
                 )
             elif event == "translation_failed":
-                await edit_status_message(
-                    status,
+                await update_status_message(
+                    message,
+                    status_ref,
                     f"Step 6/{total_steps}: translation failed; preparing Arabic subtitles...",
                     job_id=job_id,
                 )
@@ -1247,8 +1289,9 @@ async def process_media_message(
         else None
     )
     srt = translated_srt or render_srt(transcription_result.subtitle_cues)
-    await edit_status_message(
-        status,
+    await update_status_message(
+        message,
+        status_ref,
         f"Step {sending_step}/{total_steps}: sending transcript...",
         job_id=job_id,
     )
@@ -1268,31 +1311,41 @@ async def process_media_message(
         final_transcript,
         filename=f"{base_name}.transcription.txt",
         caption="Transcription",
+        job_id=job_id,
     )
     if srt:
-        await send_srt(message, srt, filename=f"{base_name}.srt")
+        await send_srt(message, srt, filename=f"{base_name}.srt", job_id=job_id)
     if persian_transcript:
         await send_transcript(
             message,
             persian_transcript,
             filename=f"{base_name}.fa.txt",
             caption="Persian translation",
+            job_id=job_id,
         )
     if transcription_result.translation_warnings:
         await reply_to_source(
             message,
             "Warning: " + " ".join(transcription_result.translation_warnings),
+            job_id=job_id,
+            operation_name="send translation warning",
         )
     if transcription_result.warnings:
-        await edit_status_message(
-            status,
+        await update_status_message(
+            message,
+            status_ref,
             "Transcript ready. " + " ".join(transcription_result.warnings),
             job_id=job_id,
         )
     elif srt:
-        await edit_status_message(status, "Transcript ready.", job_id=job_id)
+        await update_status_message(message, status_ref, "Transcript ready.", job_id=job_id)
     else:
-        await edit_status_message(status, "Transcript ready. SRT unavailable for this provider/model.", job_id=job_id)
+        await update_status_message(
+            message,
+            status_ref,
+            "Transcript ready. SRT unavailable for this provider/model.",
+            job_id=job_id,
+        )
     logger.info(
         "job %s completed: duration_ms=%d final_chars=%d translated_srt_chars=%s line_translated_transcript_chars=%s srt_cues=%d",
         job_id,
@@ -1322,32 +1375,60 @@ async def send_transcript(
     *,
     filename: str = "transcript.txt",
     caption: str = "Transcript",
+    job_id: str | None = None,
 ) -> None:
     formatted_transcript = format_transcript_for_delivery(transcript)
     if should_send_as_text(formatted_transcript):
         for chunk in split_text_for_telegram(formatted_transcript):
-            await reply_to_source(message, chunk)
+            await reply_to_source(
+                message,
+                chunk,
+                job_id=job_id,
+                operation_name="send transcript text",
+            )
         return
 
-    with BytesIO(formatted_transcript.encode("utf-8")) as transcript_file:
-        transcript_file.name = filename
-        transcript_file.seek(0)
-        await message.reply_document(
-            document=InputFile(transcript_file, filename=filename, read_file_handle=True),
-            caption=caption,
-            **source_reply_kwargs(message),
-        )
+    payload = formatted_transcript.encode("utf-8")
+
+    async def send_document() -> None:
+        with BytesIO(payload) as transcript_file:
+            transcript_file.name = filename
+            await message.reply_document(
+                document=InputFile(transcript_file, filename=filename, read_file_handle=True),
+                caption=caption,
+                **source_reply_kwargs(message),
+            )
+
+    await retry_telegram_request(
+        send_document,
+        operation_name="send transcript document",
+        job_id=job_id,
+    )
 
 
-async def send_srt(message: Message, srt: str, *, filename: str = "transcript.srt") -> None:
-    with BytesIO(srt.encode("utf-8")) as srt_file:
-        srt_file.name = filename
-        srt_file.seek(0)
-        await message.reply_document(
-            document=InputFile(srt_file, filename=filename, read_file_handle=True),
-            caption="SRT subtitles",
-            **source_reply_kwargs(message),
-        )
+async def send_srt(
+    message: Message,
+    srt: str,
+    *,
+    filename: str = "transcript.srt",
+    job_id: str | None = None,
+) -> None:
+    payload = srt.encode("utf-8")
+
+    async def send_document() -> None:
+        with BytesIO(payload) as srt_file:
+            srt_file.name = filename
+            await message.reply_document(
+                document=InputFile(srt_file, filename=filename, read_file_handle=True),
+                caption="SRT subtitles",
+                **source_reply_kwargs(message),
+            )
+
+    await retry_telegram_request(
+        send_document,
+        operation_name="send SRT document",
+        job_id=job_id,
+    )
 
 
 def normalize_transcription_result(result: object) -> TranscriptionResult:
@@ -1366,13 +1447,65 @@ def format_provider_name(value: object) -> str:
     return "Provider"
 
 
-async def reply_to_source(message: Message, text: str) -> Message:
-    return await message.reply_text(text, **source_reply_kwargs(message))
+async def retry_telegram_request(
+    operation: Callable[[], Awaitable[TelegramResult]],
+    *,
+    operation_name: str,
+    job_id: str | None = None,
+) -> TelegramResult:
+    for attempt in range(1, TELEGRAM_REQUEST_MAX_ATTEMPTS + 1):
+        try:
+            return await operation()
+        except TimedOut as exc:
+            cause_type = type(exc.__cause__).__name__ if exc.__cause__ is not None else "unknown"
+            if attempt == TELEGRAM_REQUEST_MAX_ATTEMPTS:
+                logger.error(
+                    "Telegram request timed out after retries: operation=%s attempt=%d/%d cause_type=%s job=%s",
+                    operation_name,
+                    attempt,
+                    TELEGRAM_REQUEST_MAX_ATTEMPTS,
+                    cause_type,
+                    job_id or "none",
+                )
+                raise
+            delay_seconds = TELEGRAM_RETRY_DELAYS_SECONDS[attempt - 1]
+            logger.warning(
+                "Telegram request timed out; retrying: operation=%s attempt=%d/%d cause_type=%s delay_seconds=%g job=%s",
+                operation_name,
+                attempt,
+                TELEGRAM_REQUEST_MAX_ATTEMPTS,
+                cause_type,
+                delay_seconds,
+                job_id or "none",
+            )
+            await asyncio.sleep(delay_seconds)
+
+    raise AssertionError("Telegram retry loop completed without a result.")
 
 
-async def edit_status_message(status: Message, text: str, *, job_id: str) -> bool:
+async def reply_to_source(
+    message: Message,
+    text: str,
+    *,
+    job_id: str | None = None,
+    operation_name: str = "send text reply",
+) -> Message:
+    return await retry_telegram_request(
+        lambda: message.reply_text(text, **source_reply_kwargs(message)),
+        operation_name=operation_name,
+        job_id=job_id,
+    )
+
+
+async def edit_status_message(status: Message | None, text: str, *, job_id: str) -> bool:
+    if status is None:
+        return False
     try:
-        await status.edit_text(text)
+        await retry_telegram_request(
+            lambda: status.edit_text(text),
+            operation_name="edit status message",
+            job_id=job_id,
+        )
     except RetryAfter as exc:
         logger.warning(
             "job %s skipped Telegram status edit after flood control: retry_after=%s text=%r",
@@ -1381,6 +1514,32 @@ async def edit_status_message(status: Message, text: str, *, job_id: str) -> boo
             text,
         )
         return False
+    except TimedOut:
+        return False
+    return True
+
+
+async def update_status_message(
+    message: Message,
+    status_ref: dict[str, Message | None],
+    text: str,
+    *,
+    job_id: str,
+) -> bool:
+    status = status_ref.get("message")
+    if status is not None:
+        return await edit_status_message(status, text, job_id=job_id)
+
+    try:
+        status = await reply_to_source(
+            message,
+            text,
+            job_id=job_id,
+            operation_name="send status message",
+        )
+    except TimedOut:
+        return False
+    status_ref["message"] = status
     return True
 
 

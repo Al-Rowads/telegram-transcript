@@ -47,6 +47,8 @@ Optional:
 - `MAX_VIDEO_MB` defaults to Telegram's 2048 MiB media limit.
 - `AUDIO_TEMPO` accepts `0.5`–`2.0` and defaults to `1.0`.
 - `MAX_CONCURRENT_JOBS` defaults to `1`. The application maintains a bounded worker queue and keeps command handling responsive.
+- `TELEGRAM_REQUEST_TIMEOUT_SECONDS` defaults to `30` for outbound Bot API connections, responses, writes, and connection-pool waits.
+- `TELEGRAM_MEDIA_WRITE_TIMEOUT_SECONDS` defaults to `120` for outbound document uploads.
 - `SCOPED_STATE_PATH` defaults to `data/bot-state.sqlite3` and stores scoped preferences only.
 - `ALLOWED_TELEGRAM_USER_IDS` optionally restricts access.
 

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from telegram.constants import ChatType
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, TimedOut
 
 from telegram_transcript import bot as bot_module
 from telegram_transcript.bot import (
@@ -110,6 +110,13 @@ class FakeAdminBot:
     async def get_chat_member(self, chat_id: int, user_id: int) -> object:
         del chat_id, user_id
         return SimpleNamespace(status="administrator")
+
+
+def make_timed_out(cause_message: str = "network timeout") -> TimedOut:
+    try:
+        raise TimedOut from TimeoutError(cause_message)
+    except TimedOut as exc:
+        return exc
 
 
 def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
@@ -278,6 +285,37 @@ def test_create_application_uses_selected_gemini_refiner_without_context(
         assert captured["transcription_refinement_model"] == "google/gemini-3.5-flash"
         assert application.bot_data["transcriber"] is fake_transcriber
         assert "effective_transcription_refinement_model" not in application.bot_data
+    finally:
+        application.bot_data["scoped_state_store"].close()
+
+
+def test_create_application_configures_telegram_request_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        telegram_bot_token="123:token",
+        openrouter_api_key="key",
+        telegram_request_timeout_seconds=45.0,
+        telegram_media_write_timeout_seconds=180.0,
+        runtime_state_path=tmp_path / "runtime.json",
+        video_registry_path=tmp_path / "videos.sqlite3",
+        scoped_state_path=tmp_path / "state.sqlite3",
+    )
+    monkeypatch.setattr(
+        bot_module,
+        "create_transcriber",
+        lambda *args, **kwargs: SimpleNamespace(provider_name="gemini", model="gemini"),
+    )
+
+    application = bot_module.create_application(settings)
+    try:
+        request = application.bot.request
+        assert request.read_timeout == 45.0
+        assert request._client.timeout.connect == 45.0
+        assert request._client.timeout.write == 45.0
+        assert request._client.timeout.pool == 45.0
+        assert request._media_write_timeout == 180.0
     finally:
         application.bot_data["scoped_state_store"].close()
 
@@ -696,6 +734,128 @@ async def test_document_delivery_closes_transient_output_buffers(monkeypatch: py
     await bot_module.send_srt(message, "1\n00:00:00,000 --> 00:00:01,000\ntext\n")
 
     assert all(document.file.closed for document, _ in message.document_replies)
+
+
+@pytest.mark.asyncio
+async def test_retry_telegram_request_retries_timeouts_with_sanitized_logging(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise make_timed_out("private-request-details")
+        return "delivered"
+
+    async def record_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", record_sleep)
+    caplog.set_level("WARNING", logger="telegram_transcript.bot")
+
+    result = await bot_module.retry_telegram_request(
+        operation,
+        operation_name="send transcript",
+        job_id="job1234",
+    )
+
+    assert result == "delivered"
+    assert attempts == 3
+    assert delays == [1.0, 2.0]
+    assert "cause_type=TimeoutError" in caplog.text
+    assert "private-request-details" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_retry_telegram_request_raises_after_bounded_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def operation() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise TimedOut
+
+    async def skip_sleep(delay: float) -> None:
+        assert delay in bot_module.TELEGRAM_RETRY_DELAYS_SECONDS
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+
+    with pytest.raises(TimedOut):
+        await bot_module.retry_telegram_request(operation, operation_name="send text")
+
+    assert attempts == bot_module.TELEGRAM_REQUEST_MAX_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_retry_telegram_request_does_not_retry_other_errors() -> None:
+    attempts = 0
+
+    async def operation() -> None:
+        nonlocal attempts
+        attempts += 1
+        raise BadRequest("invalid request")
+
+    with pytest.raises(BadRequest):
+        await bot_module.retry_telegram_request(operation, operation_name="send text")
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_document_delivery_recreates_buffer_for_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    buffers: list[object] = []
+    payloads: list[bytes] = []
+
+    class FakeInputFile:
+        def __init__(self, file: object, *, filename: str, read_file_handle: bool) -> None:
+            assert filename == "transcript.txt"
+            assert read_file_handle is True
+            buffers.append(file)
+            payloads.append(file.getvalue())
+
+    class TimeoutThenSuccessMessage(FakeMessage):
+        async def reply_document(self, *, document: object, caption: str, **kwargs: object) -> None:
+            del document, caption, kwargs
+            if len(buffers) == 1:
+                raise TimedOut
+
+    async def skip_sleep(delay: float) -> None:
+        assert delay == 1.0
+
+    monkeypatch.setattr(bot_module, "InputFile", FakeInputFile)
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+
+    await send_transcript(TimeoutThenSuccessMessage(), "x" * 4000)
+
+    assert len(buffers) == 2
+    assert buffers[0] is not buffers[1]
+    assert payloads[0] == payloads[1]
+    assert all(buffer.closed for buffer in buffers)
+
+
+@pytest.mark.asyncio
+async def test_status_edit_timeout_is_non_fatal_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    status = FakeStatus(edit_errors=[TimedOut(), TimedOut(), TimedOut()])
+
+    async def skip_sleep(delay: float) -> None:
+        assert delay in bot_module.TELEGRAM_RETRY_DELAYS_SECONDS
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+
+    updated = await bot_module.edit_status_message(status, "Working...", job_id="job1234")
+
+    assert updated is False
+    assert status.edit_errors == []
 
 
 @pytest.mark.asyncio
@@ -1643,6 +1803,41 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
     assert queued_job.attachment is attachment
     assert queued_job.audio_tempo == 1.4
     assert message.text_replies == ["Video queued for transcription..."]
+
+
+@pytest.mark.asyncio
+async def test_handle_video_upload_queues_job_when_acknowledgement_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TimeoutMessage(FakeMessage):
+        reply_attempts = 0
+
+        async def reply_text(self, text: str, **kwargs: object) -> object:
+            del text, kwargs
+            self.reply_attempts += 1
+            raise TimedOut
+
+    async def skip_sleep(delay: float) -> None:
+        assert delay in bot_module.TELEGRAM_RETRY_DELAYS_SECONDS
+
+    monkeypatch.setattr(bot_module.asyncio, "sleep", skip_sleep)
+    attachment = SimpleNamespace(file_size=10)
+    message = TimeoutMessage(video=attachment)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    queue: asyncio.Queue[bot_module.QueuedMediaJob] = asyncio.Queue()
+    context = SimpleNamespace(
+        bot_data={
+            "settings": Settings(telegram_bot_token="token", openrouter_api_key="key"),
+            "media_job_queue": queue,
+        }
+    )
+
+    await handle_video_upload(update, context)
+
+    queued_job = queue.get_nowait()
+    assert queued_job.attachment is attachment
+    assert queued_job.status_ref["message"] is None
+    assert message.reply_attempts == bot_module.TELEGRAM_REQUEST_MAX_ATTEMPTS
 
 
 @pytest.mark.asyncio
