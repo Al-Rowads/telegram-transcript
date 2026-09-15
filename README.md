@@ -43,6 +43,7 @@ Optional:
 
 - `DEEPGRAM_API_KEY` enables Nova-3. `DEEPGRAM_LANGUAGE` defaults to `ar-IQ`; `DEEPGRAM_KEYTERMS` can contain Iraqi names and domain terms.
 - `OPENAI_API_KEY` enables direct OpenAI transcription.
+- `OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL` and `OPENROUTER_REFINE_MODEL` default to `openai/gpt-5.4-mini` for Iraqi Arabic cleaning and Persian translation, respectively. `/refiner gpt` and `/tmodel gpt` select this model.
 - `REFINE` controls the initial Persian translation default and defaults to `true`.
 - `MAX_VIDEO_MB` defaults to Telegram's 2048 MiB media limit.
 - `AUDIO_TEMPO` accepts `0.5`–`2.0` and defaults to `1.0`.
@@ -53,6 +54,8 @@ Optional:
 - `ALLOWED_TELEGRAM_USER_IDS` optionally restricts access.
 
 `RUNTIME_STATE_PATH` remains accepted for older global preferences. `VIDEO_REGISTRY_PATH` identifies a legacy media registry; startup purges that database and its SQLite sidecars automatically before accepting work. It must not overlap `RUNTIME_STATE_PATH`.
+
+Saved GPT-5.5 translation and refinement selections are mapped to GPT-5.4 mini when loaded from either preference store and written back on the next settings save. Other preferences and environment model overrides remain supported.
 
 ## Commands
 

@@ -33,8 +33,8 @@ def test_load_settings_uses_defaults() -> None:
     assert settings.deepgram_keyterms == ()
     assert settings.openai_api_key == "openai-key"
     assert settings.openrouter_api_key == "openrouter-key"
-    assert settings.openrouter_refine_model == "openai/gpt-5.5"
-    assert settings.openrouter_transcription_refinement_model == "openai/gpt-5.5"
+    assert settings.openrouter_refine_model == "openai/gpt-5.4-mini"
+    assert settings.openrouter_transcription_refinement_model == "openai/gpt-5.4-mini"
     assert settings.refine is True
     assert settings.max_video_bytes == mb_to_bytes(2048)
     assert settings.audio_tempo == 1.0

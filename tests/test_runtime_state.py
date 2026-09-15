@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -13,9 +14,9 @@ def make_store(tmp_path: object) -> RuntimePreferencesStore:
     defaults = RuntimePreferences(
         audio_tempo=1.0,
         transcription_model="gemini",
-        transcription_refinement_model="openai/gpt-5.5",
+        transcription_refinement_model="openai/gpt-5.4-mini",
         translation_enabled=False,
-        translation_model="openai/gpt-5.5",
+        translation_model="openai/gpt-5.4-mini",
         translation_prompt="natural",
     )
     return RuntimePreferencesStore(
@@ -23,9 +24,9 @@ def make_store(tmp_path: object) -> RuntimePreferencesStore:
         defaults=defaults,
         transcription_models=frozenset({"gemini", "deepgram", "whisper"}),
         transcription_refinement_models=frozenset(
-            {"openai/gpt-5.5", "google/gemini-3.5-flash"}
+            {"openai/gpt-5.4-mini", "google/gemini-3.5-flash"}
         ),
-        translation_models=frozenset({"openai/gpt-5.5", "anthropic/claude-sonnet-4.6"}),
+        translation_models=frozenset({"openai/gpt-5.4-mini", "anthropic/claude-sonnet-4.6"}),
         translation_prompts=frozenset({"natural", "literal", "normal", "v2"}),
     )
 
@@ -48,6 +49,44 @@ def test_runtime_preferences_round_trip_and_use_defaults_when_missing(tmp_path: 
     assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 3
 
 
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("legacy_field", ["translation_model", "transcription_refinement_model", "both"])
+def test_runtime_preferences_migrate_saved_gpt_models(tmp_path: object, version: int, legacy_field: str) -> None:
+    store = make_store(tmp_path)
+    expected = replace(
+        store.defaults,
+        audio_tempo=0.8,
+        transcription_model="whisper",
+        translation_prompt="literal",
+        translation_model=(
+            "anthropic/claude-sonnet-4.6"
+            if legacy_field == "transcription_refinement_model"
+            else "openai/gpt-5.4-mini"
+        ),
+        transcription_refinement_model=(
+            "google/gemini-3.5-flash"
+            if legacy_field == "translation_model" and version >= 2
+            else "openai/gpt-5.4-mini"
+        ),
+    )
+    payload = {"version": version, **asdict(expected)}
+    for field in ("translation_model", "transcription_refinement_model"):
+        if legacy_field in {field, "both"}:
+            payload[field] = "openai/gpt-5.5"
+    if version == 1:
+        del payload["transcription_refinement_model"]
+    if version < 3:
+        del payload["translation_enabled"]
+    store.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert store.load() == expected
+    assert store.load() == expected
+    assert json.loads(store.path.read_text(encoding="utf-8")) == payload
+    store.save(store.load())
+    assert json.loads(store.path.read_text(encoding="utf-8")) == {"version": 3, **asdict(expected)}
+    assert store.load() == expected
+
+
 def test_runtime_preferences_load_version_one_with_default_refinement_model(tmp_path: object) -> None:
     store = make_store(tmp_path)
     store.path.write_text(
@@ -65,7 +104,7 @@ def test_runtime_preferences_load_version_one_with_default_refinement_model(tmp_
 
     preferences = store.load()
 
-    assert preferences.transcription_refinement_model == "openai/gpt-5.5"
+    assert preferences.transcription_refinement_model == "openai/gpt-5.4-mini"
     assert preferences.transcription_model == "whisper"
     assert preferences.translation_enabled is False
     assert preferences.translation_model == "anthropic/claude-sonnet-4.6"
@@ -102,7 +141,7 @@ def test_runtime_preferences_reject_invalid_refinement_model(tmp_path: object) -
                 "audio_tempo": 1,
                 "transcription_model": "gemini",
                 "transcription_refinement_model": "invalid",
-                "translation_model": "openai/gpt-5.5",
+                "translation_model": "openai/gpt-5.4-mini",
                 "translation_prompt": "natural",
             }
         ),
@@ -125,9 +164,9 @@ def test_runtime_preferences_reject_invalid_translation_enabled(
                 "version": 3,
                 "audio_tempo": 1,
                 "transcription_model": "gemini",
-                "transcription_refinement_model": "openai/gpt-5.5",
+                "transcription_refinement_model": "openai/gpt-5.4-mini",
                 "translation_enabled": translation_enabled,
-                "translation_model": "openai/gpt-5.5",
+                "translation_model": "openai/gpt-5.4-mini",
                 "translation_prompt": "natural",
             }
         ),
@@ -146,7 +185,7 @@ def test_runtime_preferences_reject_invalid_translation_enabled(
         '{"version": 1, "audio_tempo": 1}',
         (
             '{"version": 1, "audio_tempo": 1, "transcription_model": "invalid", '
-            '"translation_model": "openai/gpt-5.5", "translation_prompt": "normal"}'
+            '"translation_model": "openai/gpt-5.4-mini", "translation_prompt": "normal"}'
         ),
     ],
 )

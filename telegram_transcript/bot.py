@@ -176,7 +176,7 @@ TRANSLATION_MODEL_OPTIONS: dict[str, TranslationModelOption] = {
     "gpt": TranslationModelOption(
         key="gpt",
         model=DEFAULT_REFINEMENT_MODEL,
-        label="OpenRouter GPT-5.5",
+        label="OpenRouter GPT-5.4 mini",
     ),
     "claude": TranslationModelOption(
         key="claude",
@@ -196,7 +196,7 @@ TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS: dict[str, TranscriptionRefinementModelOp
     "gpt": TranscriptionRefinementModelOption(
         key="gpt",
         model=DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
-        label="OpenRouter GPT-5.5",
+        label="OpenRouter GPT-5.4 mini",
     ),
     "gemini": TranscriptionRefinementModelOption(
         key="gemini",

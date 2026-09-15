@@ -27,6 +27,11 @@ class RuntimePreferences:
     translation_prompt: str
 
 
+def normalize_legacy_gpt_model(model: str) -> str:
+    # Keep this migration pinned so future default changes do not retarget saved preferences.
+    return "openai/gpt-5.4-mini" if model == "openai/gpt-5.5" else model
+
+
 class RuntimePreferencesStore:
     def __init__(
         self,
@@ -61,6 +66,9 @@ class RuntimePreferencesStore:
         required_fields = {"audio_tempo", "transcription_model", "translation_model", "translation_prompt"}
         if not required_fields.issubset(payload):
             raise ConfigError(f"Runtime state in {self.path} is missing required settings.")
+        for field in ("transcription_refinement_model", "translation_model"):
+            if isinstance(payload.get(field), str):
+                payload[field] = normalize_legacy_gpt_model(payload[field])
         refinement_model = (
             payload.get("transcription_refinement_model")
             if payload["version"] >= 2

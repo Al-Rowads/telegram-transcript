@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from telegram_transcript.runtime_state import RuntimePreferences
 from telegram_transcript.scoped_state import ScopedStateStore
@@ -11,9 +14,9 @@ def default_preferences() -> RuntimePreferences:
     return RuntimePreferences(
         audio_tempo=1.0,
         transcription_model="gemini",
-        transcription_refinement_model="openai/gpt-5.5",
+        transcription_refinement_model="openai/gpt-5.4-mini",
         translation_enabled=True,
-        translation_model="openai/gpt-5.5",
+        translation_model="openai/gpt-5.4-mini",
         translation_prompt="natural",
     )
 
@@ -23,9 +26,9 @@ def test_scoped_preferences_are_isolated(tmp_path: Path) -> None:
     changed = RuntimePreferences(
         audio_tempo=0.8,
         transcription_model="deepgram",
-        transcription_refinement_model="openai/gpt-5.5",
+        transcription_refinement_model="openai/gpt-5.4-mini",
         translation_enabled=False,
-        translation_model="openai/gpt-5.5",
+        translation_model="openai/gpt-5.4-mini",
         translation_prompt="literal",
     )
     try:
@@ -34,6 +37,58 @@ def test_scoped_preferences_are_isolated(tmp_path: Path) -> None:
         assert store.load_preferences("user:1") == changed
         assert store.load_preferences("user:2") == default_preferences()
         assert store.load_preferences("chat:-100") == default_preferences()
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("legacy_field", ["translation_model", "transcription_refinement_model", "both"])
+def test_scoped_preferences_migrate_saved_gpt_models(tmp_path: Path, legacy_field: str) -> None:
+    database = tmp_path / "state.sqlite3"
+    expected = replace(
+        default_preferences(),
+        audio_tempo=0.8,
+        transcription_model="deepgram",
+        translation_enabled=False,
+        translation_prompt="literal",
+        translation_model=(
+            "anthropic/claude-sonnet-4.6"
+            if legacy_field == "transcription_refinement_model"
+            else "openai/gpt-5.4-mini"
+        ),
+        transcription_refinement_model=(
+            "google/gemini-3.5-flash"
+            if legacy_field == "translation_model"
+            else "openai/gpt-5.4-mini"
+        ),
+    )
+    legacy = replace(expected, **{
+        field: "openai/gpt-5.5"
+        for field in ("translation_model", "transcription_refinement_model")
+        if legacy_field in {field, "both"}
+    })
+    store = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        store.save_preferences("user:1", legacy)
+        store.save_preferences("user:2", expected)
+        assert store.load_preferences("user:1") == expected
+        assert store.load_preferences("user:1") == expected
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT translation_model, transcription_refinement_model FROM scope_preferences WHERE scope_key = ?",
+                ("user:1",),
+            ).fetchone() == (legacy.translation_model, legacy.transcription_refinement_model)
+        store.save_preferences("user:1", store.load_preferences("user:1"))
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT translation_model, transcription_refinement_model FROM scope_preferences WHERE scope_key = ?",
+                ("user:1",),
+            ).fetchone() == (expected.translation_model, expected.transcription_refinement_model)
+        assert store.load_preferences("user:2") == expected
+    finally:
+        store.close()
+    store = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        assert store.load_preferences("user:1") == expected
     finally:
         store.close()
 
@@ -62,9 +117,9 @@ def test_opening_state_database_purges_legacy_jobs_and_preserves_preferences(tmp
     changed = RuntimePreferences(
         audio_tempo=0.9,
         transcription_model="whisper",
-        transcription_refinement_model="openai/gpt-5.5",
+        transcription_refinement_model="openai/gpt-5.4-mini",
         translation_enabled=False,
-        translation_model="openai/gpt-5.5",
+        translation_model="openai/gpt-5.4-mini",
         translation_prompt="literal",
     )
     store = ScopedStateStore(database, defaults=default_preferences())

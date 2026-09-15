@@ -6,7 +6,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from telegram_transcript.runtime_state import RuntimePreferences
+from telegram_transcript.runtime_state import RuntimePreferences, normalize_legacy_gpt_model
 
 
 SCHEMA = """
@@ -55,9 +55,9 @@ class ScopedStateStore:
         return RuntimePreferences(
             audio_tempo=float(row[0]),
             transcription_model=str(row[1]),
-            transcription_refinement_model=str(row[2]),
+            transcription_refinement_model=normalize_legacy_gpt_model(str(row[2])),
             translation_enabled=bool(row[3]),
-            translation_model=str(row[4]),
+            translation_model=normalize_legacy_gpt_model(str(row[4])),
             translation_prompt=str(row[5]),
         )
 

@@ -137,7 +137,7 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
         "whisper",
         "openai",
     )
-    assert transcriber.transcription_refinement_model == "openai/gpt-5.5"
+    assert transcriber.transcription_refinement_model == "openai/gpt-5.4-mini"
 
 
 @pytest.mark.parametrize(
@@ -172,7 +172,7 @@ def test_parse_model_command_arg_accepts_whisper_aliases(argument: str, expected
     "translation_model",
     [
         "google/gemini-3.5-flash",
-        "openai/gpt-5.5",
+        "openai/gpt-5.4-mini",
         "anthropic/claude-sonnet-4.6",
     ],
 )
@@ -194,7 +194,7 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
 @pytest.mark.parametrize(
     ("settings_enabled", "runtime_enabled", "expected_model"),
     [
-        (False, True, "openai/gpt-5.5"),
+        (False, True, "openai/gpt-5.4-mini"),
         (True, False, None),
     ],
 )
@@ -1177,7 +1177,7 @@ async def test_handle_transcription_refinement_model_command_lists_current_model
 
     reply = message.text_replies[0]
     assert "Current transcription refinement model: OpenRouter Gemini 3.5 Flash" in reply
-    assert "gpt: OpenRouter GPT-5.5" in reply
+    assert "gpt: OpenRouter GPT-5.4 mini" in reply
     assert "gemini: OpenRouter Gemini 3.5 Flash" in reply
     assert "Use /refiner gpt or /refiner gemini." in reply
 
@@ -1186,7 +1186,7 @@ async def test_handle_transcription_refinement_model_command_lists_current_model
 @pytest.mark.parametrize(
     ("argument", "expected_model", "expected_label"),
     [
-        ("gpt", "openai/gpt-5.5", "OpenRouter GPT-5.5"),
+        ("gpt", "openai/gpt-5.4-mini", "OpenRouter GPT-5.4 mini"),
         ("google/gemini-3.5-flash", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
     ],
 )
@@ -1322,7 +1322,7 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
         bot_data={
             "settings": settings,
             "transcriber": active_transcriber,
-            "transcription_refinement_model": "openai/gpt-5.5",
+            "transcription_refinement_model": "openai/gpt-5.4-mini",
             "runtime_preferences_store": store,
         },
     )
@@ -1335,7 +1335,7 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
     await handle_transcription_refinement_model_command(update, context)
 
     assert context.bot_data["transcriber"] is active_transcriber
-    assert context.bot_data["transcription_refinement_model"] == "openai/gpt-5.5"
+    assert context.bot_data["transcription_refinement_model"] == "openai/gpt-5.4-mini"
     assert message.text_replies == ["Unable to save runtime settings."]
 
 
@@ -1489,7 +1489,7 @@ async def test_handle_translation_model_command_lists_current_models_and_refine_
     reply = message.text_replies[0]
     assert "Current translation model: OpenRouter Gemini 3.5 Flash" in reply
     assert "Translation: enabled" in reply
-    assert "gpt: OpenRouter GPT-5.5" in reply
+    assert "gpt: OpenRouter GPT-5.4 mini" in reply
     assert "claude: OpenRouter Claude Sonnet 4.6" in reply
     assert message.text_reply_kwargs == [
         {
@@ -1521,7 +1521,7 @@ async def test_handle_translation_model_command_reports_when_refine_is_disabled(
     ("argument", "expected_model", "expected_label"),
     [
         ("gemini", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
-        ("openai/gpt-5.5", "openai/gpt-5.5", "OpenRouter GPT-5.5"),
+        ("openai/gpt-5.4-mini", "openai/gpt-5.4-mini", "OpenRouter GPT-5.4 mini"),
         ("claude", "anthropic/claude-sonnet-4.6", "OpenRouter Claude Sonnet 4.6"),
     ],
 )
@@ -1677,7 +1677,7 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     await handle_translation_prompt_command(update, context)
 
     assert calls == [
-        ("gemini", "openai/gpt-5.5", "natural", "openai/gpt-5.5")
+        ("gemini", "openai/gpt-5.4-mini", "natural", "openai/gpt-5.4-mini")
     ]
     assert context.bot_data["translation_prompt"] == "natural"
     assert context.bot_data["transcriber"] is fake_transcriber
