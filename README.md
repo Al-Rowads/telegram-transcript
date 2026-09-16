@@ -7,18 +7,28 @@ A Telegram bot for faithful Iraqi Arabic transcription and Persian translation o
 1. Telethon downloads the Telegram attachment to a per-job temporary directory.
 2. `ffmpeg` extracts mono 16 kHz lossless FLAC. Optional tempo changes preserve pitch, and all output timestamps are mapped back to the original media timeline.
 3. Audio is split near silence boundaries into provider-safe chunks with overlap ownership boundaries.
-4. A timestamp-capable provider transcribes each chunk. The selected provider is tried first; only configured alternatives are used for failed chunks.
-5. A structured-output pass refines the validated provider cues into Iraqi/Baghdadi Arabic without changing timestamps or numbers. Successful refinement becomes the Arabic delivery source; the raw provider transcript is retained only for fallback.
-6. The refined cues are translated to Persian. Translation must preserve cue identity and numeric values.
-7. The bot delivers the refined Arabic transcript, a bilingual refined-Arabic/Persian SRT, and a Persian-only transcript. If Iraqi refinement fails, it falls back atomically to the raw Arabic transcript and subtitles with a warning.
+4. Deepgram Nova-3 transcribes each chunk by default. Only the explicitly selected provider is called; failure reports an error without switching to another provider.
+5. Iraqi/Baghdadi text refinement and Gemini low-confidence audio correction are both off by default. `/refiner on` and `/correction on` enable these additional paid passes independently.
+6. Persian translation uses Gemini 2.5 Flash-Lite by default. Natural translation batches up to 48 cues with at most two neighboring cues per side; literal translation omits neighboring context.
+7. The bot delivers Arabic text, bilingual Arabic/Persian SRT, and Persian-only text. Optional refinement becomes the Arabic source when successful; failures retain the valid Arabic source with an explicit warning.
 
-Supported transcription providers are OpenRouter Gemini, Deepgram Nova-3 with `ar-IQ`, OpenRouter Whisper Large V3, and direct OpenAI `whisper-1`. Provider credentials are optional individually; at least the selected provider and OpenRouter cleaning/translation path must be configured.
+Supported transcription providers are Deepgram Nova-3 with `ar-IQ`, OpenRouter Gemini 3.5 Flash, OpenRouter Whisper Large V3, and direct OpenAI `whisper-1`. The selected provider needs its credentials; there is no automatic provider fallback. The OpenAI Python SDK remains the transport for OpenRouter and direct Whisper.
+
+### Cost controls
+
+Translation sends compact cue IDs and text, keeping timestamps local. Requests are limited to 12 KiB of serialized input, including at most 1 KiB of neighboring context. Output allowances scale with source length and never exceed 8,192 tokens for translation/refinement. Oversized cues are translated in fragments and reassembled under their original IDs and timestamps; spoken content is never truncated to fit a budget.
+
+Translation and refinement allow at most three provider calls per original batch, including retries and smaller-batch recovery; SDK retries are disabled for these calls. Invalid or truncated output is rejected. Flash-Lite thinking is disabled, Qwen Instruct uses no thinking, and manually selected Gemini 3.5 uses its minimum thinking effort.
+
+`lite` selects `google/gemini-2.5-flash-lite`, `qwen` selects `qwen/qwen3-30b-a3b-instruct-2507`, and `gemini` retains `google/gemini-3.5-flash`. These choices apply to both `/tmodel` and `/refiner`. GPT and Claude options have been removed.
+
+Logs record provider-reported input/output/reasoning tokens and USD cost, including responses rejected by validation. Missing usage is logged as unknown (`None`), never estimated as zero. Actual quality and savings must be evaluated on representative, consented clips; cheaper models and reduced context can affect dialect and translation quality.
 
 ## Correctness and privacy properties
 
 - Provider text is never interpolated into a system instruction. Cleaning uses a static system policy plus untrusted, structured user data.
 - Raw provider cues remain available as fallback artifacts. Successfully refined Iraqi cues become the source for delivered Arabic, SRT rendering, and Persian translation.
-- Structured responses must preserve cue IDs and numbers. Malformed cleaning output falls back atomically to raw Arabic with a warning; malformed translation output falls back to refined Arabic subtitles.
+- Structured responses must preserve cue IDs. Cleaning rejects number changes; translation reports numeric/script discrepancies as advisory warnings. Malformed output retains the valid Arabic source with a warning.
 - Subtitle cues are normalized for readability, chunk overlap is assigned to one owner, and tempo-adjusted timestamps are rescaled to the original video.
 - Jobs capture an immutable settings snapshot when queued, so later commands cannot change in-flight work.
 - Preferences are isolated per private user or group. Only group administrators can mutate group settings.
@@ -37,13 +47,14 @@ Required:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` for Telethon downloads
-- `OPENROUTER_API_KEY` for the default transcription model, Iraqi cleaning, and Persian translation
+- `DEEPGRAM_API_KEY` for the default Nova-3 transcription path
+- `OPENROUTER_API_KEY` for Persian translation and optional Gemini/refinement passes
 
 Optional:
 
-- `DEEPGRAM_API_KEY` enables Nova-3. `DEEPGRAM_LANGUAGE` defaults to `ar-IQ`; `DEEPGRAM_KEYTERMS` can contain Iraqi names and domain terms.
+- `DEEPGRAM_LANGUAGE` defaults to `ar-IQ`; `DEEPGRAM_KEYTERMS` can contain Iraqi names and domain terms. Existing language overrides are preserved.
 - `OPENAI_API_KEY` enables direct OpenAI transcription.
-- `OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL` and `OPENROUTER_REFINE_MODEL` default to `openai/gpt-5.4-mini` for Iraqi Arabic cleaning and Persian translation, respectively. `/refiner gpt` and `/tmodel gpt` select this model.
+- `OPENROUTER_TRANSCRIPTION_REFINEMENT_MODEL` and `OPENROUTER_REFINE_MODEL` default to `google/gemini-2.5-flash-lite`. Custom model overrides remain supported; the operator is responsible for their structured-output support and cost.
 - `REFINE` controls the initial Persian translation default and defaults to `true`.
 - `MAX_VIDEO_MB` defaults to Telegram's 2048 MiB media limit.
 - `AUDIO_TEMPO` accepts `0.5`–`2.0` and defaults to `1.0`.
@@ -55,14 +66,15 @@ Optional:
 
 `RUNTIME_STATE_PATH` remains accepted for older global preferences. `VIDEO_REGISTRY_PATH` identifies a legacy media registry; startup purges that database and its SQLite sidecars automatically before accepting work. It must not overlap `RUNTIME_STATE_PATH`.
 
-Saved GPT-5.5 translation and refinement selections are mapped to GPT-5.4 mini when loaded from either preference store and written back on the next settings save. Other preferences and environment model overrides remain supported.
+On the first upgrade, JSON preferences (v1–v3) and the SQLite preference database migrate once: existing transcription selections become Deepgram, and correction/refinement start disabled. Later explicit provider selections and pass toggles survive restarts. Known GPT-5.5, GPT-5.4 mini, and Claude Sonnet 4.6 text selections, including environment overrides, map to Flash-Lite. Existing Gemini text selections, translation on/off, style, tempo, and custom models remain intact. JSON preferences are saved as v4; SQLite records migration version 1 using `PRAGMA user_version`.
 
 ## Commands
 
 - `/model [gemini|deepgram|whisper|openai]`
-- `/refiner [gpt|gemini]`
+- `/refiner [on|off|lite|qwen|gemini]` (selecting a model enables refinement; `off` remembers it)
+- `/correction [on|off]` (extra Gemini audio calls for Deepgram only)
 - `/translate`
-- `/tmodel [gemini|gpt|claude]`
+- `/tmodel [lite|qwen|gemini]`
 - `/translation [natural|literal]`
 - `/tempo <0.5-2.0>` in groups
 - `/privacy`

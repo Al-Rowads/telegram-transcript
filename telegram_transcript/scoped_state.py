@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from telegram_transcript.runtime_state import RuntimePreferences, normalize_legacy_gpt_model
+from telegram_transcript.model_catalog import GEMINI_FLASH_LITE_MODEL, RETIRED_TEXT_MODELS
 
 
 SCHEMA = """
@@ -18,6 +19,8 @@ CREATE TABLE IF NOT EXISTS scope_preferences (
     translation_enabled INTEGER NOT NULL,
     translation_model TEXT NOT NULL,
     translation_prompt TEXT NOT NULL,
+    transcription_refinement_enabled INTEGER NOT NULL DEFAULT 0,
+    audio_correction_enabled INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 """
@@ -37,16 +40,42 @@ class ScopedStateStore:
             purge_legacy_job_metadata(self._connection)
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.executescript(SCHEMA)
-            self._connection.commit()
+            with self._connection:
+                self._migrate_cost_preferences()
         except Exception:
             self._connection.close()
             raise
+
+    def _migrate_cost_preferences(self) -> None:
+        # Include the reset and version marker in the same transaction so a
+        # restart never resets a user's new, explicit provider selection.
+        self._connection.execute("BEGIN IMMEDIATE")
+        if self._connection.execute("PRAGMA user_version").fetchone()[0] >= 1:
+            return
+        columns = {row[1] for row in self._connection.execute("PRAGMA table_info(scope_preferences)")}
+        for column in ("transcription_refinement_enabled", "audio_correction_enabled"):
+            if column not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE scope_preferences ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                )
+        self._connection.execute(
+            "UPDATE scope_preferences SET transcription_model = 'deepgram', "
+            "transcription_refinement_enabled = 0, audio_correction_enabled = 0"
+        )
+        for field in ("translation_model", "transcription_refinement_model"):
+            for model in RETIRED_TEXT_MODELS:
+                self._connection.execute(
+                    f"UPDATE scope_preferences SET {field} = ? WHERE {field} = ?",
+                    (GEMINI_FLASH_LITE_MODEL, model),
+                )
+        self._connection.execute("PRAGMA user_version=1")
 
     def load_preferences(self, scope_key: str) -> RuntimePreferences:
         with self._lock:
             row = self._connection.execute(
                 "SELECT audio_tempo, transcription_model, transcription_refinement_model, "
-                "translation_enabled, translation_model, translation_prompt "
+                "translation_enabled, translation_model, translation_prompt, "
+                "transcription_refinement_enabled, audio_correction_enabled "
                 "FROM scope_preferences WHERE scope_key = ?",
                 (scope_key,),
             ).fetchone()
@@ -59,6 +88,8 @@ class ScopedStateStore:
             translation_enabled=bool(row[3]),
             translation_model=normalize_legacy_gpt_model(str(row[4])),
             translation_prompt=str(row[5]),
+            transcription_refinement_enabled=bool(row[6]),
+            audio_correction_enabled=bool(row[7]),
         )
 
     def save_preferences(self, scope_key: str, preferences: RuntimePreferences) -> None:
@@ -68,13 +99,16 @@ class ScopedStateStore:
             self._connection.execute(
                 "INSERT INTO scope_preferences "
                 "(scope_key, audio_tempo, transcription_model, transcription_refinement_model, "
-                "translation_enabled, translation_model, translation_prompt, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "translation_enabled, translation_model, translation_prompt, updated_at, "
+                "transcription_refinement_enabled, audio_correction_enabled) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(scope_key) DO UPDATE SET "
                 "audio_tempo=excluded.audio_tempo, transcription_model=excluded.transcription_model, "
                 "transcription_refinement_model=excluded.transcription_refinement_model, "
                 "translation_enabled=excluded.translation_enabled, translation_model=excluded.translation_model, "
-                "translation_prompt=excluded.translation_prompt, updated_at=excluded.updated_at",
+                "translation_prompt=excluded.translation_prompt, updated_at=excluded.updated_at, "
+                "transcription_refinement_enabled=excluded.transcription_refinement_enabled, "
+                "audio_correction_enabled=excluded.audio_correction_enabled",
                 (
                     scope_key,
                     values["audio_tempo"],
@@ -84,6 +118,8 @@ class ScopedStateStore:
                     values["translation_model"],
                     values["translation_prompt"],
                     now,
+                    int(values["transcription_refinement_enabled"]),
+                    int(values["audio_correction_enabled"]),
                 ),
             )
             self._connection.commit()

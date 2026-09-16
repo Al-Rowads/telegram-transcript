@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from telegram_transcript.runtime_state import RuntimePreferences
+from telegram_transcript.model_catalog import GEMINI_FLASH_LITE_MODEL, RETIRED_TEXT_MODELS
 from telegram_transcript.scoped_state import ScopedStateStore
 
 
@@ -14,11 +15,57 @@ def default_preferences() -> RuntimePreferences:
     return RuntimePreferences(
         audio_tempo=1.0,
         transcription_model="gemini",
-        transcription_refinement_model="openai/gpt-5.4-mini",
+        transcription_refinement_model="google/gemini-2.5-flash-lite",
         translation_enabled=True,
-        translation_model="openai/gpt-5.4-mini",
+        translation_model="google/gemini-2.5-flash-lite",
         translation_prompt="natural",
     )
+
+
+@pytest.mark.parametrize("retired_model", sorted(RETIRED_TEXT_MODELS))
+def test_old_sqlite_schema_migrates_once_without_resetting_future_choices(tmp_path: Path, retired_model: str) -> None:
+    database = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE scope_preferences (scope_key TEXT PRIMARY KEY, audio_tempo REAL NOT NULL, "
+            "transcription_model TEXT NOT NULL, transcription_refinement_model TEXT NOT NULL, "
+            "translation_enabled INTEGER NOT NULL, translation_model TEXT NOT NULL, "
+            "translation_prompt TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        connection.executemany(
+            "INSERT INTO scope_preferences VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("user:1", 0.9, "gemini", retired_model, 1, retired_model, "literal", "original"),
+                ("chat:2", 1.0, "whisper", "custom-model", 0, "google/gemini-3.5-flash", "natural", "original"),
+            ],
+        )
+    store = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        migrated = store.load_preferences("user:1")
+        assert migrated.transcription_model == "deepgram"
+        assert migrated.translation_model == GEMINI_FLASH_LITE_MODEL
+        assert migrated.transcription_refinement_model == GEMINI_FLASH_LITE_MODEL
+        assert migrated.audio_tempo == 0.9 and migrated.translation_prompt == "literal"
+        assert migrated.translation_enabled is True
+        assert migrated.transcription_refinement_enabled is False
+        assert migrated.audio_correction_enabled is False
+        other = store.load_preferences("chat:2")
+        assert other.translation_model == "google/gemini-3.5-flash"
+        assert other.transcription_refinement_model == "custom-model"
+        assert other.translation_enabled is False
+        selected = replace(migrated, transcription_model="gemini", transcription_refinement_enabled=True,
+                           audio_correction_enabled=True)
+        store.save_preferences("user:1", selected)
+    finally:
+        store.close()
+    reopened = ScopedStateStore(database, defaults=default_preferences())
+    try:
+        assert reopened.load_preferences("user:1") == selected
+        assert reopened.load_preferences("chat:2") == other
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone() == (1,)
+    finally:
+        reopened.close()
 
 
 def test_scoped_preferences_are_isolated(tmp_path: Path) -> None:
@@ -26,9 +73,9 @@ def test_scoped_preferences_are_isolated(tmp_path: Path) -> None:
     changed = RuntimePreferences(
         audio_tempo=0.8,
         transcription_model="deepgram",
-        transcription_refinement_model="openai/gpt-5.4-mini",
+        transcription_refinement_model="google/gemini-2.5-flash-lite",
         translation_enabled=False,
-        translation_model="openai/gpt-5.4-mini",
+        translation_model="google/gemini-2.5-flash-lite",
         translation_prompt="literal",
     )
     try:
@@ -51,14 +98,14 @@ def test_scoped_preferences_migrate_saved_gpt_models(tmp_path: Path, legacy_fiel
         translation_enabled=False,
         translation_prompt="literal",
         translation_model=(
-            "anthropic/claude-sonnet-4.6"
+            "qwen/qwen3-30b-a3b-instruct-2507"
             if legacy_field == "transcription_refinement_model"
-            else "openai/gpt-5.4-mini"
+            else "google/gemini-2.5-flash-lite"
         ),
         transcription_refinement_model=(
             "google/gemini-3.5-flash"
             if legacy_field == "translation_model"
-            else "openai/gpt-5.4-mini"
+            else "google/gemini-2.5-flash-lite"
         ),
     )
     legacy = replace(expected, **{
@@ -117,9 +164,9 @@ def test_opening_state_database_purges_legacy_jobs_and_preserves_preferences(tmp
     changed = RuntimePreferences(
         audio_tempo=0.9,
         transcription_model="whisper",
-        transcription_refinement_model="openai/gpt-5.4-mini",
+        transcription_refinement_model="google/gemini-2.5-flash-lite",
         translation_enabled=False,
-        translation_model="openai/gpt-5.4-mini",
+        translation_model="google/gemini-2.5-flash-lite",
         translation_prompt="literal",
     )
     store = ScopedStateStore(database, defaults=default_preferences())

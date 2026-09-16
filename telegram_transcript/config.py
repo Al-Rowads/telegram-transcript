@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from telegram_transcript.ffmpeg import DEFAULT_AUDIO_TEMPO
+from telegram_transcript.model_catalog import normalize_legacy_text_model
 from telegram_transcript.transcriber import (
     DEFAULT_DEEPGRAM_LANGUAGE,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
@@ -105,8 +106,8 @@ def load_settings(
         deepgram_keyterms=deepgram_keyterms,
         openai_api_key=openai_api_key,
         openrouter_api_key=openrouter_api_key,
-        openrouter_refine_model=refine_model,
-        openrouter_transcription_refinement_model=transcription_refinement_model,
+        openrouter_refine_model=normalize_legacy_text_model(refine_model),
+        openrouter_transcription_refinement_model=normalize_legacy_text_model(transcription_refinement_model),
         refine=refine,
         allowed_telegram_user_ids=parse_user_ids(source.get("ALLOWED_TELEGRAM_USER_IDS")),
         max_video_mb=max_video_mb,

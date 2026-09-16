@@ -449,6 +449,7 @@ def test_gemini_audio_correction_passes_openrouter_routing_in_extra_body(tmp_pat
     ) == "صحيح"
     assert completions.calls[0]["extra_body"] == {
         "provider": {"require_parameters": True},
+        "reasoning": {"effort": "minimal"},
     }
     assert "provider" not in completions.calls[0]
 
@@ -482,6 +483,7 @@ def test_candidate_resolver_passes_openrouter_routing_in_extra_body() -> None:
     assert completions.calls[0]["response_format"]["json_schema"]["strict"] is True
     assert completions.calls[0]["extra_body"] == {
         "provider": {"require_parameters": True},
+        "reasoning": {"enabled": False},
     }
     assert "provider" not in completions.calls[0]
 
@@ -1281,7 +1283,7 @@ def test_iraqi_refiner_uses_exact_system_prompt_and_preserves_srt_identity() -> 
     assert raw_srt.strip() not in call["messages"][0]["content"]
     assert json.loads(call["messages"][1]["content"])["cues"][0]["text"] == "قال أقدر"
     assert call["response_format"]["type"] == "json_schema"
-    assert call["extra_body"] == {"provider": {"require_parameters": True}}
+    assert call["extra_body"] == {"provider": {"require_parameters": True}, "reasoning": {"enabled": False}}
 
 
 def test_gemini_iraqi_refiner_uses_only_the_system_prompt() -> None:
@@ -1438,7 +1440,7 @@ def test_transcript_refiner_uses_structured_one_cue_translation_request() -> Non
     assert "temperature" not in call
     assert call["response_format"]["type"] == "json_schema"
     assert call["response_format"]["json_schema"]["strict"] is True
-    assert call["extra_body"] == {"provider": {"require_parameters": True}}
+    assert call["extra_body"] == {"provider": {"require_parameters": True}, "reasoning": {"enabled": False}}
     assert "provider" not in call
 
 
@@ -1476,7 +1478,10 @@ def test_cohesive_refiner_includes_only_supplied_previous_context() -> None:
     assert messages[0]["content"] == SRT_TRANSLATION_COHESIVE_SYSTEM_PROMPT
     user_content = messages[1]["content"]
     assert "Arabic 1" not in user_content
-    for index in range(2, 7):
+    for index in range(2, 5):
+        assert f"Arabic {index}" not in user_content
+        assert f"Persian {index}" not in user_content
+    for index in range(5, 7):
         assert f"Arabic {index}" in user_content
         assert f"Persian {index}" in user_content
     assert "Arabic 7" in user_content
@@ -1523,15 +1528,13 @@ def test_transcript_refiner_does_not_retry_changed_number() -> None:
     assert completions.calls == 1
 
 
-def test_refinement_input_uses_delimited_raw_transcript() -> None:
+def test_refinement_input_sends_only_cue_identity_and_text() -> None:
     raw = "1\n00:00:00,000 --> 00:00:01,000\nهاي تجربة\n"
 
     refinement_input = build_refinement_input(raw)
 
-    assert SRT_TRANSLATION_REQUEST in refinement_input
-    assert "<target_cues>" in refinement_input
-    assert "</target_cues>" in refinement_input
-    assert raw.strip() in refinement_input
+    assert json.loads(refinement_input) == {"cues": [["1", "هاي تجربة"]]}
+    assert "00:00" not in refinement_input
 
 
 def test_transcribe_chunks_skips_refinement_for_empty_transcript(tmp_path: Path) -> None:
@@ -1881,10 +1884,9 @@ def test_parse_srt_batch_translation_response_rejects_invalid_results(response: 
         parse_srt_batch_translation_response(response, expected_indexes=("1",))
 
 
-def test_batch_translation_retries_then_bisects_malformed_response() -> None:
+def test_batch_translation_bisects_once_with_three_call_ceiling() -> None:
     responses = iter(
         [
-            "not json",
             "not json",
             '{"translations":[{"index":"1","translation":"اول"}]}',
             '{"translations":[{"index":"2","translation":"دوم"}]}',
@@ -1912,11 +1914,11 @@ def test_batch_translation_retries_then_bisects_malformed_response() -> None:
     )
 
     assert refiner.translate_srt_blocks(blocks) == ("اول", "دوم")
-    assert len(completions.calls) == 4
+    assert len(completions.calls) == 3
 
 
 @pytest.mark.asyncio
-async def test_transcribe_chunks_translates_twelve_cue_batches_with_bidirectional_context(
+async def test_transcribe_chunks_translates_forty_eight_cue_batches_with_bounded_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1932,7 +1934,7 @@ async def test_transcribe_chunks_translates_twelve_cue_batches_with_bidirectiona
         model = "nova-3"
 
         def transcribe_file_result(self, audio: Path, *, previous_transcript: str = "") -> FileTranscriptionResult:
-            cues = tuple(SubtitleCue(float(index), float(index + 1), f"Arabic {index + 1}") for index in range(13))
+            cues = tuple(SubtitleCue(float(index), float(index + 1), f"Arabic {index + 1}") for index in range(49))
             return FileTranscriptionResult(transcript="raw", subtitle_cues=cues)
 
     class FakeRefiner:
@@ -1960,10 +1962,10 @@ async def test_transcribe_chunks_translates_twelve_cue_batches_with_bidirectiona
         refiner=refiner,
     ).transcribe_chunks_async((audio_path,))
 
-    assert refiner.calls[0] == (tuple(str(index) for index in range(1, 13)), (), ("13",))
-    assert refiner.calls[1] == (("13",), ("8", "9", "10", "11", "12"), ())
+    assert refiner.calls[0] == (tuple(str(index) for index in range(1, 49)), (), ("49",))
+    assert refiner.calls[1] == (("49",), ("47", "48"), ())
     assert result.subtitle_cues[0].start_seconds == 0.0
-    assert result.subtitle_cues[-1].end_seconds == 13.0
+    assert result.subtitle_cues[-1].end_seconds == 49.0
 
 
 def test_merge_overlapping_subtitle_cues_deduplicates_chunk_overlap() -> None:

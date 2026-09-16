@@ -20,6 +20,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from telegram_transcript.config import ConfigError, Settings, load_settings, parse_audio_tempo
 from telegram_transcript.ffmpeg import FfmpegError, ensure_ffmpeg_available, extract_audio, split_audio_to_timed_chunks
+from telegram_transcript.model_catalog import QWEN_TRANSLATION_MODEL, normalize_legacy_text_model
 from telegram_transcript.models import TranscriptionResult
 from telegram_transcript.privacy_migrate import delete_legacy_registry_data, delete_legacy_registry_files
 from telegram_transcript.runtime_state import RuntimePreferences, RuntimePreferencesStore, RuntimeStateError
@@ -31,12 +32,10 @@ from telegram_transcript.telegram_utils import (
 )
 from telegram_transcript.telegram_downloader import TelegramDownloadError, TelegramMediaDownloader
 from telegram_transcript.transcriber import (
-    CLAUDE_SONNET_TRANSLATION_MODEL,
     DEFAULT_DEEPGRAM_TRANSCRIPTION_MODEL,
     DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
     DEFAULT_OPENAI_TRANSCRIPTION_MODEL,
     DEFAULT_REFINEMENT_MODEL,
-    DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
     DEFAULT_TRANSLATION_PROMPT_KEY,
     DEFAULT_WHISPER_LARGE_V3_TRANSCRIPTION_MODEL,
     TRANSLATION_PROMPT_ALIASES,
@@ -73,7 +72,7 @@ AUDIO_SUFFIX_BY_MIME = {
 }
 GROUP_CHAT_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
 DEFAULT_OUTPUT_BASENAME = "transcript"
-DEFAULT_TRANSCRIPTION_MODEL_KEY = "gemini"
+DEFAULT_TRANSCRIPTION_MODEL_KEY = "deepgram"
 STATUS_PROGRESS_EDIT_INTERVAL_SECONDS = 30.0
 HELP_MESSAGE_DELETE_DELAY_SECONDS = 20.0
 TELEGRAM_REQUEST_MAX_ATTEMPTS = 3
@@ -85,9 +84,10 @@ HELP_MESSAGE = """Available commands:
 /start - Start the bot (currently no additional setup is required).
 /tempo <0.5-2.0> - Set audio tempo for future media (groups only).
 /model [gemini|deepgram|whisper|openai] - Show or select the primary transcription model.
-/refiner [gpt|gemini] - Show or select the Iraqi transcription refinement model.
+/refiner [on|off|lite|qwen|gemini] - Enable or disable Iraqi refinement (off by default).
+/correction [on|off] - Enable Gemini audio correction (off by default; adds cost).
 /translate - Toggle Persian translation for future media.
-/tmodel [gemini|gpt|claude] - Show or select the translation model.
+/tmodel [lite|qwen|gemini] - Show or select the translation model.
 /translation [natural|literal] - Show or select the translation style.
 /privacy - Show data handling and retention information.
 /forget - Delete your scope's retained preferences.
@@ -158,7 +158,6 @@ TRANSCRIPTION_MODEL_OPTIONS: dict[str, TranscriptionModelOption] = {
         label="Direct OpenAI whisper-1",
     ),
 }
-TRANSCRIPTION_FALLBACK_ORDER = ("gemini", "deepgram", "whisper", "openai")
 TRANSCRIPTION_MODEL_ALIASES = {
     option.key: option.key
     for option in TRANSCRIPTION_MODEL_OPTIONS.values()
@@ -173,15 +172,15 @@ TRANSLATION_MODEL_OPTIONS: dict[str, TranslationModelOption] = {
         model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
         label="OpenRouter Gemini 3.5 Flash",
     ),
-    "gpt": TranslationModelOption(
-        key="gpt",
+    "lite": TranslationModelOption(
+        key="lite",
         model=DEFAULT_REFINEMENT_MODEL,
-        label="OpenRouter GPT-5.4 mini",
+        label="Gemini 2.5 Flash-Lite (budget default)",
     ),
-    "claude": TranslationModelOption(
-        key="claude",
-        model=CLAUDE_SONNET_TRANSLATION_MODEL,
-        label="OpenRouter Claude Sonnet 4.6",
+    "qwen": TranslationModelOption(
+        key="qwen",
+        model=QWEN_TRANSLATION_MODEL,
+        label="Qwen3 30B A3B Instruct (budget)",
     ),
 }
 TRANSLATION_MODEL_ALIASES = {
@@ -193,16 +192,8 @@ TRANSLATION_MODEL_ALIASES = {
 }
 
 TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS: dict[str, TranscriptionRefinementModelOption] = {
-    "gpt": TranscriptionRefinementModelOption(
-        key="gpt",
-        model=DEFAULT_TRANSCRIPTION_REFINEMENT_MODEL,
-        label="OpenRouter GPT-5.4 mini",
-    ),
-    "gemini": TranscriptionRefinementModelOption(
-        key="gemini",
-        model=DEFAULT_GEMINI_TRANSCRIPTION_MODEL,
-        label="OpenRouter Gemini 3.5 Flash",
-    ),
+    key: TranscriptionRefinementModelOption(key=key, model=option.model, label=option.label)
+    for key, option in TRANSLATION_MODEL_OPTIONS.items()
 }
 TRANSCRIPTION_REFINEMENT_MODEL_ALIASES = {
     option.key: option.model
@@ -217,9 +208,9 @@ def create_runtime_preferences_store(settings: Settings) -> RuntimePreferencesSt
     defaults = RuntimePreferences(
         audio_tempo=settings.audio_tempo,
         transcription_model=DEFAULT_TRANSCRIPTION_MODEL_KEY,
-        transcription_refinement_model=settings.openrouter_transcription_refinement_model,
+        transcription_refinement_model=normalize_legacy_text_model(settings.openrouter_transcription_refinement_model),
         translation_enabled=settings.refine,
-        translation_model=settings.openrouter_refine_model,
+        translation_model=normalize_legacy_text_model(settings.openrouter_refine_model),
         translation_prompt=DEFAULT_TRANSLATION_PROMPT_KEY,
     )
     return RuntimePreferencesStore(
@@ -271,6 +262,8 @@ def create_application(settings: Settings | None = None) -> Application:
         transcription_refinement_model=selected_refinement_model,
         translation_model=runtime_preferences.translation_model,
         translation_prompt=translation_prompt,
+        transcription_refinement_enabled=runtime_preferences.transcription_refinement_enabled,
+        audio_correction_enabled=runtime_preferences.audio_correction_enabled,
     )
 
     app = (
@@ -289,6 +282,8 @@ def create_application(settings: Settings | None = None) -> Application:
     app.bot_data["transcriber"] = transcriber
     app.bot_data["transcription_model"] = runtime_preferences.transcription_model
     app.bot_data["transcription_refinement_model"] = selected_refinement_model
+    app.bot_data["transcription_refinement_enabled"] = runtime_preferences.transcription_refinement_enabled
+    app.bot_data["audio_correction_enabled"] = runtime_preferences.audio_correction_enabled
     app.bot_data["translation_enabled"] = runtime_preferences.translation_enabled
     app.bot_data["translation_model"] = runtime_preferences.translation_model
     app.bot_data["translation_prompt"] = translation_prompt
@@ -307,6 +302,7 @@ def create_application(settings: Settings | None = None) -> Application:
     app.add_handler(CommandHandler("tempo", handle_tempo_command))
     app.add_handler(CommandHandler("model", handle_model_command))
     app.add_handler(CommandHandler("refiner", handle_transcription_refinement_model_command))
+    app.add_handler(CommandHandler("correction", handle_audio_correction_command))
     app.add_handler(CommandHandler("translate", handle_translation_toggle_command))
     app.add_handler(CommandHandler("tmodel", handle_translation_model_command))
     app.add_handler(CommandHandler("translation", handle_translation_prompt_command))
@@ -324,30 +320,21 @@ def create_transcriber(
     translation_prompt: str = DEFAULT_TRANSLATION_PROMPT_KEY,
     transcription_refinement_model: str | None = None,
     translation_enabled: bool | None = None,
+    transcription_refinement_enabled: bool = False,
+    audio_correction_enabled: bool = False,
 ) -> SpeechTranscriber:
     if not settings.openrouter_api_key:
         raise ConfigError(
             "OPENROUTER_API_KEY is required for Iraqi Arabic cleaning and Persian translation."
         )
-    model_order = get_transcription_model_order(model_key)
-    configured_model_order = tuple(
-        ordered_model_key
-        for ordered_model_key in model_order
-        if is_model_option_configured(TRANSCRIPTION_MODEL_OPTIONS[ordered_model_key], settings)
-    )
-    if not configured_model_order:
-        raise ConfigError("At least one transcription provider must be configured.")
-    speech_to_text_providers = [
-        create_speech_to_text_provider(settings, ordered_model_key)
-        for ordered_model_key in configured_model_order
-    ]
+    speech_to_text_provider = create_speech_to_text_provider(settings, model_key)
     canonical_prompt = canonicalize_translation_prompt_key(translation_prompt)
     effective_translation_enabled = settings.refine if translation_enabled is None else translation_enabled
 
     refiner = (
         TranscriptRefiner(
             api_key=settings.openrouter_api_key,
-            model=translation_model or settings.openrouter_refine_model,
+            model=normalize_legacy_text_model(translation_model or settings.openrouter_refine_model),
             system_prompt=TRANSLATION_PROMPT_OPTIONS[canonical_prompt],
             prompt_key=canonical_prompt,
         )
@@ -359,20 +346,19 @@ def create_transcriber(
             secondary_provider=GeminiAudioCorrectionProvider(api_key=settings.openrouter_api_key),
             resolver=TranscriptCandidateResolver(
                 api_key=settings.openrouter_api_key,
-                model=translation_model or settings.openrouter_refine_model,
+                model=DEFAULT_REFINEMENT_MODEL,
             ),
         )
-    }
-    selected_refinement_model = (
+    } if audio_correction_enabled and model_key == "deepgram" else {}
+    selected_refinement_model = normalize_legacy_text_model(
         transcription_refinement_model or settings.openrouter_transcription_refinement_model
     )
     return SpeechTranscriber(
-        speech_to_text_provider=speech_to_text_providers[0],
-        fallback_speech_to_text_providers=speech_to_text_providers[1:],
+        speech_to_text_provider=speech_to_text_provider,
         transcription_refiner=IraqiArabicTranscriptRefiner(
             api_key=settings.openrouter_api_key,
             model=selected_refinement_model,
-        ),
+        ) if transcription_refinement_enabled else None,
         refiner=refiner,
         correctors_by_provider=correctors_by_provider,
     )
@@ -403,13 +389,15 @@ def create_runtime_transcriber(
         translation_model=translation_model or get_runtime_translation_model(context, settings),
         translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
         transcription_refinement_model=selected_refinement_model,
+        transcription_refinement_enabled=get_runtime_optional_pass(context, "transcription_refinement_enabled"),
+        audio_correction_enabled=get_runtime_optional_pass(context, "audio_correction_enabled"),
     )
 
 
 def get_transcription_model_order(model_key: str) -> tuple[str, ...]:
     if model_key not in TRANSCRIPTION_MODEL_OPTIONS:
         raise ConfigError(f"Unknown transcription model: {model_key}")
-    return (model_key, *(key for key in TRANSCRIPTION_FALLBACK_ORDER if key != model_key))
+    return (model_key,)
 
 
 def create_speech_to_text_provider(settings: Settings, model_key: str) -> object:
@@ -670,6 +658,8 @@ async def handle_model_command(update: Update, context: ContextTypes.DEFAULT_TYP
             transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=preferences.translation_model,
             translation_prompt=preferences.translation_prompt,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
@@ -715,7 +705,11 @@ async def handle_transcription_refinement_model_command(
         await reply_to_source(message, format_unknown_transcription_refinement_model_message())
         return
 
-    refinement_model = parse_transcription_refinement_model_command_arg(args[0])
+    action = args[0].strip().lower()
+    refinement_model = (
+        preferences.transcription_refinement_model if action in {"on", "off"}
+        else parse_transcription_refinement_model_command_arg(action)
+    )
     if refinement_model is None:
         await reply_to_source(message, format_unknown_transcription_refinement_model_message())
         return
@@ -730,24 +724,66 @@ async def handle_transcription_refinement_model_command(
             transcription_refinement_model=refinement_model,
             translation_model=preferences.translation_model,
             translation_prompt=preferences.translation_prompt,
+            transcription_refinement_enabled=action != "off",
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
         save_scoped_preferences(
             context,
             message,
             user_id,
-            replace(preferences, transcription_refinement_model=refinement_model),
+            replace(preferences, transcription_refinement_model=refinement_model,
+                    transcription_refinement_enabled=action != "off"),
         )
         activate_legacy_runtime_transcriber(context, replacement_transcriber)
     except (ConfigError, RuntimeStateError) as exc:
         await reply_to_source(message, str(exc))
         return
 
-    option = next(
-        option
-        for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values()
-        if option.model == refinement_model
-    )
-    await reply_to_source(message, f"Transcription refinement model set to {option.label}.")
+    await reply_to_source(message, format_transcription_refinement_preferences_message(
+        replace(preferences, transcription_refinement_model=refinement_model,
+                transcription_refinement_enabled=action != "off")
+    ))
+
+
+async def handle_audio_correction_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or get_chat_type(message) == ChatType.CHANNEL:
+        return
+    settings: Settings = context.bot_data["settings"]
+    user_id = get_update_user_id(update)
+    if not is_authorized(settings, user_id):
+        await reply_to_source(message, "Sorry, this bot is not enabled for your Telegram account.")
+        return
+    preferences = get_scoped_preferences(context, message, user_id)
+    args = getattr(context, "args", None)
+    if not args:
+        status = "on" if preferences.audio_correction_enabled else "off"
+        await reply_to_source(message, f"Deepgram audio correction: {status}. Use /correction on or off. "
+                              "Enabling it adds Gemini audio and text calls.")
+        return
+    if len(args) != 1 or args[0].lower() not in {"on", "off"}:
+        await reply_to_source(message, "Usage: /correction on or /correction off")
+        return
+    if not await can_change_scope_preferences(context, message, user_id):
+        await reply_to_source(message, "Only chat administrators can change group transcription settings.")
+        return
+    enabled = args[0].lower() == "on"
+    try:
+        transcriber = create_transcriber(
+            settings, preferences.transcription_model,
+            translation_enabled=preferences.translation_enabled,
+            translation_model=preferences.translation_model,
+            translation_prompt=preferences.translation_prompt,
+            transcription_refinement_model=preferences.transcription_refinement_model,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=enabled,
+        )
+        save_scoped_preferences(context, message, user_id, replace(preferences, audio_correction_enabled=enabled))
+        activate_legacy_runtime_transcriber(context, transcriber)
+    except (ConfigError, RuntimeStateError) as exc:
+        await reply_to_source(message, str(exc))
+        return
+    await reply_to_source(message, f"Deepgram audio correction is {'on (additional Gemini calls)' if enabled else 'off'}.")
 
 
 async def handle_translation_toggle_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -779,6 +815,8 @@ async def handle_translation_toggle_command(update: Update, context: ContextType
             transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=preferences.translation_model,
             translation_prompt=preferences.translation_prompt,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
         save_scoped_preferences(
             context,
@@ -832,6 +870,8 @@ async def handle_translation_model_command(update: Update, context: ContextTypes
             transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=option.model,
             translation_prompt=preferences.translation_prompt,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
     except ConfigError as exc:
         await reply_to_source(message, str(exc))
@@ -886,6 +926,8 @@ async def handle_translation_prompt_command(update: Update, context: ContextType
             transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=preferences.translation_model,
             translation_prompt=prompt_key,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
         save_scoped_preferences(
             context,
@@ -932,6 +974,8 @@ async def handle_media_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             transcription_refinement_model=preferences.transcription_refinement_model,
             translation_model=preferences.translation_model,
             translation_prompt=preferences.translation_prompt,
+            transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+            audio_correction_enabled=preferences.audio_correction_enabled,
         )
     except ConfigError as exc:
         await reply_to_source(message, f"Transcription configuration is unavailable: {exc}")
@@ -1010,8 +1054,10 @@ async def process_media_message(
     )
     base_name = get_media_attachment_basename(attachment)
     job_started = time.monotonic()
-    total_steps = 7 if translation_enabled else 6
-    sending_step = 7 if translation_enabled else 6
+    refinement_enabled = getattr(transcriber, "transcription_refiner", None) is not None
+    translation_step = 5 + int(refinement_enabled)
+    total_steps = 5 + int(refinement_enabled) + int(translation_enabled)
+    sending_step = total_steps
 
     with tempfile.TemporaryDirectory(prefix="telegram-transcript-") as tmp:
         work_dir = Path(tmp)
@@ -1223,9 +1269,9 @@ async def process_media_message(
                 index = progress_data.get("index")
                 total = progress_data.get("total")
                 if isinstance(total, int) and total > 1:
-                    status_text = f"Step 6/{total_steps}: translating subtitle cue {index}/{total}..."
+                    status_text = f"Step {translation_step}/{total_steps}: translating subtitle cue {index}/{total}..."
                 else:
-                    status_text = f"Step 6/{total_steps}: translating subtitles..."
+                    status_text = f"Step {translation_step}/{total_steps}: translating subtitles..."
                 now = time.monotonic()
                 if (
                     last_translation_status_attempt_at is None
@@ -1239,8 +1285,9 @@ async def process_media_message(
                         job_id=job_id,
                     )
                 logger.info(
-                    "job %s step 6/%d translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
+                    "job %s step %d/%d translating subtitle cue %s/%s: srt_chars=%s srt_bytes=%s model=%s",
                     job_id,
+                    translation_step,
                     total_steps,
                     index,
                     total,
@@ -1250,8 +1297,9 @@ async def process_media_message(
                 )
             elif event == "translation_complete":
                 logger.info(
-                    "job %s step 6/%d translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
+                    "job %s step %d/%d translated SRT and derived transcript: translated_srt_chars=%s line_translated_transcript_chars=%s",
                     job_id,
+                    translation_step,
                     total_steps,
                     progress_data.get("translated_srt_chars"),
                     progress_data.get("line_translated_transcript_chars"),
@@ -1260,12 +1308,13 @@ async def process_media_message(
                 await update_status_message(
                     message,
                     status_ref,
-                    f"Step 6/{total_steps}: translation failed; preparing Arabic subtitles...",
+                    f"Step {translation_step}/{total_steps}: translation failed; preparing Arabic subtitles...",
                     job_id=job_id,
                 )
                 logger.warning(
-                    "job %s step 6/%d translation failed; Arabic subtitles will be delivered: model=%s",
+                    "job %s step %d/%d translation failed; Arabic subtitles will be delivered: model=%s",
                     job_id,
+                    translation_step,
                     total_steps,
                     progress_data.get("model"),
                 )
@@ -1618,6 +1667,8 @@ def get_scoped_preferences(
         translation_enabled=get_runtime_translation_enabled(context, settings),
         translation_model=get_runtime_translation_model(context, settings),
         translation_prompt=get_runtime_translation_prompt(context),
+        transcription_refinement_enabled=get_runtime_optional_pass(context, "transcription_refinement_enabled"),
+        audio_correction_enabled=get_runtime_optional_pass(context, "audio_correction_enabled"),
     )
 
 
@@ -1642,6 +1693,8 @@ def save_scoped_preferences(
         translation_enabled=preferences.translation_enabled,
         translation_model=preferences.translation_model,
         translation_prompt=preferences.translation_prompt,
+        transcription_refinement_enabled=preferences.transcription_refinement_enabled,
+        audio_correction_enabled=preferences.audio_correction_enabled,
     )
     context.bot_data.update(
         {
@@ -1651,6 +1704,8 @@ def save_scoped_preferences(
             "translation_enabled": preferences.translation_enabled,
             "translation_model": preferences.translation_model,
             "translation_prompt": preferences.translation_prompt,
+            "transcription_refinement_enabled": preferences.transcription_refinement_enabled,
+            "audio_correction_enabled": preferences.audio_correction_enabled,
         }
     )
 
@@ -1712,6 +1767,10 @@ def parse_transcription_refinement_model_command_arg(raw: object) -> str | None:
     return TRANSCRIPTION_REFINEMENT_MODEL_ALIASES.get(raw.strip().lower())
 
 
+def get_runtime_optional_pass(context: ContextTypes.DEFAULT_TYPE | Application, name: str) -> bool:
+    return context.bot_data.get(name, False) is True
+
+
 def get_runtime_model_key(context: ContextTypes.DEFAULT_TYPE) -> str:
     candidate = context.bot_data.get("transcription_model", DEFAULT_TRANSCRIPTION_MODEL_KEY)
     if isinstance(candidate, str) and candidate in TRANSCRIPTION_MODEL_OPTIONS:
@@ -1765,6 +1824,8 @@ def persist_runtime_preferences(
     translation_enabled: bool | None = None,
     translation_model: str | None = None,
     translation_prompt: str | None = None,
+    transcription_refinement_enabled: bool | None = None,
+    audio_correction_enabled: bool | None = None,
 ) -> None:
     settings: Settings = context.bot_data["settings"]
     store = context.bot_data.get("runtime_preferences_store")
@@ -1785,6 +1846,14 @@ def persist_runtime_preferences(
             ),
             translation_model=translation_model or get_runtime_translation_model(context, settings),
             translation_prompt=translation_prompt or get_runtime_translation_prompt(context),
+            transcription_refinement_enabled=(
+                get_runtime_optional_pass(context, "transcription_refinement_enabled")
+                if transcription_refinement_enabled is None else transcription_refinement_enabled
+            ),
+            audio_correction_enabled=(
+                get_runtime_optional_pass(context, "audio_correction_enabled")
+                if audio_correction_enabled is None else audio_correction_enabled
+            ),
         )
     )
 
@@ -1849,7 +1918,7 @@ def format_transcription_refinement_model_settings_message(
     for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values():
         lines.append(f"- {option.key}: {option.label}")
     lines.append("")
-    lines.append("Use /refiner gpt or /refiner gemini.")
+    lines.append("Use /refiner on, off, lite, qwen, or gemini.")
     return "\n".join(lines)
 
 
@@ -1862,15 +1931,16 @@ def format_transcription_refinement_preferences_message(preferences: RuntimePref
         ),
         preferences.transcription_refinement_model,
     )
-    lines = [f"Current transcription refinement model: {current_label}", "", "Available models:"]
+    status = "on" if preferences.transcription_refinement_enabled else "off"
+    lines = [f"Iraqi refinement: {status}", f"Current transcription refinement model: {current_label}", "", "Available models:"]
     lines.extend(f"- {option.key}: {option.label}" for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values())
-    lines.extend(("", "Use /refiner gpt or /refiner gemini."))
+    lines.extend(("", "Use /refiner on, off, lite, qwen, or gemini."))
     return "\n".join(lines)
 
 
 def format_unknown_transcription_refinement_model_message() -> str:
     options = ", ".join(option.key for option in TRANSCRIPTION_REFINEMENT_MODEL_OPTIONS.values())
-    return f"Unknown transcription refinement model. Available models: {options}."
+    return f"Use /refiner on, off, or a model: {options}."
 
 
 def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE, settings: Settings) -> str:
@@ -1888,7 +1958,7 @@ def format_translation_model_settings_message(context: ContextTypes.DEFAULT_TYPE
     for option in TRANSLATION_MODEL_OPTIONS.values():
         lines.append(f"- {option.key}: {option.label}")
     lines.append("")
-    lines.append("Use /tmodel gemini, /tmodel gpt, or /tmodel claude.")
+    lines.append("Use /tmodel lite, /tmodel qwen, or /tmodel gemini.")
     return "\n".join(lines)
 
 
@@ -1904,7 +1974,7 @@ def format_translation_preferences_message(preferences: RuntimePreferences) -> s
         "Available models:",
     ]
     lines.extend(f"- {option.key}: {option.label}" for option in TRANSLATION_MODEL_OPTIONS.values())
-    lines.extend(("", "Use /tmodel gemini, /tmodel gpt, or /tmodel claude."))
+    lines.extend(("", "Use /tmodel lite, /tmodel qwen, or /tmodel gemini."))
     return "\n".join(lines)
 
 

@@ -34,6 +34,7 @@ from telegram_transcript.bot import (
 )
 from telegram_transcript.config import ConfigError, Settings
 from telegram_transcript.models import AudioChunk, TranscriptionResult, SubtitleCue
+from telegram_transcript.scoped_state import ScopedStateStore
 from telegram_transcript.transcriber import PERSIAN_TRANSLATION_NUMBER_WARNING
 
 
@@ -112,6 +113,70 @@ class FakeAdminBot:
         return SimpleNamespace(status="administrator")
 
 
+@pytest.mark.asyncio
+async def test_optional_pass_commands_preserve_scopes_and_queued_settings(tmp_path: Path) -> None:
+    settings = Settings(telegram_bot_token="test", deepgram_api_key="test", openrouter_api_key="test")
+    defaults = bot_module.create_runtime_preferences_store(settings).defaults
+    store = ScopedStateStore(tmp_path / "state.sqlite3", defaults=defaults)
+    message = FakeMessage(video=SimpleNamespace(file_size=1))
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(args=["qwen"], bot_data={
+        "settings": settings, "scoped_state_store": store, "media_job_queue": asyncio.Queue(),
+    })
+    try:
+        await handle_transcription_refinement_model_command(update, context)
+        context.args = ["on"]
+        await bot_module.handle_audio_correction_command(update, context)
+        await handle_video_upload(update, context)
+        queued = context.bot_data["media_job_queue"].get_nowait()
+        assert queued.transcriber.transcription_refinement_model == "qwen/qwen3-30b-a3b-instruct-2507"
+        assert "deepgram" in queued.transcriber.correctors_by_provider
+        context.args = ["off"]
+        await handle_transcription_refinement_model_command(update, context)
+        await bot_module.handle_audio_correction_command(update, context)
+        preferences = store.load_preferences("user:123")
+        assert not preferences.transcription_refinement_enabled
+        assert not preferences.audio_correction_enabled
+        # The queued object is an immutable settings snapshot, not the live settings.
+        assert queued.transcriber.transcription_refinement_model == preferences.transcription_refinement_model
+        assert "deepgram" in queued.transcriber.correctors_by_provider
+        assert store.load_preferences("user:456") == defaults
+        context.args = ["on"]
+        await handle_transcription_refinement_model_command(update, context)
+        restored = store.load_preferences("user:123")
+        assert restored.transcription_refinement_enabled
+        assert restored.transcription_refinement_model == "qwen/qwen3-30b-a3b-instruct-2507"
+        assert not restored.audio_correction_enabled
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", [handle_transcription_refinement_model_command, bot_module.handle_audio_correction_command])
+async def test_optional_passes_require_group_administrator(tmp_path: Path, handler: object) -> None:
+    class MemberBot:
+        async def get_chat_member(self, chat_id: int, user_id: int) -> object:
+            return SimpleNamespace(status="member")
+
+    settings = Settings(telegram_bot_token="test", deepgram_api_key="test", openrouter_api_key="test")
+    defaults = bot_module.create_runtime_preferences_store(settings).defaults
+    store = ScopedStateStore(tmp_path / "state.sqlite3", defaults=defaults)
+    message = FakeMessage(chat_type=ChatType.SUPERGROUP)
+    update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
+    context = SimpleNamespace(args=["on"], bot=MemberBot(), bot_data={"settings": settings, "scoped_state_store": store})
+    try:
+        await handler(update, context)
+        assert "Only chat administrators" in message.text_replies[-1]
+        assert store.load_preferences("chat:100") == defaults
+        context.bot = FakeAdminBot()
+        await handler(update, context)
+        changed = store.load_preferences("chat:100")
+        assert changed != defaults
+        assert store.load_preferences("user:123") == defaults
+    finally:
+        store.close()
+
+
 def make_timed_out(cause_message: str = "network timeout") -> TimedOut:
     try:
         raise TimedOut from TimeoutError(cause_message)
@@ -119,7 +184,7 @@ def make_timed_out(cause_message: str = "network timeout") -> TimedOut:
         return exc
 
 
-def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
+def test_create_transcriber_defaults_to_deepgram_without_extra_passes() -> None:
     transcriber = bot_module.create_transcriber(
         Settings(
             telegram_bot_token="token",
@@ -129,24 +194,22 @@ def test_create_transcriber_defaults_to_openrouter_gemini() -> None:
         )
     )
 
-    assert transcriber.provider_name == "gemini"
-    assert transcriber.model == "google/gemini-3.5-flash"
+    assert transcriber.provider_name == "deepgram"
+    assert transcriber.model == "nova-3"
     assert tuple(provider.provider_name for provider in transcriber.speech_to_text_providers) == (
-        "gemini",
         "deepgram",
-        "whisper",
-        "openai",
     )
-    assert transcriber.transcription_refinement_model == "openai/gpt-5.4-mini"
+    assert transcriber.transcription_refinement_model is None
+    assert transcriber.correctors_by_provider == {}
 
 
 @pytest.mark.parametrize(
     ("selected", "expected"),
     [
-        ("gemini", ("gemini", "deepgram", "whisper", "openai")),
-        ("deepgram", ("deepgram", "gemini", "whisper", "openai")),
-        ("whisper", ("whisper", "gemini", "deepgram", "openai")),
-        ("openai", ("openai", "gemini", "deepgram", "whisper")),
+        ('gemini', ('gemini',)),
+        ('deepgram', ('deepgram',)),
+        ('whisper', ('whisper',)),
+        ('openai', ('openai',)),
     ],
 )
 def test_transcription_model_order_uses_selected_provider_first(
@@ -172,8 +235,8 @@ def test_parse_model_command_arg_accepts_whisper_aliases(argument: str, expected
     "translation_model",
     [
         "google/gemini-3.5-flash",
-        "openai/gpt-5.4-mini",
-        "anthropic/claude-sonnet-4.6",
+        "google/gemini-2.5-flash-lite",
+        "qwen/qwen3-30b-a3b-instruct-2507",
     ],
 )
 def test_create_transcriber_uses_selected_translation_model(translation_model: str) -> None:
@@ -194,7 +257,7 @@ def test_create_transcriber_uses_selected_translation_model(translation_model: s
 @pytest.mark.parametrize(
     ("settings_enabled", "runtime_enabled", "expected_model"),
     [
-        (False, True, "openai/gpt-5.4-mini"),
+        (False, True, "google/gemini-2.5-flash-lite"),
         (True, False, None),
     ],
 )
@@ -235,7 +298,8 @@ def test_create_transcriber_uses_dedicated_transcription_refinement_model() -> N
             openai_api_key="openai-key",
             openrouter_api_key="openrouter-key",
             openrouter_transcription_refinement_model="custom-arabic-refinement-model",
-        )
+        ),
+        transcription_refinement_enabled=True,
     )
 
     assert transcriber.transcription_refinement_model == "custom-arabic-refinement-model"
@@ -251,6 +315,7 @@ def test_create_transcriber_uses_runtime_transcription_refinement_model() -> Non
             openrouter_api_key="openrouter-key",
         ),
         transcription_refinement_model="google/gemini-3.5-flash",
+        transcription_refinement_enabled=True,
     )
 
     assert transcriber.transcription_refinement_model == "google/gemini-3.5-flash"
@@ -327,6 +392,7 @@ def test_create_application_automatically_deletes_legacy_registry(tmp_path: Path
     settings = Settings(
         telegram_bot_token="123:token",
         openrouter_api_key="key",
+        deepgram_api_key="key",
         runtime_state_path=tmp_path / "runtime.json",
         video_registry_path=registry,
         scoped_state_path=tmp_path / "state.sqlite3",
@@ -621,9 +687,9 @@ async def test_help_command_lists_commands_and_schedules_deletion(monkeypatch: p
     assert "/help - Show this help message" in reply
     assert "/tempo <0.5-2.0>" in reply
     assert "/model [gemini|deepgram|whisper|openai]" in reply
-    assert "/refiner [gpt|gemini]" in reply
+    assert "/refiner [on|off|lite|qwen|gemini]" in reply
     assert "/translate - Toggle Persian translation" in reply
-    assert "/tmodel [gemini|gpt|claude]" in reply
+    assert "/tmodel [lite|qwen|gemini]" in reply
     assert "/translation [natural|literal]" in reply
     assert message.text_reply_kwargs == [
         {
@@ -1072,7 +1138,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
         bot_data={
             "settings": settings,
             "transcription_refinement_model": "google/gemini-3.5-flash",
-            "translation_model": "anthropic/claude-sonnet-4.6",
+            "translation_model": "qwen/qwen3-30b-a3b-instruct-2507",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
     )
@@ -1083,6 +1149,8 @@ async def test_handle_model_command_switches_runtime_transcriber(
         settings_arg: Settings,
         model_key: str,
         translation_enabled: bool | None = None,
+        transcription_refinement_enabled: bool = False,
+        audio_correction_enabled: bool = False,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1100,7 +1168,7 @@ async def test_handle_model_command_switches_runtime_transcriber(
         (
             settings,
             "whisper",
-            "anthropic/claude-sonnet-4.6",
+            "qwen/qwen3-30b-a3b-instruct-2507",
             "google/gemini-3.5-flash",
         )
     ]
@@ -1177,16 +1245,16 @@ async def test_handle_transcription_refinement_model_command_lists_current_model
 
     reply = message.text_replies[0]
     assert "Current transcription refinement model: OpenRouter Gemini 3.5 Flash" in reply
-    assert "gpt: OpenRouter GPT-5.4 mini" in reply
+    assert "lite: Gemini 2.5 Flash-Lite (budget default)" in reply
     assert "gemini: OpenRouter Gemini 3.5 Flash" in reply
-    assert "Use /refiner gpt or /refiner gemini." in reply
+    assert "Use /refiner on, off, lite, qwen, or gemini." in reply
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("argument", "expected_model", "expected_label"),
     [
-        ("gpt", "openai/gpt-5.4-mini", "OpenRouter GPT-5.4 mini"),
+        ("lite", "google/gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite (budget default)"),
         ("google/gemini-3.5-flash", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
     ],
 )
@@ -1211,7 +1279,7 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
         bot_data={
             "settings": settings,
             "transcription_model": "deepgram",
-            "translation_model": "anthropic/claude-sonnet-4.6",
+            "translation_model": "qwen/qwen3-30b-a3b-instruct-2507",
             "translation_prompt": "literal",
             "runtime_preferences_store": bot_module.create_runtime_preferences_store(settings),
         },
@@ -1223,6 +1291,8 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
         settings_arg: Settings,
         model_key: str,
         translation_enabled: bool | None = None,
+        transcription_refinement_enabled: bool = False,
+        audio_correction_enabled: bool = False,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1243,18 +1313,18 @@ async def test_handle_transcription_refinement_model_command_switches_and_persis
     await handle_transcription_refinement_model_command(update, context)
 
     assert calls == [
-        ("deepgram", "anthropic/claude-sonnet-4.6", "literal", expected_model)
+        ("deepgram", "qwen/qwen3-30b-a3b-instruct-2507", "literal", expected_model)
     ]
     assert context.bot_data["transcriber"] is replacement_transcriber
     assert context.bot_data["transcription_refinement_model"] == expected_model
     persisted = context.bot_data["runtime_preferences_store"].load()
     assert persisted.transcription_refinement_model == expected_model
     assert persisted.transcription_model == "deepgram"
-    assert persisted.translation_model == "anthropic/claude-sonnet-4.6"
+    assert persisted.translation_model == "qwen/qwen3-30b-a3b-instruct-2507"
     assert persisted.translation_prompt == "literal"
-    assert message.text_replies == [
-        f"Transcription refinement model set to {expected_label}."
-    ]
+    assert persisted.transcription_refinement_enabled is True
+    assert "Iraqi refinement: on" in message.text_replies[0]
+    assert expected_label in message.text_replies[0]
 
 
 @pytest.mark.asyncio
@@ -1274,7 +1344,7 @@ async def test_handle_transcription_refinement_model_command_rejects_invalid_and
     await handle_transcription_refinement_model_command(update, context)
 
     assert message.text_replies == [
-        "Unknown transcription refinement model. Available models: gpt, gemini."
+        "Use /refiner on, off, or a model: gemini, lite, qwen."
     ]
 
     message.text_replies.clear()
@@ -1322,7 +1392,7 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
         bot_data={
             "settings": settings,
             "transcriber": active_transcriber,
-            "transcription_refinement_model": "openai/gpt-5.4-mini",
+            "transcription_refinement_model": "google/gemini-2.5-flash-lite",
             "runtime_preferences_store": store,
         },
     )
@@ -1335,7 +1405,7 @@ async def test_handle_transcription_refinement_model_command_keeps_active_model_
     await handle_transcription_refinement_model_command(update, context)
 
     assert context.bot_data["transcriber"] is active_transcriber
-    assert context.bot_data["transcription_refinement_model"] == "openai/gpt-5.4-mini"
+    assert context.bot_data["transcription_refinement_model"] == "google/gemini-2.5-flash-lite"
     assert message.text_replies == ["Unable to save runtime settings."]
 
 
@@ -1379,6 +1449,8 @@ async def test_handle_translation_toggle_command_switches_and_persists(
         settings_arg: Settings,
         model_key: str,
         translation_enabled: bool | None = None,
+        transcription_refinement_enabled: bool = False,
+        audio_correction_enabled: bool = False,
         translation_model: str | None = None,
         translation_prompt: str = "natural",
         transcription_refinement_model: str | None = None,
@@ -1489,8 +1561,8 @@ async def test_handle_translation_model_command_lists_current_models_and_refine_
     reply = message.text_replies[0]
     assert "Current translation model: OpenRouter Gemini 3.5 Flash" in reply
     assert "Translation: enabled" in reply
-    assert "gpt: OpenRouter GPT-5.4 mini" in reply
-    assert "claude: OpenRouter Claude Sonnet 4.6" in reply
+    assert "lite: Gemini 2.5 Flash-Lite (budget default)" in reply
+    assert "qwen: Qwen3 30B A3B Instruct (budget)" in reply
     assert message.text_reply_kwargs == [
         {
             "reply_to_message_id": 123,
@@ -1521,8 +1593,8 @@ async def test_handle_translation_model_command_reports_when_refine_is_disabled(
     ("argument", "expected_model", "expected_label"),
     [
         ("gemini", "google/gemini-3.5-flash", "OpenRouter Gemini 3.5 Flash"),
-        ("openai/gpt-5.4-mini", "openai/gpt-5.4-mini", "OpenRouter GPT-5.4 mini"),
-        ("claude", "anthropic/claude-sonnet-4.6", "OpenRouter Claude Sonnet 4.6"),
+        ("google/gemini-2.5-flash-lite", "google/gemini-2.5-flash-lite", "Gemini 2.5 Flash-Lite (budget default)"),
+        ("qwen", "qwen/qwen3-30b-a3b-instruct-2507", "Qwen3 30B A3B Instruct (budget)"),
     ],
 )
 async def test_handle_translation_model_command_switches_model_and_preserves_transcription(
@@ -1557,6 +1629,8 @@ async def test_handle_translation_model_command_switches_model_and_preserves_tra
         settings_arg: Settings,
         model_key: str,
         translation_enabled: bool | None = None,
+        transcription_refinement_enabled: bool = False,
+        audio_correction_enabled: bool = False,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1590,7 +1664,7 @@ async def test_handle_translation_model_command_rejects_unknown_model() -> None:
 
     await handle_translation_model_command(update, context)
 
-    assert message.text_replies == ["Unknown translation model. Available models: gemini, gpt, claude."]
+    assert message.text_replies == ["Unknown translation model. Available models: gemini, lite, qwen."]
 
 
 @pytest.mark.asyncio
@@ -1598,7 +1672,7 @@ async def test_handle_translation_model_command_rejects_unauthorized_user() -> N
     message = FakeMessage()
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=999))
     context = SimpleNamespace(
-        args=["gpt"],
+        args=["lite"],
         bot_data={
             "settings": Settings(
                 telegram_bot_token="token",
@@ -1618,7 +1692,7 @@ async def test_handle_translation_model_command_rejects_unauthorized_user() -> N
 async def test_handle_translation_model_command_ignores_channels() -> None:
     message = FakeMessage(chat_type=ChatType.CHANNEL)
     update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=123))
-    context = SimpleNamespace(args=["gpt"], bot_data={})
+    context = SimpleNamespace(args=["lite"], bot_data={})
 
     await handle_translation_model_command(update, context)
 
@@ -1658,6 +1732,8 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
         settings_arg: Settings,
         model_key: str,
         translation_enabled: bool | None = None,
+        transcription_refinement_enabled: bool = False,
+        audio_correction_enabled: bool = False,
         translation_model: str | None = None,
         translation_prompt: str = "normal",
         transcription_refinement_model: str | None = None,
@@ -1677,7 +1753,7 @@ async def test_handle_translation_prompt_command_lists_and_switches_prompt(
     await handle_translation_prompt_command(update, context)
 
     assert calls == [
-        ("gemini", "openai/gpt-5.4-mini", "natural", "openai/gpt-5.4-mini")
+        ("deepgram", "google/gemini-2.5-flash-lite", "natural", "google/gemini-2.5-flash-lite")
     ]
     assert context.bot_data["translation_prompt"] == "natural"
     assert context.bot_data["transcriber"] is fake_transcriber
@@ -1783,6 +1859,7 @@ async def test_handle_video_upload_accepts_video_at_exact_size(monkeypatch: pyte
     settings = Settings(
         telegram_bot_token="token",
         openrouter_api_key="key",
+        deepgram_api_key="key",
         max_video_mb=10 / 1024 / 1024,
     )
     attachment = SimpleNamespace(file_size=10)
@@ -1827,7 +1904,7 @@ async def test_handle_video_upload_queues_job_when_acknowledgement_times_out(
     queue: asyncio.Queue[bot_module.QueuedMediaJob] = asyncio.Queue()
     context = SimpleNamespace(
         bot_data={
-            "settings": Settings(telegram_bot_token="token", openrouter_api_key="key"),
+            "settings": Settings(telegram_bot_token="token", openrouter_api_key="key", deepgram_api_key="key"),
             "media_job_queue": queue,
         }
     )
@@ -1855,6 +1932,7 @@ async def test_process_video_message_reports_step_by_step_flow(
         file_size = 5
 
     class FakeTranscriber:
+        transcription_refiner = SimpleNamespace(model="arabic-model")
         async def transcribe_chunks_async(self, chunks: object, progress_callback: object = None) -> TranscriptionResult:
             chunk = list(chunks)[0]
             assert progress_callback is not None
@@ -2039,8 +2117,8 @@ async def test_process_video_message_throttles_rapid_translation_cue_progress(
 
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
-    assert "Step 6/7: translating subtitle cue 1/2..." in message.status_replies[0].edits
-    assert "Step 6/7: translating subtitle cue 2/2..." not in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 1/2..." in message.status_replies[0].edits
+    assert "Step 5/6: translating subtitle cue 2/2..." not in message.status_replies[0].edits
 
 
 @pytest.mark.asyncio
@@ -2099,9 +2177,9 @@ async def test_process_video_message_reports_translation_progress_after_throttle
     await process_video_message(message, FakeAttachment(), settings, context, status_ref, "job1234", 1.0)
 
     edits = message.status_replies[0].edits
-    assert "Step 6/7: translating subtitle cue 1/3..." in edits
-    assert "Step 6/7: translating subtitle cue 2/3..." not in edits
-    assert "Step 6/7: translating subtitle cue 3/3..." in edits
+    assert "Step 5/6: translating subtitle cue 1/3..." in edits
+    assert "Step 5/6: translating subtitle cue 2/3..." not in edits
+    assert "Step 5/6: translating subtitle cue 3/3..." in edits
 
 
 @pytest.mark.asyncio
@@ -2262,7 +2340,7 @@ async def test_process_video_message_rejects_downloaded_file_over_size(
     assert not downloaded_path.exists()
     assert message.text_replies == ["Video received. Starting transcription..."]
     assert message.status_replies[0].edits == [
-        "Step 1/6: downloading media...",
+        "Step 1/5: downloading media...",
         "Media is larger than the configured upload limit.",
     ]
 

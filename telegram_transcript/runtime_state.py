@@ -3,14 +3,15 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from telegram_transcript.config import ConfigError, parse_audio_tempo
+from telegram_transcript.model_catalog import normalize_legacy_text_model
 
-RUNTIME_PREFERENCES_VERSION = 3
-LEGACY_RUNTIME_PREFERENCES_VERSIONS = frozenset({1, 2})
+RUNTIME_PREFERENCES_VERSION = 4
+LEGACY_RUNTIME_PREFERENCES_VERSIONS = frozenset({1, 2, 3})
 
 
 class RuntimeStateError(RuntimeError):
@@ -25,11 +26,12 @@ class RuntimePreferences:
     translation_enabled: bool
     translation_model: str
     translation_prompt: str
+    transcription_refinement_enabled: bool = False
+    audio_correction_enabled: bool = False
 
 
 def normalize_legacy_gpt_model(model: str) -> str:
-    # Keep this migration pinned so future default changes do not retarget saved preferences.
-    return "openai/gpt-5.4-mini" if model == "openai/gpt-5.5" else model
+    return normalize_legacy_text_model(model)
 
 
 class RuntimePreferencesStore:
@@ -78,7 +80,7 @@ class RuntimePreferencesStore:
             raise ConfigError(f"Runtime state in {self.path} is missing required settings.")
         translation_enabled = (
             self._validate_bool(payload.get("translation_enabled"), "translation enabled")
-            if payload["version"] == RUNTIME_PREFERENCES_VERSION
+            if payload["version"] >= 3
             else self.defaults.translation_enabled
         )
         preferences = RuntimePreferences(
@@ -98,7 +100,18 @@ class RuntimePreferencesStore:
             translation_prompt=self._validate_choice(
                 payload["translation_prompt"], self.translation_prompts, "translation prompt"
             ),
+            transcription_refinement_enabled=(
+                self._validate_bool(payload.get("transcription_refinement_enabled"), "transcription refinement enabled")
+                if payload["version"] >= 4 else False
+            ),
+            audio_correction_enabled=(
+                self._validate_bool(payload.get("audio_correction_enabled"), "audio correction enabled")
+                if payload["version"] >= 4 else False
+            ),
         )
+        if payload["version"] < 4:
+            preferences = replace(preferences, transcription_model="deepgram")
+            self.save(preferences)
         return preferences
 
     def save(self, preferences: RuntimePreferences) -> None:
